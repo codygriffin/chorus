@@ -405,6 +405,35 @@ impl NetworkConsensus {
         self.voters.contains(&node_id) || self.learners.contains(&node_id)
     }
 
+    /// Authorize a peer against the effective replicated membership.  The
+    /// static manifest is used only until the first membership entry is
+    /// applied; after that, a removed node must stop being a valid RPC
+    /// requester even if it remains in the original endpoint map.
+    fn effective_member(&self, node_id: u64) -> Result<bool> {
+        let (voters, learners) = self.membership()?;
+        Ok(voters.binary_search(&node_id).is_ok() || learners.binary_search(&node_id).is_ok())
+    }
+
+    /// The framed transport carries a claimed leader id, but role selection
+    /// is still made locally from a quorum observation.  Fail closed when the
+    /// sender is not the freshest leader currently observed by a majority.
+    /// This is protocol-role enforcement only; cryptographic peer
+    /// authentication remains an explicit transport requirement.
+    fn authorize_current_leader(&self, from: u64, claimed_leader: u64) -> Result<()> {
+        if from != claimed_leader {
+            return Err(ChorusError::Protocol(
+                "request sender does not match declared leader".into(),
+            ));
+        }
+        let (_, _, _, observed_leader, _) = self.observe()?;
+        if observed_leader != claimed_leader {
+            return Err(ChorusError::Consensus(
+                "request sender is not the current quorum leader".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_request(&self, request: &PeerRequest) -> Result<()> {
         let (from, cluster_id, cluster_incarnation) = match request {
             PeerRequest::Ping {
@@ -453,7 +482,7 @@ impl NetworkConsensus {
             } => (*from, *cluster_id, *cluster_incarnation),
         };
         self.identity_ok(cluster_id, cluster_incarnation)?;
-        if !self.known_peer(from) {
+        if !self.effective_member(from)? {
             return Err(ChorusError::Protocol(
                 "requester is not a cluster member".into(),
             ));
@@ -950,8 +979,10 @@ impl NetworkConsensus {
             PeerRequest::Snapshot { .. } => {
                 PeerResponse::Snapshot(snapshot_from_store(self.store.as_ref())?)
             }
-            PeerRequest::Prepare { log_id, .. } => {
-                if !self.store.status().healthy {
+            PeerRequest::Prepare { from, log_id, .. } => {
+                if let Err(error) = self.authorize_current_leader(from, from) {
+                    PeerResponse::Error(error.to_string())
+                } else if !self.store.status().healthy {
                     PeerResponse::Error("state store is unhealthy".into())
                 } else {
                     let current = self.store.snapshot()?.last_applied();
@@ -979,8 +1010,8 @@ impl NetworkConsensus {
                 command,
                 ..
             } => {
-                if from != leader_id {
-                    PeerResponse::Error("apply sender is not the declared leader".into())
+                if let Err(error) = self.authorize_current_leader(from, leader_id) {
+                    PeerResponse::Error(error.to_string())
                 } else {
                     let current = self.store.snapshot()?.last_applied();
                     if log_id.index > current.index.saturating_add(1) {
@@ -1005,8 +1036,8 @@ impl NetworkConsensus {
                 snapshot,
                 ..
             } => {
-                if from != leader_id {
-                    PeerResponse::Error("snapshot sender is not the declared leader".into())
+                if let Err(error) = self.authorize_current_leader(from, leader_id) {
+                    PeerResponse::Error(error.to_string())
                 } else {
                     match self.store.install(&snapshot) {
                         Ok(()) => PeerResponse::Installed,
@@ -1551,5 +1582,117 @@ mod tests {
                 Some(&b"network-value"[..])
             );
         }
+    }
+
+    fn raw_peer_request(endpoint: &str, request: &PeerRequest) -> Result<PeerResponse> {
+        let mut stream = TcpStream::connect(endpoint)
+            .map_err(|error| ChorusError::Consensus(error.to_string()))?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .map_err(|error| ChorusError::Consensus(error.to_string()))?;
+        stream
+            .set_write_timeout(Some(Duration::from_millis(500)))
+            .map_err(|error| ChorusError::Consensus(error.to_string()))?;
+        write_frame(&mut stream, request)?;
+        read_frame(&mut stream)
+    }
+
+    #[test]
+    fn network_rejects_nonleader_and_removed_member_control_frames() {
+        let ports = [19_601u16, 19_602, 19_603];
+        let endpoints: BTreeMap<_, _> = (1..=3)
+            .zip(ports)
+            .map(|(id, port)| (id, format!("127.0.0.1:{port}")))
+            .collect();
+        let mut nodes = Vec::new();
+        let mut stores = Vec::new();
+        for id in 1..=3 {
+            let store = Arc::new(MemoryStateStore::new()) as Arc<dyn StateStore>;
+            let node = NetworkConsensus::new(
+                id,
+                vec![1, 2, 3],
+                Vec::new(),
+                endpoints.clone(),
+                store.clone(),
+            );
+            match node.start() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+                Err(error) => panic!("failed to start peer: {error}"),
+            }
+            nodes.push(node);
+            stores.push(store);
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        // A correctly claimed current leader remains able to replicate. This
+        // guards the authorization gate against turning ordinary forwarding
+        // into a permanent fail-closed state.
+        let origin = OriginId::new(1);
+        nodes[0].activate_origin(origin).unwrap();
+        for store in &stores {
+            assert_eq!(store.snapshot().unwrap().last_applied().index, 1);
+        }
+
+        // Node 1 is the deterministic freshest leader while all three
+        // replicas are at the same log position. Node 2 is a valid member,
+        // but it must not be able to claim leadership in a control frame.
+        let forged_apply = PeerRequest::Apply {
+            from: 2,
+            leader_id: 2,
+            cluster_id: [0; 16],
+            cluster_incarnation: 1,
+            log_id: LogId { term: 1, index: 2 },
+            command: ReplicatedCommandV1::Noop,
+        };
+        let response = raw_peer_request(endpoints.get(&3).unwrap(), &forged_apply).unwrap();
+        assert!(matches!(response, PeerResponse::Error(_)));
+        assert_eq!(stores[2].snapshot().unwrap().last_applied().index, 1);
+
+        // Install is subject to the same sender/leader check. The snapshot
+        // is valid; only its claimed nonleader sender is forged.
+        let forged_install = PeerRequest::Install {
+            from: 2,
+            leader_id: 2,
+            cluster_id: [0; 16],
+            cluster_incarnation: 1,
+            snapshot: snapshot_from_store(stores[0].as_ref()).unwrap(),
+        };
+        let response = raw_peer_request(endpoints.get(&3).unwrap(), &forged_install).unwrap();
+        assert!(matches!(response, PeerResponse::Error(_)));
+        assert_eq!(stores[2].snapshot().unwrap().last_applied().index, 1);
+
+        // Apply a committed membership image that removes node 2. The
+        // endpoint remains in the static map, but authorization must follow
+        // replicated membership and reject node 2 thereafter.
+        let membership = ReplicatedCommandV1::Membership {
+            voters: vec![1, 3],
+            learners: Vec::new(),
+        };
+        for store in &stores {
+            store
+                .apply(LogId { term: 1, index: 2 }, &membership)
+                .unwrap();
+        }
+        let forged_removed_apply = PeerRequest::Apply {
+            from: 2,
+            leader_id: 2,
+            cluster_id: [0; 16],
+            cluster_incarnation: 1,
+            log_id: LogId { term: 1, index: 3 },
+            command: ReplicatedCommandV1::Noop,
+        };
+        assert!(raw_peer_request(endpoints.get(&3).unwrap(), &forged_removed_apply).is_err());
+        assert_eq!(
+            stores[2].snapshot().unwrap().last_applied(),
+            LogId { term: 1, index: 2 }
+        );
+
+        let forged_removed_barrier = PeerRequest::ReadBarrier {
+            from: 2,
+            cluster_id: [0; 16],
+            cluster_incarnation: 1,
+        };
+        assert!(raw_peer_request(endpoints.get(&1).unwrap(), &forged_removed_barrier).is_err());
     }
 }

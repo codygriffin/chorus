@@ -485,12 +485,19 @@ impl MemoryStateStore {
 /// A crash-safe generation file store.  Writes go to `state.json.tmp`, flush
 /// and sync the file, then atomically rename it.  The format is logical and
 /// deliberately independent of redb page layout.
+#[derive(Clone, Debug)]
+struct HealthState {
+    healthy: bool,
+    reason: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct FileStateStore {
     path: Arc<PathBuf>,
     raft_log_path: Arc<PathBuf>,
     memory: MemoryStateStore,
     persist_lock: Arc<Mutex<()>>,
+    health: Arc<Mutex<HealthState>>,
 }
 
 impl FileStateStore {
@@ -519,9 +526,54 @@ impl FileStateStore {
             raft_log_path: Arc::new(raft_log_path),
             memory,
             persist_lock: Arc::new(Mutex::new(())),
+            health: Arc::new(Mutex::new(HealthState {
+                healthy: true,
+                reason: None,
+            })),
         };
-        store.replay_durable_log()?;
+        // A replay failure means this replica cannot prove that its logical
+        // state matches the durable log. Return the store in a latched,
+        // unhealthy state so operators can inspect status and explicitly
+        // reopen after repairing the underlying files.
+        if let Err(error) = store.replay_durable_log() {
+            store.poison(error);
+        }
         Ok(store)
+    }
+    fn health_error(&self) -> Option<ChorusError> {
+        match self.health.lock() {
+            Ok(state) if state.healthy => None,
+            Ok(state) => Some(ChorusError::Storage(format!(
+                "state store is unhealthy{}",
+                state
+                    .reason
+                    .as_deref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ))),
+            Err(_) => Some(ChorusError::Storage("health latch poisoned".into())),
+        }
+    }
+    fn ensure_healthy(&self) -> Result<()> {
+        if let Some(error) = self.health_error() {
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn poison(&self, error: ChorusError) -> ChorusError {
+        if let Ok(mut state) = self.health.lock() {
+            if state.healthy {
+                state.healthy = false;
+                state.reason = Some(error.to_string());
+            }
+        }
+        error
+    }
+    fn poison_storage<T>(&self, result: Result<T>) -> Result<T> {
+        result.map_err(|error| match error {
+            ChorusError::Storage(_) => self.poison(error),
+            other => other,
+        })
     }
     /// Return the separate local recovery-log path.  Operators can include
     /// this file in a backup or inspect its size without knowing the state
@@ -684,6 +736,7 @@ impl FileStateStore {
         self.memory.data()
     }
     pub fn rebase_cluster(&self, cluster_id: [u8; 16], incarnation: u64) -> Result<()> {
+        self.ensure_healthy()?;
         if incarnation == 0 {
             return Err(ChorusError::Protocol(
                 "cluster incarnation must be nonzero".into(),
@@ -696,7 +749,9 @@ impl FileStateStore {
         // A rebind changes the identity namespace.  Never publish that new
         // generation while an older-identity intent frame can still replay;
         // compaction is therefore a required precondition, not best effort.
-        self.compact_durable_log()?;
+        if let Err(error) = self.compact_durable_log() {
+            return Err(self.poison(error));
+        }
         let before = self.memory.data();
         {
             let mut data = self
@@ -714,6 +769,7 @@ impl FileStateStore {
             data.origins.clear();
         }
         if let Err(error) = self.persist() {
+            let error = self.poison(error);
             *self
                 .memory
                 .inner
@@ -724,6 +780,7 @@ impl FileStateStore {
         Ok(())
     }
     pub fn initialize_cluster(&self, cluster_id: [u8; 16], incarnation: u64) -> Result<()> {
+        self.ensure_healthy()?;
         if incarnation == 0 {
             return Err(ChorusError::Protocol(
                 "cluster incarnation must be nonzero".into(),
@@ -753,6 +810,7 @@ impl FileStateStore {
         data.cluster_incarnation = incarnation;
         drop(data);
         if let Err(error) = self.persist() {
+            let error = self.poison(error);
             *self
                 .memory
                 .inner
@@ -760,7 +818,9 @@ impl FileStateStore {
                 .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
             return Err(error);
         }
-        let _ = self.compact_durable_log();
+        if let Err(error) = self.compact_durable_log() {
+            return Err(self.poison(error));
+        }
         Ok(())
     }
 }
@@ -1069,9 +1129,11 @@ fn validate_state_data(data: &StateData) -> Result<()> {
 
 impl StateStore for FileStateStore {
     fn snapshot(&self) -> Result<StateSnapshot> {
+        self.ensure_healthy()?;
         self.memory.snapshot()
     }
     fn apply(&self, log_id: LogId, command: &ReplicatedCommandV1) -> Result<ApplyResult> {
+        self.ensure_healthy()?;
         let _persist_guard = self
             .persist_lock
             .lock()
@@ -1088,17 +1150,20 @@ impl StateStore for FileStateStore {
             log_id,
             command: command.clone(),
         };
-        let log_offset = self.append_durable_log(&entry)?;
+        let log_offset = self.poison_storage(self.append_durable_log(&entry))?;
         let out = match self.memory.apply(log_id, command) {
             Ok(out) => out,
             Err(error) => {
                 // MemoryStateStore rolls back failed commands atomically.  A
                 // failed command must not become a future replay entry.
-                self.truncate_durable_log(log_offset)?;
+                if let Err(truncate_error) = self.truncate_durable_log(log_offset) {
+                    return Err(self.poison(truncate_error));
+                }
                 return Err(error);
             }
         };
         if let Err(error) = self.persist() {
+            let error = self.poison(error);
             *self
                 .memory
                 .inner
@@ -1109,10 +1174,13 @@ impl StateStore for FileStateStore {
         // State publication is the commit point.  If truncation itself is
         // interrupted, replay will observe that last_applied already covers
         // the frame and compact it on the next open.
-        let _ = self.compact_durable_log();
+        if let Err(error) = self.compact_durable_log() {
+            return Err(self.poison(error));
+        }
         Ok(out)
     }
     fn install(&self, snapshot: &LogicalSnapshot) -> Result<()> {
+        self.ensure_healthy()?;
         let _persist_guard = self
             .persist_lock
             .lock()
@@ -1120,6 +1188,7 @@ impl StateStore for FileStateStore {
         let before = self.memory.data();
         self.memory.install(snapshot)?;
         if let Err(error) = self.persist() {
+            let error = self.poison(error);
             *self
                 .memory
                 .inner
@@ -1127,10 +1196,13 @@ impl StateStore for FileStateStore {
                 .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
             return Err(error);
         }
-        let _ = self.compact_durable_log();
+        if let Err(error) = self.compact_durable_log() {
+            return Err(self.poison(error));
+        }
         Ok(())
     }
     fn rollback(&self, snapshot: &LogicalSnapshot) -> Result<()> {
+        self.ensure_healthy()?;
         let _persist_guard = self
             .persist_lock
             .lock()
@@ -1140,10 +1212,13 @@ impl StateStore for FileStateStore {
         // frame cannot be replayed into the restored generation after a
         // restart.  A compaction failure leaves the current state untouched
         // and fails closed to the consensus layer.
-        self.compact_durable_log()?;
+        if let Err(error) = self.compact_durable_log() {
+            return Err(self.poison(error));
+        }
         let before = self.memory.data();
         self.memory.rollback(snapshot)?;
         if let Err(error) = self.persist() {
+            let error = self.poison(error);
             *self
                 .memory
                 .inner
@@ -1154,10 +1229,16 @@ impl StateStore for FileStateStore {
         Ok(())
     }
     fn state_hash(&self) -> Result<[u8; 32]> {
+        self.ensure_healthy()?;
         self.memory.state_hash()
     }
     fn status(&self) -> StoreStatus {
-        self.memory.status()
+        let mut status = self.memory.status();
+        if self.health_error().is_some() {
+            status.healthy = false;
+            status.state_hash = [0; 32];
+        }
+        status
     }
 }
 
@@ -2257,6 +2338,57 @@ mod tests {
         assert_eq!(store.snapshot().unwrap().last_applied(), LogId::ZERO);
         let raft_log = store.raft_log_path().to_path_buf();
         drop(store);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(raft_log);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn file_store_latches_unhealthy_after_state_publish_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "chorus-storage-health-latch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let tmp = path.with_extension("tmp");
+        let cluster_id = [21; 16];
+        let store = FileStateStore::open(&path).unwrap();
+        store.initialize_cluster(cluster_id, 1).unwrap();
+        // Force the atomic state publication to fail after the synced intent
+        // frame has been appended and the in-memory command has applied.
+        fs::create_dir(&tmp).unwrap();
+        let origin = OriginId {
+            node_id: 1,
+            boot_nonce: [22; 16],
+        };
+        assert!(matches!(
+            store.apply(
+                LogId { term: 1, index: 1 },
+                &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 { origin }),
+            ),
+            Err(ChorusError::Storage(_))
+        ));
+        assert!(!store.status().healthy);
+        assert!(store.snapshot().is_err());
+        assert!(store.state_hash().is_err());
+        assert!(
+            store
+                .apply(LogId { term: 1, index: 2 }, &ReplicatedCommandV1::Noop)
+                .is_err()
+        );
+
+        fs::remove_dir(&tmp).unwrap();
+        drop(store);
+        let reopened = FileStateStore::open(&path).unwrap();
+        assert!(reopened.status().healthy);
+        assert!(reopened.snapshot().unwrap().origins().contains_key(&1));
+        let raft_log = reopened.raft_log_path().to_path_buf();
+        drop(reopened);
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(raft_log);
         let _ = fs::remove_dir(dir);

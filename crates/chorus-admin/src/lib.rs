@@ -203,7 +203,12 @@ pub fn status(
     }
 }
 pub fn open_store(config: &Config) -> Result<FileStateStore, ConfigError> {
-    FileStateStore::open(config.state_path()).map_err(|e| ConfigError::Io(e.to_string()))
+    let store =
+        FileStateStore::open(config.state_path()).map_err(|e| ConfigError::Io(e.to_string()))?;
+    store
+        .initialize_cluster(config.cluster_id().0, config.cluster_incarnation)
+        .map_err(|e| ConfigError::Io(e.to_string()))?;
+    Ok(store)
 }
 pub fn render_status(status: &NodeStatus) -> String {
     serde_json::to_string_pretty(status).unwrap_or_else(|_| "{}".into())

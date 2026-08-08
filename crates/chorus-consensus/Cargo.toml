@@ -11,3 +11,4 @@ chorus-storage = { path = "../chorus-storage" }
 chorus-txn = { path = "../chorus-txn" }
 thiserror = "2.0.19"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"

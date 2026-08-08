@@ -93,6 +93,7 @@ struct Portal {
     sql: String,
     params: Vec<Datum>,
     max_rows: usize,
+    pending: Option<QueryResult>,
 }
 
 impl Connection {
@@ -288,6 +289,7 @@ impl Connection {
                 sql,
                 params,
                 max_rows: usize::MAX,
+                pending: None,
             },
         );
         self.write_message(b'2', &[])
@@ -298,27 +300,71 @@ impl Connection {
     fn describe(&mut self, body: &[u8]) -> std::io::Result<()> {
         let kind = body.first().copied().unwrap_or(b'S');
         if kind == b'P' {
+            let (name, _) = cstr(&body[1..]);
+            if let Some(result) = self
+                .portals
+                .get(&name)
+                .and_then(|portal| portal.pending.clone())
+            {
+                return self.row_description(&result);
+            }
             self.write_message(b'n', &[])
         } else {
-            self.write_message(b'Z', &[b'I'])
+            let (name, _) = cstr(&body[1..]);
+            let types = self.prepared_types.get(&name).cloned().unwrap_or_default();
+            let mut p = Vec::new();
+            put_u16(&mut p, types.len() as u16);
+            for oid in types {
+                p.extend_from_slice(&oid.to_be_bytes());
+            }
+            self.write_message(b't', &p)?;
+            self.write_message(b'n', &[])
         }
     }
     fn execute(&mut self, body: &[u8]) -> std::io::Result<()> {
         let (portal, n) = cstr(body);
         let max = u32::from_be_bytes(body[n..n + 4].try_into().unwrap()) as usize;
-        let Some(p) = self.portals.get(&portal).cloned() else {
+        let Some(mut p) = self.portals.get(&portal).cloned() else {
             return self.error(&SqlError::new("34000", "portal does not exist"));
         };
-        let _ = max;
-        match self.session.execute(&p.sql, &p.params) {
-            Ok(r) => self.result(&r),
-            Err(e) => self.error(&e),
+        let mut result = if let Some(pending) = p.pending.take() {
+            pending
+        } else {
+            match self.session.execute(&p.sql, &p.params) {
+                Ok(r) => r,
+                Err(e) => return self.error(&e),
+            }
+        };
+        if max > 0 && result.rows.len() > max {
+            let remaining = result.rows.split_off(max);
+            p.pending = Some(QueryResult {
+                columns: result.columns.clone(),
+                rows: remaining,
+                command_tag: result.command_tag.clone(),
+                affected_rows: result.affected_rows,
+                notices: result.notices.clone(),
+            });
+            self.portals.insert(portal, p);
+            self.result_rows(&result)?;
+            return self.write_message(b's', &[]);
         }
+        self.portals.insert(portal, p);
+        self.result(&result)
     }
     fn close(&mut self, body: &[u8]) -> std::io::Result<()> {
+        let Some(kind) = body.first().copied() else {
+            return self.error(&SqlError::new("08P01", "malformed Close"));
+        };
         let (name, _) = cstr(&body[1..]);
-        if body.first() == Some(&b'P') {
-            self.portals.remove(&name);
+        match kind {
+            b'P' => {
+                self.portals.remove(&name);
+            }
+            b'S' => {
+                self.session.close_prepared(&name);
+                self.prepared_types.remove(&name);
+            }
+            _ => return self.error(&SqlError::new("08P01", "invalid Close target")),
         }
         self.write_message(b'3', &[])
     }
@@ -327,30 +373,7 @@ impl Connection {
         Ok(())
     }
     fn result(&mut self, r: &QueryResult) -> std::io::Result<()> {
-        if !r.columns.is_empty() {
-            let mut b = Vec::new();
-            put_u16(&mut b, r.columns.len() as u16);
-            for c in &r.columns {
-                cstr_put(&mut b, &c.name);
-                b.extend_from_slice(&c.table_oid.to_be_bytes());
-                b.extend_from_slice(&c.column_oid.to_be_bytes());
-                b.extend_from_slice(&(-1i16).to_be_bytes());
-                b.extend_from_slice(&(c.data_type.oid() as u32).to_be_bytes());
-                b.extend_from_slice(&(-1i16).to_be_bytes());
-                b.push(0);
-            }
-            self.write_message(b'T', &b)?;
-            for row in &r.rows {
-                let mut d = Vec::new();
-                put_u16(&mut d, row.len() as u16);
-                for v in row {
-                    let text = v.display_text();
-                    d.extend_from_slice(&(text.len() as i32).to_be_bytes());
-                    d.extend_from_slice(text.as_bytes());
-                }
-                self.write_message(b'D', &d)?;
-            }
-        }
+        self.result_rows(r)?;
         let mut tag = r.command_tag.clone();
         if tag.is_empty() {
             tag = "SELECT 0".into();
@@ -358,6 +381,40 @@ impl Connection {
         let mut b = tag.into_bytes();
         b.push(0);
         self.write_message(b'C', &b)
+    }
+    fn result_rows(&mut self, r: &QueryResult) -> std::io::Result<()> {
+        if !r.columns.is_empty() {
+            self.row_description(r)?;
+            for row in &r.rows {
+                let mut d = Vec::new();
+                put_u16(&mut d, row.len() as u16);
+                for v in row {
+                    if v.is_null() {
+                        d.extend_from_slice(&(-1i32).to_be_bytes());
+                        continue;
+                    }
+                    let text = v.display_text();
+                    d.extend_from_slice(&(text.len() as i32).to_be_bytes());
+                    d.extend_from_slice(text.as_bytes());
+                }
+                self.write_message(b'D', &d)?;
+            }
+        }
+        Ok(())
+    }
+    fn row_description(&mut self, r: &QueryResult) -> std::io::Result<()> {
+        let mut b = Vec::new();
+        put_u16(&mut b, r.columns.len() as u16);
+        for c in &r.columns {
+            cstr_put(&mut b, &c.name);
+            b.extend_from_slice(&c.table_oid.to_be_bytes());
+            b.extend_from_slice(&c.column_oid.to_be_bytes());
+            b.extend_from_slice(&(-1i16).to_be_bytes());
+            b.extend_from_slice(&c.data_type.oid().to_be_bytes());
+            b.extend_from_slice(&(-1i16).to_be_bytes());
+            b.push(0);
+        }
+        self.write_message(b'T', &b)
     }
     fn ready(&mut self) -> std::io::Result<()> {
         self.write_message(

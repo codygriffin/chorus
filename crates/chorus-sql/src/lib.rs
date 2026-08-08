@@ -1274,6 +1274,9 @@ impl SqlSession {
     pub fn prepared_sql(&self, name: &str) -> Option<&str> {
         self.prepared.get(name).map(String::as_str)
     }
+    pub fn close_prepared(&mut self, name: &str) {
+        self.prepared.remove(name);
+    }
     pub fn transaction_status(&self) -> TransactionStatus {
         if self.failed {
             TransactionStatus::Failed
@@ -1334,7 +1337,12 @@ impl SqlSession {
         Ok(last)
     }
     pub fn prepare(&mut self, name: &str, sql: &str) -> std::result::Result<(), SqlError> {
-        Parser::batch(sql)?;
+        if Parser::batch(sql)?.len() != 1 {
+            return Err(SqlError::new(
+                "42601",
+                "prepared statements must contain exactly one SQL statement",
+            ));
+        }
         self.prepared.insert(name.into(), sql.into());
         Ok(())
     }

@@ -79,6 +79,7 @@ dependencies = [
  "chorus-storage",
  "chorus-txn",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

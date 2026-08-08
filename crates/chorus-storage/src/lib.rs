@@ -318,7 +318,19 @@ impl StateStore for MemoryStateStore {
         result
     }
     fn install(&self, snapshot: &LogicalSnapshot) -> Result<()> {
-        let mut d = StateData::default();
+        let mut d = snapshot
+            .meta
+            .get("state")
+            .map(|bytes| {
+                serde_json::from_slice::<StateData>(bytes)
+                    .map_err(|e| ChorusError::Serialization(format!("snapshot state decode: {e}")))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if d.cluster_id != [0; 16] && d.cluster_id != snapshot.header.cluster_id {
+            return Err(ChorusError::Protocol("snapshot cluster id mismatch".into()));
+        }
+        d.format_version = 1;
         d.cluster_id = snapshot.header.cluster_id;
         d.cluster_incarnation = snapshot.header.cluster_incarnation;
         d.db_epoch = snapshot.header.db_epoch;
@@ -329,6 +341,10 @@ impl StateStore for MemoryStateStore {
             voters: snapshot.header.voters.clone(),
             learners: snapshot.header.learners.clone(),
         };
+        // The metadata stream is authoritative for catalog, allocator, and
+        // origin deduplication state.  Rebuild the logical KV map from the
+        // independently checksummed entry stream below.
+        d.kv.clear();
         for (k, v) in &snapshot.entries {
             d.kv.insert(k.clone(), v.clone());
         }
@@ -394,10 +410,58 @@ impl FileStateStore {
         f.sync_all()
             .map_err(|e| ChorusError::Storage(e.to_string()))?;
         fs::rename(&tmp, &*self.path).map_err(|e| ChorusError::Storage(e.to_string()))?;
+        if let Some(parent) = self.path.parent() {
+            File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| ChorusError::Storage(e.to_string()))?;
+        }
         Ok(())
     }
     pub fn data(&self) -> StateData {
         self.memory.data()
+    }
+    pub fn rebase_cluster(&self, cluster_id: [u8; 16], incarnation: u64) -> Result<()> {
+        if incarnation == 0 {
+            return Err(ChorusError::Protocol(
+                "cluster incarnation must be nonzero".into(),
+            ));
+        }
+        {
+            let mut data = self
+                .memory
+                .inner
+                .write()
+                .map_err(|_| ChorusError::Storage("state lock poisoned".into()))?;
+            data.cluster_id = cluster_id;
+            data.cluster_incarnation = incarnation;
+            data.membership = Membership {
+                log_id: data.last_applied,
+                voters: vec![],
+                learners: vec![],
+            };
+            data.origins.clear();
+        }
+        self.persist()
+    }
+    pub fn initialize_cluster(&self, cluster_id: [u8; 16], incarnation: u64) -> Result<()> {
+        let needs_init = {
+            let data = self.data();
+            data.cluster_id == [0; 16] && data.last_applied == LogId::ZERO && data.db_epoch == 0
+        };
+        if needs_init {
+            {
+                let mut data = self
+                    .memory
+                    .inner
+                    .write()
+                    .map_err(|_| ChorusError::Storage("state lock poisoned".into()))?;
+                data.cluster_id = cluster_id;
+                data.cluster_incarnation = incarnation;
+            }
+            self.persist()
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1151,5 +1215,47 @@ mod tests {
             ApplyResult::SerializationFailure { .. }
         ));
         assert!(store.snapshot().unwrap().get(b"k").is_none());
+    }
+
+    #[test]
+    fn logical_snapshot_roundtrip_preserves_catalog_and_origins() {
+        let store = MemoryStateStore::new();
+        let origin = OriginId::new(3);
+        store
+            .apply(
+                LogId { term: 1, index: 1 },
+                &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 { origin }),
+            )
+            .unwrap();
+        let operation = SchemaOperationV1::CreateTable {
+            table_id: 100,
+            schema_id: 2200,
+            name: "snap_test".into(),
+            schema_version: 1,
+            columns: vec![(101, "id".into(), SqlType::Integer, false, None)],
+            primary_key: vec![101],
+        };
+        let id = RequestId::new(origin, 1);
+        let payload = serde_json::to_vec(&operation).unwrap();
+        let command = ReplicatedCommandV1::SchemaChange(chorus_codec::SchemaCommandV1 {
+            request_id: id,
+            payload_hash: payload_hash(1, &id, 0, &payload),
+            base_epoch: 0,
+            operation,
+        });
+        store.apply(LogId { term: 1, index: 2 }, &command).unwrap();
+        let snapshot = snapshot_from_store(&store).unwrap();
+        let restored = MemoryStateStore::new();
+        restored.install(&snapshot).unwrap();
+        assert_eq!(store.state_hash().unwrap(), restored.state_hash().unwrap());
+        assert!(
+            restored
+                .snapshot()
+                .unwrap()
+                .catalog()
+                .table_by_name("snap_test")
+                .is_some()
+        );
+        assert_eq!(restored.snapshot().unwrap().origins().len(), 1);
     }
 }

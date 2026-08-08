@@ -17,7 +17,7 @@ use chorus_common::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -27,6 +27,22 @@ pub const META_CATALOG_EPOCH: &str = "catalog_epoch";
 const STATE_FILE_MAGIC: &[u8] = b"CHORUS-STATE\0";
 const STATE_FILE_VERSION: u8 = 1;
 const MAX_STATE_FILE_BYTES: usize = 256 * 1024 * 1024;
+/// The local recovery log is intentionally a framed stream rather than a
+/// collection of ad-hoc JSON files.  A frame is synced before its command is
+/// applied, so a process that dies between apply and state publication can
+/// replay the exact command on the next open.
+const RAFT_LOG_MAGIC: &[u8] = b"CHORUS-RAFT-LOG\0";
+const RAFT_LOG_VERSION: u8 = 1;
+const MAX_RAFT_LOG_BYTES: usize = 256 * 1024 * 1024;
+const MAX_RAFT_LOG_RECORD_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DurableLogEntry {
+    pub cluster_id: [u8; 16],
+    pub cluster_incarnation: u64,
+    pub log_id: LogId,
+    pub command: ReplicatedCommandV1,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ObjectState {
@@ -411,6 +427,7 @@ impl MemoryStateStore {
 #[derive(Clone)]
 pub struct FileStateStore {
     path: Arc<PathBuf>,
+    raft_log_path: Arc<PathBuf>,
     memory: MemoryStateStore,
     persist_lock: Arc<Mutex<()>>,
 }
@@ -418,6 +435,7 @@ pub struct FileStateStore {
 impl FileStateStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let raft_log_path = path.with_extension("raft.log");
         let memory = if path.exists() {
             let mut f = File::open(&path).map_err(|e| ChorusError::Storage(e.to_string()))?;
             let mut bytes = Vec::new();
@@ -435,11 +453,20 @@ impl FileStateStore {
             }
             MemoryStateStore::new()
         };
-        Ok(Self {
+        let store = Self {
             path: Arc::new(path),
+            raft_log_path: Arc::new(raft_log_path),
             memory,
             persist_lock: Arc::new(Mutex::new(())),
-        })
+        };
+        store.replay_durable_log()?;
+        Ok(store)
+    }
+    /// Return the separate local recovery-log path.  Operators can include
+    /// this file in a backup or inspect its size without knowing the state
+    /// generation naming convention.
+    pub fn raft_log_path(&self) -> &Path {
+        self.raft_log_path.as_path()
     }
     fn persist(&self) -> Result<()> {
         let data = self.memory.data();
@@ -457,6 +484,129 @@ impl FileStateStore {
                 .and_then(|dir| dir.sync_all())
                 .map_err(|e| ChorusError::Storage(e.to_string()))?;
         }
+        Ok(())
+    }
+    fn append_durable_log(&self, entry: &DurableLogEntry) -> Result<u64> {
+        let bytes = encode_durable_log_entry(entry)?;
+        if let Some(parent) = self.raft_log_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| ChorusError::Storage(e.to_string()))?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(self.raft_log_path.as_path())
+            .map_err(|e| ChorusError::Storage(e.to_string()))?;
+        let offset = file
+            .metadata()
+            .map_err(|e| ChorusError::Storage(e.to_string()))?
+            .len();
+        let next_len = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| ChorusError::Limit("raft recovery log length exhausted".into()))?;
+        if next_len > MAX_RAFT_LOG_BYTES as u64 {
+            return Err(ChorusError::Limit(
+                "raft recovery log exceeds 256 MiB; compact before appending".into(),
+            ));
+        }
+        file.write_all(&bytes)
+            .map_err(|e| ChorusError::Storage(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| ChorusError::Storage(e.to_string()))?;
+        Ok(offset)
+    }
+    fn truncate_durable_log(&self, length: u64) -> Result<()> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(self.raft_log_path.as_path())
+            .map_err(|e| ChorusError::Storage(e.to_string()))?;
+        file.set_len(length)
+            .map_err(|e| ChorusError::Storage(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| ChorusError::Storage(e.to_string()))?;
+        Ok(())
+    }
+    fn compact_durable_log(&self) -> Result<()> {
+        self.truncate_durable_log(0)
+    }
+    fn replay_durable_log(&self) -> Result<()> {
+        let (entries, valid_len) = read_durable_log(self.raft_log_path.as_path())?;
+        if entries.is_empty() {
+            let file_len = fs::metadata(self.raft_log_path.as_path())
+                .map(|m| m.len())
+                .unwrap_or(valid_len);
+            if valid_len < file_len {
+                self.truncate_durable_log(valid_len)?;
+            }
+            return Ok(());
+        }
+        // A torn final frame is safe to discard: the state file is always
+        // published after an entry is applied, while the frame is written and
+        // synced before apply.  Fully decoded frames are never silently
+        // ignored if they violate the contiguous state-machine contract.
+        let file_len = fs::metadata(self.raft_log_path.as_path())
+            .map(|m| m.len())
+            .unwrap_or(valid_len);
+        if valid_len < file_len {
+            self.truncate_durable_log(valid_len)?;
+        }
+        for entry in entries {
+            let mut current = self.memory.data();
+            if current.cluster_id == [0; 16] {
+                // A state file can be absent when the process dies during
+                // the very first publish.  The durable entry still carries
+                // the identity that was bound before it was appended.
+                current.cluster_id = entry.cluster_id;
+                current.cluster_incarnation = entry.cluster_incarnation;
+                *self
+                    .memory
+                    .inner
+                    .write()
+                    .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? =
+                    current.clone();
+            }
+            if current.cluster_id != [0; 16] && current.cluster_id != entry.cluster_id {
+                return Err(ChorusError::Protocol(
+                    "raft recovery log cluster id does not match state".into(),
+                ));
+            }
+            if current.cluster_id != [0; 16]
+                && current.cluster_incarnation != entry.cluster_incarnation
+            {
+                return Err(ChorusError::Protocol(
+                    "raft recovery log incarnation does not match state".into(),
+                ));
+            }
+            if entry.log_id.index <= current.last_applied.index {
+                continue;
+            }
+            let expected = current
+                .last_applied
+                .index
+                .checked_add(1)
+                .ok_or_else(|| ChorusError::Limit("raft log index exhausted".into()))?;
+            if entry.log_id.index != expected {
+                return Err(ChorusError::Protocol(format!(
+                    "raft recovery log has a gap: expected index {expected}, got {}",
+                    entry.log_id.index
+                )));
+            }
+            let before = current;
+            if let Err(error) = self.memory.apply(entry.log_id, &entry.command) {
+                *self
+                    .memory
+                    .inner
+                    .write()
+                    .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
+                return Err(error);
+            }
+            self.persist()?;
+        }
+        // Once the state generation is synced, all decoded entries are
+        // represented by last_applied and the recovery stream can be
+        // compacted atomically by truncation.
+        self.compact_durable_log()?;
         Ok(())
     }
     pub fn data(&self) -> StateData {
@@ -496,6 +646,7 @@ impl FileStateStore {
                 .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
             return Err(error);
         }
+        let _ = self.compact_durable_log();
         Ok(())
     }
     pub fn initialize_cluster(&self, cluster_id: [u8; 16], incarnation: u64) -> Result<()> {
@@ -535,8 +686,102 @@ impl FileStateStore {
                 .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
             return Err(error);
         }
+        let _ = self.compact_durable_log();
         Ok(())
     }
+}
+
+fn encode_durable_log_entry(entry: &DurableLogEntry) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec(entry)
+        .map_err(|e| ChorusError::Serialization(format!("raft log encode: {e}")))?;
+    let frame_len = RAFT_LOG_MAGIC
+        .len()
+        .checked_add(1 + 4 + json.len() + 32)
+        .ok_or_else(|| ChorusError::Limit("raft log frame length exhausted".into()))?;
+    if frame_len > MAX_RAFT_LOG_RECORD_BYTES {
+        return Err(ChorusError::Limit(
+            "raft log command exceeds 8 MiB frame limit".into(),
+        ));
+    }
+    let json_len = u32::try_from(json.len())
+        .map_err(|_| ChorusError::Limit("raft log frame exceeds u32 length".into()))?;
+    let mut frame = Vec::with_capacity(frame_len);
+    frame.extend_from_slice(RAFT_LOG_MAGIC);
+    frame.push(RAFT_LOG_VERSION);
+    frame.extend_from_slice(&json_len.to_be_bytes());
+    frame.extend_from_slice(&json);
+    frame.extend_from_slice(&hash32(&json));
+    Ok(frame)
+}
+
+/// Decode complete frames and return the byte boundary through which replay
+/// is safe.  A short final header/payload is treated as a torn append and can
+/// be truncated; a complete frame with a bad checksum is a hard corruption.
+fn read_durable_log(path: &Path) -> Result<(Vec<DurableLogEntry>, u64)> {
+    if !path.exists() {
+        return Ok((Vec::new(), 0));
+    }
+    let mut file = File::open(path).map_err(|e| ChorusError::Storage(e.to_string()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| ChorusError::Storage(e.to_string()))?;
+    if bytes.len() > MAX_RAFT_LOG_BYTES {
+        return Err(ChorusError::Storage(
+            "raft recovery log exceeds 256 MiB".into(),
+        ));
+    }
+    let header_len = RAFT_LOG_MAGIC.len() + 1 + 4;
+    let mut cursor = 0usize;
+    let mut entries = Vec::new();
+    while cursor < bytes.len() {
+        let remaining = bytes.len() - cursor;
+        if remaining < header_len {
+            return Ok((entries, cursor as u64));
+        }
+        if bytes[cursor..cursor + RAFT_LOG_MAGIC.len()] != *RAFT_LOG_MAGIC {
+            return Err(ChorusError::Storage(
+                "raft recovery log magic mismatch".into(),
+            ));
+        }
+        let version_at = cursor + RAFT_LOG_MAGIC.len();
+        if bytes[version_at] != RAFT_LOG_VERSION {
+            return Err(ChorusError::Storage(format!(
+                "unsupported raft recovery log version {}",
+                bytes[version_at]
+            )));
+        }
+        let len_at = version_at + 1;
+        let payload_len = u32::from_be_bytes(
+            bytes[len_at..len_at + 4]
+                .try_into()
+                .map_err(|_| ChorusError::Storage("invalid raft log length".into()))?,
+        ) as usize;
+        let frame_len = header_len
+            .checked_add(payload_len)
+            .and_then(|n| n.checked_add(32))
+            .ok_or_else(|| ChorusError::Storage("raft log frame length exhausted".into()))?;
+        if frame_len > MAX_RAFT_LOG_RECORD_BYTES {
+            return Err(ChorusError::Limit(
+                "raft log frame exceeds 8 MiB limit".into(),
+            ));
+        }
+        if remaining < frame_len {
+            return Ok((entries, cursor as u64));
+        }
+        let payload_at = cursor + header_len;
+        let payload_end = payload_at + payload_len;
+        let payload = &bytes[payload_at..payload_end];
+        if hash32(payload) != bytes[payload_end..payload_end + 32] {
+            return Err(ChorusError::Storage(
+                "raft recovery log checksum mismatch".into(),
+            ));
+        }
+        let entry = serde_json::from_slice::<DurableLogEntry>(payload)
+            .map_err(|e| ChorusError::Storage(format!("raft log decode: {e}")))?;
+        entries.push(entry);
+        cursor += frame_len;
+    }
+    Ok((entries, cursor as u64))
 }
 
 fn encode_state_file(data: &StateData) -> Result<Vec<u8>> {
@@ -748,7 +993,22 @@ impl StateStore for FileStateStore {
             .lock()
             .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
         let before = self.memory.data();
-        let out = self.memory.apply(log_id, command)?;
+        let entry = DurableLogEntry {
+            cluster_id: before.cluster_id,
+            cluster_incarnation: before.cluster_incarnation,
+            log_id,
+            command: command.clone(),
+        };
+        let log_offset = self.append_durable_log(&entry)?;
+        let out = match self.memory.apply(log_id, command) {
+            Ok(out) => out,
+            Err(error) => {
+                // MemoryStateStore rolls back failed commands atomically.  A
+                // failed command must not become a future replay entry.
+                self.truncate_durable_log(log_offset)?;
+                return Err(error);
+            }
+        };
         if let Err(error) = self.persist() {
             *self
                 .memory
@@ -757,6 +1017,10 @@ impl StateStore for FileStateStore {
                 .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
             return Err(error);
         }
+        // State publication is the commit point.  If truncation itself is
+        // interrupted, replay will observe that last_applied already covers
+        // the frame and compact it on the next open.
+        let _ = self.compact_durable_log();
         Ok(out)
     }
     fn install(&self, snapshot: &LogicalSnapshot) -> Result<()> {
@@ -774,6 +1038,7 @@ impl StateStore for FileStateStore {
                 .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
             return Err(error);
         }
+        let _ = self.compact_durable_log();
         Ok(())
     }
     fn rollback(&self, snapshot: &LogicalSnapshot) -> Result<()> {
@@ -791,6 +1056,7 @@ impl StateStore for FileStateStore {
                 .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
             return Err(error);
         }
+        let _ = self.compact_durable_log();
         Ok(())
     }
     fn state_hash(&self) -> Result<[u8; 32]> {
@@ -1721,5 +1987,87 @@ mod tests {
                 .is_some()
         );
         assert_eq!(restored.snapshot().unwrap().origins().len(), 1);
+    }
+
+    #[test]
+    fn file_store_replays_a_durable_log_after_an_interrupted_publish() {
+        let dir = std::env::temp_dir().join(format!(
+            "chorus-storage-replay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let cluster_id = [7; 16];
+        let store = FileStateStore::open(&path).unwrap();
+        store.initialize_cluster(cluster_id, 3).unwrap();
+        let origin = OriginId {
+            node_id: 1,
+            boot_nonce: [9; 16],
+        };
+        // Model a process dying after the synced intent frame but before the
+        // state generation rename.  Re-opening must apply and publish it.
+        store
+            .append_durable_log(&DurableLogEntry {
+                cluster_id,
+                cluster_incarnation: 3,
+                log_id: LogId { term: 1, index: 1 },
+                command: ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 {
+                    origin,
+                }),
+            })
+            .unwrap();
+        drop(store);
+        let reopened = FileStateStore::open(&path).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(snapshot.last_applied().index, 1);
+        assert!(snapshot.origins().contains_key(&origin.node_id));
+        assert_eq!(fs::metadata(reopened.raft_log_path()).unwrap().len(), 0);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(reopened.raft_log_path());
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn file_store_binds_identity_from_log_when_first_state_publish_is_interrupted() {
+        let dir = std::env::temp_dir().join(format!(
+            "chorus-storage-first-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let cluster_id = [8; 16];
+        let store = FileStateStore::open(&path).unwrap();
+        let origin = OriginId {
+            node_id: 2,
+            boot_nonce: [10; 16],
+        };
+        store
+            .append_durable_log(&DurableLogEntry {
+                cluster_id,
+                cluster_incarnation: 9,
+                log_id: LogId { term: 4, index: 1 },
+                command: ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 {
+                    origin,
+                }),
+            })
+            .unwrap();
+        let raft_log_path = store.raft_log_path().to_path_buf();
+        drop(store);
+        let reopened = FileStateStore::open(&path).unwrap();
+        assert_eq!(reopened.snapshot().unwrap().cluster_id(), cluster_id);
+        assert_eq!(reopened.data().cluster_incarnation, 9);
+        assert!(reopened.snapshot().unwrap().origins().contains_key(&2));
+        assert_eq!(fs::metadata(&raft_log_path).unwrap().len(), 0);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(raft_log_path);
+        let _ = fs::remove_dir(dir);
     }
 }

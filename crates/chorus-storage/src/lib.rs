@@ -174,9 +174,70 @@ pub struct StateData {
     pub catalog_epoch: u64,
     pub last_applied: LogId,
     pub catalog: Catalog,
+    #[serde(with = "binary_map")]
     pub kv: BTreeMap<Vec<u8>, Vec<u8>>,
     pub origins: BTreeMap<u64, NodeOriginState>,
     pub membership: Membership,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct BinaryMapEntry {
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
+/// JSON object keys must be strings, so serializing `BTreeMap<Vec<u8>, _>`
+/// directly fails as soon as a durable state contains a physical key.  The
+/// versioned state envelope instead stores an ordered list of byte entries;
+/// BTreeMap iteration gives every replica the same order and the decoder
+/// rejects duplicate keys rather than silently choosing one.
+mod binary_map {
+    use super::{BTreeMap, BinaryMapEntry};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Representation {
+        Entries(Vec<BinaryMapEntry>),
+        // State files written before the binary-entry envelope encoded an
+        // empty map as `{}`. Preserve that one useful rolling-upgrade case;
+        // non-empty legacy maps could not have been emitted by serde_json.
+        Legacy(BTreeMap<String, serde_json::Value>),
+    }
+
+    pub fn serialize<S>(map: &BTreeMap<Vec<u8>, Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        map.iter()
+            .map(|(key, value)| BinaryMapEntry {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Representation::deserialize(deserializer)? {
+            Representation::Entries(entries) => {
+                let mut map = BTreeMap::new();
+                for entry in entries {
+                    if map.insert(entry.key, entry.value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate binary state-map key"));
+                    }
+                }
+                Ok(map)
+            }
+            Representation::Legacy(entries) if entries.is_empty() => Ok(BTreeMap::new()),
+            Representation::Legacy(_) => Err(serde::de::Error::custom(
+                "legacy state-map object contains binary keys",
+            )),
+        }
+    }
 }
 
 impl PartialEq for StateData {
@@ -487,6 +548,11 @@ impl FileStateStore {
         Ok(())
     }
     fn append_durable_log(&self, entry: &DurableLogEntry) -> Result<u64> {
+        if entry.cluster_id == [0; 16] || entry.cluster_incarnation == 0 {
+            return Err(ChorusError::Protocol(
+                "durable raft log entries require a bound cluster identity".into(),
+            ));
+        }
         let bytes = encode_durable_log_entry(entry)?;
         if let Some(parent) = self.raft_log_path.parent() {
             fs::create_dir_all(parent).map_err(|e| ChorusError::Storage(e.to_string()))?;
@@ -513,6 +579,11 @@ impl FileStateStore {
             .map_err(|e| ChorusError::Storage(e.to_string()))?;
         file.sync_all()
             .map_err(|e| ChorusError::Storage(e.to_string()))?;
+        if let Some(parent) = self.raft_log_path.parent() {
+            File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| ChorusError::Storage(e.to_string()))?;
+        }
         Ok(offset)
     }
     fn truncate_durable_log(&self, length: u64) -> Result<()> {
@@ -622,6 +693,10 @@ impl FileStateStore {
             .persist_lock
             .lock()
             .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
+        // A rebind changes the identity namespace.  Never publish that new
+        // generation while an older-identity intent frame can still replay;
+        // compaction is therefore a required precondition, not best effort.
+        self.compact_durable_log()?;
         let before = self.memory.data();
         {
             let mut data = self
@@ -646,7 +721,6 @@ impl FileStateStore {
                 .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
             return Err(error);
         }
-        let _ = self.compact_durable_log();
         Ok(())
     }
     pub fn initialize_cluster(&self, cluster_id: [u8; 16], incarnation: u64) -> Result<()> {
@@ -692,6 +766,11 @@ impl FileStateStore {
 }
 
 fn encode_durable_log_entry(entry: &DurableLogEntry) -> Result<Vec<u8>> {
+    if entry.cluster_id == [0; 16] || entry.cluster_incarnation == 0 {
+        return Err(ChorusError::Protocol(
+            "durable raft log entries require a bound cluster identity".into(),
+        ));
+    }
     let json = serde_json::to_vec(entry)
         .map_err(|e| ChorusError::Serialization(format!("raft log encode: {e}")))?;
     let frame_len = RAFT_LOG_MAGIC
@@ -778,6 +857,11 @@ fn read_durable_log(path: &Path) -> Result<(Vec<DurableLogEntry>, u64)> {
         }
         let entry = serde_json::from_slice::<DurableLogEntry>(payload)
             .map_err(|e| ChorusError::Storage(format!("raft log decode: {e}")))?;
+        if entry.cluster_id == [0; 16] || entry.cluster_incarnation == 0 {
+            return Err(ChorusError::Protocol(
+                "raft recovery log entry has an unbound cluster identity".into(),
+            ));
+        }
         entries.push(entry);
         cursor += frame_len;
     }
@@ -993,6 +1077,11 @@ impl StateStore for FileStateStore {
             .lock()
             .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
         let before = self.memory.data();
+        if before.cluster_id == [0; 16] || before.cluster_incarnation == 0 {
+            return Err(ChorusError::Protocol(
+                "state store must be initialized with a cluster identity before apply".into(),
+            ));
+        }
         let entry = DurableLogEntry {
             cluster_id: before.cluster_id,
             cluster_incarnation: before.cluster_incarnation,
@@ -1046,6 +1135,12 @@ impl StateStore for FileStateStore {
             .persist_lock
             .lock()
             .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
+        // Rollback is used only for an apply that was never acknowledged.
+        // Remove its durable intent before publishing the rewind so a stale
+        // frame cannot be replayed into the restored generation after a
+        // restart.  A compaction failure leaves the current state untouched
+        // and fails closed to the consensus layer.
+        self.compact_durable_log()?;
         let before = self.memory.data();
         self.memory.rollback(snapshot)?;
         if let Err(error) = self.persist() {
@@ -1056,7 +1151,6 @@ impl StateStore for FileStateStore {
                 .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
             return Err(error);
         }
-        let _ = self.compact_durable_log();
         Ok(())
     }
     fn state_hash(&self) -> Result<[u8; 32]> {
@@ -1080,6 +1174,23 @@ fn apply_command(
     // cursor backwards.
     if log_id.index <= data.last_applied.index {
         return Ok(ApplyResult::Noop);
+    }
+    let expected_index = data
+        .last_applied
+        .index
+        .checked_add(1)
+        .ok_or_else(|| ChorusError::Limit("log index exhausted".into()))?;
+    if log_id.index != expected_index {
+        return Err(ChorusError::Protocol(format!(
+            "state-machine log gap: expected index {expected_index}, got {}",
+            log_id.index
+        )));
+    }
+    if data.last_applied.index != 0 && log_id.term < data.last_applied.term {
+        return Err(ChorusError::Protocol(format!(
+            "state-machine term regressed from {} to {}",
+            data.last_applied.term, log_id.term
+        )));
     }
     let result = match command {
         ReplicatedCommandV1::Noop => ApplyResult::Noop,
@@ -1853,7 +1964,12 @@ fn canonical_state_hash(data: &StateData) -> [u8; 32] {
 
 pub fn snapshot_from_store(store: &dyn StateStore) -> Result<LogicalSnapshot> {
     let s = store.snapshot()?;
-    let data = s.to_data();
+    let mut data = s.to_data();
+    // KV bytes have their own ordered entry stream in the logical snapshot.
+    // Keep metadata focused on catalog/origin state so a large table is not
+    // serialized twice (and cannot hit the snapshot cap merely because of
+    // redundant metadata).
+    data.kv.clear();
     let mut meta = BTreeMap::new();
     meta.insert(
         "state".into(),
@@ -1938,9 +2054,11 @@ mod tests {
     #[test]
     fn higher_term_lower_index_cannot_regress_cursor() {
         let store = MemoryStateStore::new();
-        store
-            .apply(LogId { term: 1, index: 5 }, &ReplicatedCommandV1::Noop)
-            .unwrap();
+        for index in 1..=5 {
+            store
+                .apply(LogId { term: 1, index }, &ReplicatedCommandV1::Noop)
+                .unwrap();
+        }
         store
             .apply(LogId { term: 2, index: 1 }, &ReplicatedCommandV1::Noop)
             .unwrap();
@@ -1967,17 +2085,50 @@ mod tests {
         };
         let id = RequestId::new(origin, 1);
         let payload = serde_json::to_vec(&operation).unwrap();
-        let command = ReplicatedCommandV1::SchemaChange(chorus_codec::SchemaCommandV1 {
+        let schema_command = ReplicatedCommandV1::SchemaChange(chorus_codec::SchemaCommandV1 {
             request_id: id,
             payload_hash: payload_hash(1, &id, 0, &payload),
             base_epoch: 0,
             operation,
         });
-        store.apply(LogId { term: 1, index: 2 }, &command).unwrap();
+        store
+            .apply(LogId { term: 1, index: 2 }, &schema_command)
+            .unwrap();
+        let kv_origin = OriginId {
+            node_id: 5,
+            boot_nonce: [13; 16],
+        };
+        store
+            .apply(
+                LogId { term: 1, index: 3 },
+                &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 {
+                    origin: kv_origin,
+                }),
+            )
+            .unwrap();
+        let kv_command = command(kv_origin, 1, 1, b"\xffk", b"binary-value");
+        store
+            .apply(LogId { term: 1, index: 4 }, &kv_command)
+            .unwrap();
         let snapshot = snapshot_from_store(&store).unwrap();
+        let metadata_state: StateData =
+            serde_json::from_slice(snapshot.meta.get("state").unwrap()).unwrap();
+        assert!(metadata_state.kv.is_empty());
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .find(|(key, _)| key == b"\xffk")
+                .map(|(_, value)| value.as_slice()),
+            Some(&b"binary-value"[..])
+        );
         let restored = MemoryStateStore::new();
         restored.install(&snapshot).unwrap();
         assert_eq!(store.state_hash().unwrap(), restored.state_hash().unwrap());
+        assert_eq!(
+            restored.snapshot().unwrap().get(b"\xffk"),
+            Some(&b"binary-value"[..])
+        );
         assert!(
             restored
                 .snapshot()
@@ -1986,7 +2137,7 @@ mod tests {
                 .table_by_name("snap_test")
                 .is_some()
         );
-        assert_eq!(restored.snapshot().unwrap().origins().len(), 1);
+        assert_eq!(restored.snapshot().unwrap().origins().len(), 2);
     }
 
     #[test]
@@ -2068,6 +2219,46 @@ mod tests {
         assert_eq!(fs::metadata(&raft_log_path).unwrap().len(), 0);
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(raft_log_path);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn file_store_rejects_unbound_and_gapped_apply() {
+        let dir = std::env::temp_dir().join(format!(
+            "chorus-storage-gaps-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let store = FileStateStore::open(&path).unwrap();
+        let origin = OriginId {
+            node_id: 4,
+            boot_nonce: [11; 16],
+        };
+        assert!(matches!(
+            store.apply(
+                LogId { term: 1, index: 1 },
+                &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 { origin },),
+            ),
+            Err(ChorusError::Protocol(_))
+        ));
+        store.initialize_cluster([12; 16], 1).unwrap();
+        assert!(matches!(
+            store.apply(
+                LogId { term: 1, index: 2 },
+                &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 { origin },),
+            ),
+            Err(ChorusError::Protocol(_))
+        ));
+        assert_eq!(store.snapshot().unwrap().last_applied(), LogId::ZERO);
+        let raft_log = store.raft_log_path().to_path_buf();
+        drop(store);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(raft_log);
         let _ = fs::remove_dir(dir);
     }
 }

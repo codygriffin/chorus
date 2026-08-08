@@ -9,6 +9,7 @@ members = [
     "crates/chorus-pg",
     "crates/chorus-admin",
     "crates/chorus-consensus",
+    "crates/chorus-testkit",
     "crates/chorus-node",
 ]
 

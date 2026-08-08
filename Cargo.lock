@@ -138,6 +138,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chorus-testkit"
+version = "0.1.0"
+dependencies = [
+ "chorus-codec",
+ "chorus-common",
+ "chorus-storage",
+]
+
+[[package]]
 name = "chorus-txn"
 version = "0.1.0"
 dependencies = [

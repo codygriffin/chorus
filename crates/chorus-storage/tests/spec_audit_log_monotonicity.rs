@@ -8,10 +8,15 @@ fn applying_a_stale_noop_cannot_move_last_applied_backwards() {
     let origin = OriginId::new(1);
     store
         .apply(
-            LogId { term: 4, index: 10 },
+            LogId { term: 4, index: 1 },
             &ReplicatedCommandV1::ActivateOrigin(ActivateOriginV1 { origin }),
         )
         .unwrap();
+    for index in 2..=10 {
+        store
+            .apply(LogId { term: 4, index }, &ReplicatedCommandV1::Noop)
+            .unwrap();
+    }
     assert_eq!(
         store.snapshot().unwrap().last_applied(),
         LogId { term: 4, index: 10 }

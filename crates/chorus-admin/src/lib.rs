@@ -606,6 +606,9 @@ pub fn logical_backup_from_store(store: &dyn StateStore) -> Result<LogicalSnapsh
     data.membership = chorus_storage::Membership::default();
     data.membership.log_id = chorus_common::LogId::ZERO;
     data.origins.clear();
+    // The logical snapshot entry stream is authoritative for KV bytes; do
+    // not duplicate them in the metadata state envelope.
+    data.kv.clear();
     let mut meta = std::collections::BTreeMap::new();
     meta.insert("backup_kind".into(), b"chorus-logical-backup-v1".to_vec());
     meta.insert(
@@ -714,5 +717,80 @@ fn merge_toml_table(value: &mut toml::Value, defaults: &toml::Value, section: &s
     };
     for (key, default) in defaults {
         table.entry(key.clone()).or_insert_with(|| default.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chorus_codec::{
+        ActivateOriginV1, CommitTransactionV1, KvMutationV1, ReplicatedCommandV1,
+        canonical_mutations, payload_hash,
+    };
+    use chorus_common::{LogId, OriginId, RequestId};
+    use chorus_storage::StateStore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn logical_backup_roundtrip_keeps_kv_in_single_entry_stream() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "chorus-admin-logical-backup-{}-{nonce}.state",
+            std::process::id()
+        ));
+        let raft_path = path.with_extension("raft.log");
+        let store = FileStateStore::open(&path).expect("open test store");
+        let cluster = ClusterId::from_name("chorus-admin-test");
+        store
+            .initialize_cluster(cluster.0, 1)
+            .expect("initialize cluster");
+        let origin = OriginId::new(7);
+        store
+            .apply(
+                LogId { term: 1, index: 1 },
+                &ReplicatedCommandV1::ActivateOrigin(ActivateOriginV1 { origin }),
+            )
+            .expect("activate origin");
+
+        let mutations = vec![KvMutationV1::Put {
+            key: vec![0x00, 0xff, 0x01],
+            value: vec![0xde, 0xad, 0xbe, 0xef],
+        }];
+        let request_id = RequestId::new(origin, 1);
+        let payload = canonical_mutations(&mutations).expect("canonical mutations");
+        let command = ReplicatedCommandV1::CommitTransaction(CommitTransactionV1 {
+            request_id,
+            payload_hash: payload_hash(1, &request_id, 0, &payload),
+            base_epoch: 0,
+            mutations,
+        });
+        store
+            .apply(LogId { term: 1, index: 2 }, &command)
+            .expect("commit mutation");
+
+        let backup = logical_backup_from_store(&store).expect("build backup");
+        assert_eq!(
+            backup.entries,
+            vec![(vec![0x00, 0xff, 0x01], vec![0xde, 0xad, 0xbe, 0xef])]
+        );
+        let state: chorus_storage::StateData =
+            serde_json::from_slice(backup.meta.get("state").expect("state metadata"))
+                .expect("decode state metadata");
+        assert!(
+            state.kv.is_empty(),
+            "metadata must not duplicate KV entries"
+        );
+
+        let decoded = LogicalSnapshot::decode(&backup.encode().expect("encode backup"))
+            .expect("decode backup");
+        assert_eq!(decoded.entries, backup.entries);
+        assert!(is_logical_backup(&decoded));
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(raft_path);
     }
 }

@@ -319,6 +319,12 @@ impl StateSnapshot {
             .take_while(move |(k, _)| end.map(|e| k.as_slice() < e).unwrap_or(true))
     }
     pub fn state_hash(&self) -> [u8; 32] {
+        // Preserve the original infallible snapshot API for diagnostics.
+        // Store-level callers use `try_state_hash`/`StateStore::state_hash`
+        // and receive the serialization error instead of this sentinel.
+        self.try_state_hash().unwrap_or([0; 32])
+    }
+    pub fn try_state_hash(&self) -> Result<[u8; 32]> {
         canonical_state_hash(&self.data)
     }
     pub fn to_data(&self) -> StateData {
@@ -414,16 +420,20 @@ impl StateStore for MemoryStateStore {
         self.install_snapshot(snapshot, false)
     }
     fn state_hash(&self) -> Result<[u8; 32]> {
-        Ok(self.snapshot()?.state_hash())
+        self.snapshot()?.try_state_hash()
     }
     fn status(&self) -> StoreStatus {
         let d = self.data();
+        let (state_hash, healthy) = match canonical_state_hash(&d) {
+            Ok(hash) => (hash, true),
+            Err(_) => ([0; 32], false),
+        };
         StoreStatus {
             db_epoch: d.db_epoch,
             catalog_epoch: d.catalog_epoch,
             last_applied: d.last_applied,
-            state_hash: canonical_state_hash(&d),
-            healthy: true,
+            state_hash,
+            healthy,
         }
     }
 }
@@ -2040,9 +2050,85 @@ fn index_entry_key(
     )
 }
 
-fn canonical_state_hash(data: &StateData) -> [u8; 32] {
-    let bytes = serde_json::to_vec(data).unwrap_or_default();
-    hash32(&bytes)
+#[derive(Serialize)]
+struct CanonicalLogicalKv<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+}
+
+#[derive(Serialize)]
+struct CanonicalLogicalStateV1<'a> {
+    format_version: u8,
+    db_epoch: u64,
+    catalog_epoch: u64,
+    catalog: &'a Catalog,
+    kv: Vec<CanonicalLogicalKv<'a>>,
+    origins: &'a BTreeMap<u64, NodeOriginState>,
+    membership: &'a Membership,
+}
+
+/// Hash the replicated logical database state, not its Raft placement or
+/// local representation. Cluster identity/incarnation and `last_applied` are
+/// deliberately absent: they can differ across recovery/rebinding while the
+/// database contents are identical. Likewise, physical bytes retained only
+/// for dropped objects and redundant catalog-key material are excluded.
+///
+/// `hash32` is the repository's current SHA-256 compatibility fallback. The
+/// MVP specification requires a pinned BLAKE3 implementation before release;
+/// changing that primitive remains an explicit format/version transition.
+fn canonical_state_hash(data: &StateData) -> Result<[u8; 32]> {
+    const DOMAIN: &[u8] = b"CHORUS-CANONICAL-LOGICAL-STATE-V1\0";
+    let kv = data
+        .kv
+        .iter()
+        .filter(|(key, _)| canonical_kv_is_live(data, key))
+        .map(|(key, value)| CanonicalLogicalKv {
+            key: key.as_slice(),
+            value: value.as_slice(),
+        })
+        .collect();
+    let logical = CanonicalLogicalStateV1 {
+        format_version: data.format_version,
+        db_epoch: data.db_epoch,
+        catalog_epoch: data.catalog_epoch,
+        catalog: &data.catalog,
+        kv,
+        origins: &data.origins,
+        membership: &data.membership,
+    };
+    let encoded = serde_json::to_vec(&logical)
+        .map_err(|error| ChorusError::Serialization(format!("state hash encode: {error}")))?;
+    let mut input = Vec::with_capacity(DOMAIN.len() + encoded.len());
+    input.extend_from_slice(DOMAIN);
+    input.extend_from_slice(&encoded);
+    Ok(hash32(&input))
+}
+
+fn canonical_kv_is_live(data: &StateData, key: &[u8]) -> bool {
+    if key.len() < 5 {
+        // Short private keys are valid replicated logical state.
+        return true;
+    }
+    let object_id = u32::from_be_bytes([key[1], key[2], key[3], key[4]]);
+    match key[0] {
+        0x10..=0x14 => false, // Catalog is represented canonically above.
+        0x20 => data
+            .catalog
+            .tables
+            .get(&object_id)
+            .is_some_and(|table| table.state == ObjectState::Live),
+        0x21 | 0x22 => data.catalog.indexes.get(&object_id).is_some_and(|index| {
+            index.state == ObjectState::Live
+                && data
+                    .catalog
+                    .tables
+                    .get(&index.table_oid)
+                    .is_some_and(|table| table.state == ObjectState::Live)
+        }),
+        // Unknown/reserved replicated keys are included so corruption or a
+        // future logical namespace cannot be silently hidden by the hash.
+        _ => true,
+    }
 }
 
 pub fn snapshot_from_store(store: &dyn StateStore) -> Result<LogicalSnapshot> {

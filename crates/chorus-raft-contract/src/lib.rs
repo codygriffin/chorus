@@ -15,6 +15,8 @@ use chorus_common::{ChorusError, LogId, Result};
 use chorus_storage::consensus_log::{ConsensusLogEntry, DurableConsensusLog, HardState};
 use std::path::Path;
 
+pub mod state_machine;
+
 /// The state of one capability in the internal readiness report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Capability {
@@ -156,6 +158,10 @@ impl InternalRaftLog {
 
     pub fn commit(&self, index: u64) -> Result<()> {
         self.log.set_commit_index(index)
+    }
+
+    pub fn mark_applied(&self, log_id: LogId) -> Result<()> {
+        self.log.mark_applied(log_id)
     }
 
     pub fn committed_range(&self, start: u64, end: u64) -> Result<Vec<ConsensusLogEntry>> {

@@ -17,6 +17,10 @@ use uuid::Uuid;
 pub const FORMAT_VERSION: u8 = 1;
 pub const MAX_KEY_BYTES: usize = 8 * 1024;
 pub const MAX_INDEXED_VALUE_BYTES: usize = 4 * 1024;
+/// PostgreSQL's timestamp wire epoch (2000-01-01), retained for protocol
+/// adapters.  SQL values inside Chorus use Unix microseconds so diagnostics
+/// and the host clock helper share one representation.
+pub const POSTGRES_EPOCH_UNIX_SECS: i64 = 946_684_800;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct OriginId {
@@ -241,8 +245,8 @@ impl Datum {
             Self::Float64(v) => v.to_string(),
             Self::Text(v) => v.clone(),
             Self::Bytes(v) => format!("\\x{}", hex(v)),
-            Self::Date(v) => v.to_string(),
-            Self::Timestamp(v) | Self::TimestampTz(v) => v.to_string(),
+            Self::Date(v) => format_date(*v),
+            Self::Timestamp(v) | Self::TimestampTz(v) => format_timestamp(*v),
             Self::Uuid(v) => uuid_text(v),
             Self::Jsonb(v) => v.clone(),
         }
@@ -483,6 +487,52 @@ pub fn unix_now_us() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
+}
+
+/// Format a PostgreSQL-style date value (days since 1970-01-01) without a
+/// locale or time-zone dependency.
+pub fn format_date(days_since_unix_epoch: i32) -> String {
+    let (year, month, day) = civil_from_days(days_since_unix_epoch as i64);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Format a UTC timestamp represented as Unix microseconds.  PostgreSQL's
+/// text representation is intentionally kept at microsecond precision only
+/// when needed.
+pub fn format_timestamp(micros: i64) -> String {
+    let seconds = micros.div_euclid(1_000_000);
+    let fraction = micros.rem_euclid(1_000_000);
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+    if fraction == 0 {
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+    } else {
+        let mut frac = format!("{fraction:06}");
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{frac}")
+    }
+}
+
+// Howard Hinnant's proleptic-Gregorian civil calendar conversion, expressed
+// without floating point so dates before the Unix epoch remain correct.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year, m, d)
 }
 
 pub fn checked_add_u64(a: u64, b: u64, what: &str) -> Result<u64> {

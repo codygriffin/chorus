@@ -7,7 +7,9 @@ use chorus_codec::{
     payload_hash,
 };
 use chorus_common::{ChorusError, Limits, LogId, OriginId, RequestId, Result, unix_now_us};
-use chorus_storage::{MemoryStateStore, StateSnapshot, StateStore};
+use chorus_storage::{StateSnapshot, StateStore};
+#[cfg(test)]
+use chorus_storage::MemoryStateStore;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -228,7 +230,7 @@ impl Transaction {
             started_at: Instant::now(),
             limits,
             status: TransactionStatus::Active,
-            read_only: true,
+            read_only: false,
         }
     }
     pub fn with_id(snapshot: StateSnapshot, limits: Limits, id: [u8; 16]) -> Self {
@@ -236,9 +238,13 @@ impl Transaction {
         t.transaction_id = id;
         t
     }
-    pub fn set_statement_time(&mut self) {
+    pub fn set_statement_time(&mut self) -> Result<()> {
         self.statement_timestamp_us = unix_now_us();
-        self.statement_ordinal = self.statement_ordinal.saturating_add(1);
+        self.statement_ordinal = self
+            .statement_ordinal
+            .checked_add(1)
+            .ok_or_else(|| ChorusError::Limit("statement ordinal exhausted".into()))?;
+        Ok(())
     }
     pub fn check_age(&self) -> Result<()> {
         if self.started_at.elapsed() > Duration::from_millis(self.limits.max_transaction_age_ms) {
@@ -269,11 +275,23 @@ impl Transaction {
     }
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         self.check_age()?;
+        if self.read_only {
+            return Err(ChorusError::Sql(chorus_common::SqlError::new(
+                "25006",
+                "cannot execute write in a read-only transaction",
+            )));
+        }
         self.read_only = false;
         self.overlay.put(key, value)
     }
     pub fn delete(&mut self, key: Vec<u8>) -> Result<()> {
         self.check_age()?;
+        if self.read_only {
+            return Err(ChorusError::Sql(chorus_common::SqlError::new(
+                "25006",
+                "cannot execute write in a read-only transaction",
+            )));
+        }
         self.read_only = false;
         self.overlay.delete(key)
     }

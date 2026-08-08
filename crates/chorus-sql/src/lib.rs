@@ -1363,6 +1363,9 @@ impl SqlSession {
         s: Statement,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
+        if self.failed && !matches!(s, Statement::Commit | Statement::Rollback) {
+            return Err(SqlError::failed_transaction());
+        }
         match s {
             Statement::Begin { read_only } => {
                 if self.txn.is_some() {
@@ -1585,7 +1588,8 @@ impl SqlSession {
         q: Select,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
-        tx.set_statement_time();
+        tx.check_age().map_err(to_sql)?;
+        tx.set_statement_time().map_err(to_sql)?;
         if q.from
             .as_deref()
             .is_some_and(|name| is_virtual_relation(name))
@@ -1982,7 +1986,8 @@ impl SqlSession {
         q: Insert,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
-        tx.set_statement_time();
+        tx.check_age().map_err(to_sql)?;
+        tx.set_statement_time().map_err(to_sql)?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let cols: Vec<_> = if q.columns.is_empty() {
             table
@@ -2197,7 +2202,8 @@ impl SqlSession {
         q: Update,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
-        tx.set_statement_time();
+        tx.check_age().map_err(to_sql)?;
+        tx.set_statement_time().map_err(to_sql)?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let targets = scan(tx, &table)?;
         let mut ret = Vec::new();
@@ -2294,7 +2300,8 @@ impl SqlSession {
         q: Delete,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
-        tx.set_statement_time();
+        tx.check_age().map_err(to_sql)?;
+        tx.set_statement_time().map_err(to_sql)?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let targets = scan(tx, &table)?;
         let mut ret = Vec::new();

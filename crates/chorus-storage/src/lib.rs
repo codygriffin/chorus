@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub const META_DB_EPOCH: &str = "db_epoch";
 pub const META_CATALOG_EPOCH: &str = "catalog_epoch";
@@ -376,6 +376,7 @@ impl StateStore for MemoryStateStore {
 pub struct FileStateStore {
     path: Arc<PathBuf>,
     memory: MemoryStateStore,
+    persist_lock: Arc<Mutex<()>>,
 }
 
 impl FileStateStore {
@@ -398,6 +399,7 @@ impl FileStateStore {
         Ok(Self {
             path: Arc::new(path),
             memory,
+            persist_lock: Arc::new(Mutex::new(())),
         })
     }
     fn persist(&self) -> Result<()> {
@@ -426,6 +428,10 @@ impl FileStateStore {
                 "cluster incarnation must be nonzero".into(),
             ));
         }
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
         {
             let mut data = self
                 .memory
@@ -449,6 +455,10 @@ impl FileStateStore {
             data.cluster_id == [0; 16] && data.last_applied == LogId::ZERO && data.db_epoch == 0
         };
         if needs_init {
+            let _persist_guard = self
+                .persist_lock
+                .lock()
+                .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
             {
                 let mut data = self
                     .memory
@@ -470,13 +480,38 @@ impl StateStore for FileStateStore {
         self.memory.snapshot()
     }
     fn apply(&self, log_id: LogId, command: &ReplicatedCommandV1) -> Result<ApplyResult> {
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
+        let before = self.memory.data();
         let out = self.memory.apply(log_id, command)?;
-        self.persist()?;
+        if let Err(error) = self.persist() {
+            *self
+                .memory
+                .inner
+                .write()
+                .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
+            return Err(error);
+        }
         Ok(out)
     }
     fn install(&self, snapshot: &LogicalSnapshot) -> Result<()> {
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
+        let before = self.memory.data();
         self.memory.install(snapshot)?;
-        self.persist()
+        if let Err(error) = self.persist() {
+            *self
+                .memory
+                .inner
+                .write()
+                .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
+            return Err(error);
+        }
+        Ok(())
     }
     fn state_hash(&self) -> Result<[u8; 32]> {
         self.memory.state_hash()
@@ -497,22 +532,38 @@ fn apply_command(
     let result = match command {
         ReplicatedCommandV1::Noop => ApplyResult::Noop,
         ReplicatedCommandV1::Membership { voters, learners } => {
+            let voters = sorted_unique(voters);
+            let learners = sorted_unique(learners);
+            if voters.iter().any(|id| learners.binary_search(id).is_ok())
+                || voters.contains(&0)
+                || learners.contains(&0)
+            {
+                return Ok(ApplyResult::Rejected(
+                    "membership contains overlapping or invalid node ids".into(),
+                ));
+            }
             data.membership = Membership {
                 log_id,
-                voters: sorted_unique(voters),
-                learners: sorted_unique(learners),
+                voters,
+                learners,
             };
             ApplyResult::Noop
         }
         ReplicatedCommandV1::ActivateOrigin(a) => {
-            data.origins.insert(
-                a.origin.node_id,
-                NodeOriginState {
-                    active_origin: a.origin,
-                    last_sequence: 0,
-                    recent_results: Vec::new(),
-                },
-            );
+            if !data
+                .origins
+                .get(&a.origin.node_id)
+                .is_some_and(|state| state.active_origin == a.origin)
+            {
+                data.origins.insert(
+                    a.origin.node_id,
+                    NodeOriginState {
+                        active_origin: a.origin,
+                        last_sequence: 0,
+                        recent_results: Vec::new(),
+                    },
+                );
+            }
             ApplyResult::Activated
         }
         ReplicatedCommandV1::CommitTransaction(c) => apply_commit(data, log_id, c)?,
@@ -557,7 +608,11 @@ fn apply_commit(
     if c.request_id.sequence <= state.last_sequence {
         return Ok(ApplyResult::AlreadyProcessed);
     }
-    if c.request_id.sequence != state.last_sequence + 1 {
+    let expected_sequence = state
+        .last_sequence
+        .checked_add(1)
+        .ok_or_else(|| ChorusError::Limit("request sequence exhausted".into()))?;
+    if c.request_id.sequence != expected_sequence {
         return Ok(ApplyResult::ProtocolError("request sequence gap".into()));
     }
     let mut canonical = Vec::new();
@@ -590,7 +645,9 @@ fn apply_commit(
             }
         }
         previous_key = Some(m.key());
-        bytes += m.encoded_len();
+        bytes = bytes
+            .checked_add(m.encoded_len())
+            .ok_or_else(|| ChorusError::Limit("transaction mutation size exhausted".into()))?;
         if m.key().len() > 8 * 1024 {
             let result = ApplyResult::Rejected("physical key exceeds limit".into());
             record_data_result(data, origin, c, result.clone());
@@ -762,7 +819,11 @@ fn apply_schema(
                 "duplicate schema payload".into(),
             ));
         }
-        if c.request_id.sequence != state.last_sequence + 1 {
+        let expected_sequence = state
+            .last_sequence
+            .checked_add(1)
+            .ok_or_else(|| ChorusError::Limit("request sequence exhausted".into()))?;
+        if c.request_id.sequence != expected_sequence {
             return Ok(if c.request_id.sequence <= state.last_sequence {
                 ApplyResult::AlreadyProcessed
             } else {
@@ -805,8 +866,17 @@ fn apply_schema(
         return Ok(result);
     }
     let op = c.operation.clone();
-    let result =
-        apply_schema_op(data, &op).unwrap_or_else(|e| ApplyResult::Rejected(e.to_string()));
+    // Schema operations may build indexes by scanning and inserting many
+    // entries. Keep a state-data checkpoint so a deterministic rejection
+    // cannot leave a partially-built catalog or index behind.
+    let before_schema = data.clone();
+    let result = match apply_schema_op(data, &op) {
+        Ok(result) => result,
+        Err(error) => {
+            *data = before_schema;
+            ApplyResult::Rejected(error.to_string())
+        }
+    };
     if matches!(result, ApplyResult::Rejected(_)) {
         record_result(
             data.origins
@@ -852,6 +922,27 @@ fn apply_schema_op(
             columns,
             primary_key,
         } => {
+            if *table_id == 0 || name.is_empty() || name.len() > 63 {
+                return Err(SqlError::new("54000", "invalid table identifier"));
+            }
+            if columns.is_empty() || columns.len() > 256 {
+                return Err(SqlError::new("54000", "table must contain 1..256 columns"));
+            }
+            let mut column_ids = std::collections::BTreeSet::new();
+            let mut column_names = std::collections::BTreeSet::new();
+            for (id, column_name, _, _, _) in columns {
+                if *id == 0
+                    || !column_ids.insert(*id)
+                    || column_name.is_empty()
+                    || column_name.len() > 63
+                    || !column_names.insert(column_name)
+                {
+                    return Err(SqlError::new("42710", "duplicate or invalid column"));
+                }
+            }
+            if primary_key.len() > 16 || primary_key.iter().any(|id| !column_ids.contains(id)) {
+                return Err(SqlError::new("42703", "primary key column does not exist"));
+            }
             if data.catalog.table_by_name(name).is_some() {
                 return Err(SqlError::new("42P07", "relation already exists"));
             }
@@ -866,14 +957,16 @@ fn apply_schema_op(
                     state: ColumnState::Live,
                 })
                 .collect();
-            data.catalog.next_object_id = data.catalog.next_object_id.max(*table_id + 1).max(
-                columns
-                    .iter()
-                    .map(|(id, _, _, _, _)| *id)
-                    .max()
-                    .unwrap_or(0)
-                    + 1,
-            );
+            let table_next = checked_next_u32(*table_id, "table object id")?;
+            let column_next = columns
+                .iter()
+                .map(|(id, _, _, _, _)| checked_next_u32(*id, "column object id"))
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            data.catalog.next_object_id =
+                data.catalog.next_object_id.max(table_next).max(column_next);
             data.catalog.tables.insert(
                 *table_id,
                 TableDescriptor {
@@ -893,15 +986,28 @@ fn apply_schema_op(
             table_id,
             expected_version,
         } => {
+            let index_ids = data
+                .catalog
+                .table(*table_id)
+                .ok_or_else(|| SqlError::new("42P01", "table does not exist"))
+                .and_then(|table| {
+                    if table.schema_version != *expected_version {
+                        Err(SqlError::serialization("table descriptor changed"))
+                    } else {
+                        Ok(table.secondary_indexes.clone())
+                    }
+                })?;
+            for index_id in &index_ids {
+                if let Some(index) = data.catalog.indexes.get_mut(index_id) {
+                    index.state = ObjectState::Dropped;
+                }
+            }
             let t = data
                 .catalog
                 .table_mut(*table_id)
                 .ok_or_else(|| SqlError::new("42P01", "table does not exist"))?;
-            if t.schema_version != *expected_version {
-                return Err(SqlError::serialization("table descriptor changed"));
-            }
             t.state = ObjectState::Dropped;
-            t.schema_version += 1;
+            t.schema_version = checked_next_u32(t.schema_version, "schema version")?;
         }
         SchemaOperationV1::AddColumn {
             table_id,
@@ -917,9 +1023,12 @@ fn apply_schema_op(
                 .table_mut(*table_id)
                 .ok_or_else(|| SqlError::new("42P01", "table does not exist"))?;
             if t.schema_version != *expected_version
-                || t.columns
-                    .iter()
-                    .any(|c| c.name == *name && c.state == ColumnState::Live)
+                || t.columns.iter().any(|c| {
+                    (c.name == *name && c.state == ColumnState::Live) || c.id == *column_id
+                })
+                || *column_id == 0
+                || name.is_empty()
+                || name.len() > 63
             {
                 return Err(SqlError::new(
                     "42701",
@@ -934,34 +1043,72 @@ fn apply_schema_op(
                 default: default.clone(),
                 state: ColumnState::Live,
             });
-            t.schema_version += 1;
-            data.catalog.next_object_id = data.catalog.next_object_id.max(*column_id + 1);
+            t.schema_version = checked_next_u32(t.schema_version, "schema version")?;
+            data.catalog.next_object_id = data
+                .catalog
+                .next_object_id
+                .max(checked_next_u32(*column_id, "column object id")?);
         }
         SchemaOperationV1::DropColumn {
             table_id,
             column_id,
             expected_version,
         } => {
+            let (primary_key, secondary_indexes, schema_version) = data
+                .catalog
+                .table(*table_id)
+                .ok_or_else(|| SqlError::new("42P01", "table does not exist"))
+                .map(|table| {
+                    (
+                        table.primary_key,
+                        table.secondary_indexes.clone(),
+                        table.schema_version,
+                    )
+                })?;
+            if schema_version != *expected_version {
+                return Err(SqlError::serialization("table descriptor changed"));
+            }
+            let used_by_index = secondary_indexes.iter().any(|index_id| {
+                data.catalog.indexes.get(index_id).is_some_and(|index| {
+                    index
+                        .columns
+                        .iter()
+                        .any(|column| column.column_id == *column_id)
+                })
+            });
+            if primary_key == Some(*column_id) || used_by_index {
+                return Err(SqlError::new(
+                    "2BP01",
+                    "cannot drop a column used by an index or primary key",
+                ));
+            }
             let t = data
                 .catalog
                 .table_mut(*table_id)
                 .ok_or_else(|| SqlError::new("42P01", "table does not exist"))?;
-            if t.schema_version != *expected_version {
-                return Err(SqlError::serialization("table descriptor changed"));
-            }
             let c = t
                 .columns
                 .iter_mut()
                 .find(|c| c.id == *column_id)
                 .ok_or_else(|| SqlError::new("42703", "column does not exist"))?;
             c.state = ColumnState::Dropped;
-            t.schema_version += 1;
+            t.schema_version = checked_next_u32(t.schema_version, "schema version")?;
         }
         SchemaOperationV1::RenameTable {
             table_id,
             new_name,
             expected_version,
         } => {
+            if new_name.is_empty() || new_name.len() > 63 {
+                return Err(SqlError::new("42602", "invalid relation name"));
+            }
+            if data
+                .catalog
+                .table_by_name(new_name)
+                .is_some_and(|table| table.oid != *table_id)
+            {
+                return Err(SqlError::new("42P07", "relation already exists"));
+            }
             let t = data
                 .catalog
                 .table_mut(*table_id)
@@ -970,7 +1117,7 @@ fn apply_schema_op(
                 return Err(SqlError::serialization("table descriptor changed"));
             }
             t.name = new_name.clone();
-            t.schema_version += 1;
+            t.schema_version = checked_next_u32(t.schema_version, "schema version")?;
         }
         SchemaOperationV1::RenameColumn {
             table_id,
@@ -978,6 +1125,29 @@ fn apply_schema_op(
             new_name,
             expected_version,
         } => {
+            if new_name.is_empty() || new_name.len() > 63 {
+                return Err(SqlError::new("42602", "invalid column name"));
+            }
+            let (schema_version, duplicate) = data
+                .catalog
+                .table(*table_id)
+                .ok_or_else(|| SqlError::new("42P01", "table does not exist"))
+                .map(|table| {
+                    (
+                        table.schema_version,
+                        table.columns.iter().any(|column| {
+                            column.state == ColumnState::Live
+                                && column.id != *column_id
+                                && column.name == *new_name
+                        }),
+                    )
+                })?;
+            if schema_version != *expected_version {
+                return Err(SqlError::serialization("table descriptor changed"));
+            }
+            if duplicate {
+                return Err(SqlError::new("42701", "column already exists"));
+            }
             let t = data
                 .catalog
                 .table_mut(*table_id)
@@ -991,7 +1161,7 @@ fn apply_schema_op(
                 .find(|c| c.id == *column_id)
                 .ok_or_else(|| SqlError::new("42703", "column does not exist"))?;
             c.name = new_name.clone();
-            t.schema_version += 1;
+            t.schema_version = checked_next_u32(t.schema_version, "schema version")?;
         }
         SchemaOperationV1::CreateIndex {
             index_id,
@@ -1000,6 +1170,9 @@ fn apply_schema_op(
             unique,
             columns,
         } => {
+            if *index_id == 0 || name.is_empty() || name.len() > 63 {
+                return Err(SqlError::new("54000", "invalid index identifier"));
+            }
             if data.catalog.index_by_name(name).is_some() {
                 return Err(SqlError::new("42P07", "index already exists"));
             }
@@ -1068,8 +1241,11 @@ fn apply_schema_op(
             data.catalog.indexes.insert(*index_id, desc);
             let t = data.catalog.table_mut(*table_id).expect("table checked");
             t.secondary_indexes.push(*index_id);
-            t.schema_version += 1;
-            data.catalog.next_object_id = data.catalog.next_object_id.max(*index_id + 1);
+            t.schema_version = checked_next_u32(t.schema_version, "schema version")?;
+            data.catalog.next_object_id = data
+                .catalog
+                .next_object_id
+                .max(checked_next_u32(*index_id, "index object id")?);
         }
         SchemaOperationV1::DropIndex {
             index_id,
@@ -1090,7 +1266,7 @@ fn apply_schema_op(
                 i.state = ObjectState::Dropped;
             }
             let t = data.catalog.table_mut(table_id).expect("table checked");
-            t.schema_version += 1;
+            t.schema_version = checked_next_u32(t.schema_version, "schema version")?;
         }
     }
     Ok(ApplyResult::Noop)
@@ -1101,6 +1277,12 @@ fn index_contains_null(index: &IndexDescriptor, row: &EncodedRowV1) -> bool {
         .columns
         .iter()
         .any(|c| row.get(c.column_id).is_none_or(Datum::is_null))
+}
+
+fn checked_next_u32(value: u32, what: &str) -> std::result::Result<u32, SqlError> {
+    value
+        .checked_add(1)
+        .ok_or_else(|| SqlError::new("54000", format!("{what} exhausted")))
 }
 
 fn index_entry_key(

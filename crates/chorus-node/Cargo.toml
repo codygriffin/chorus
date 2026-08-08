@@ -1,0 +1,22 @@
+[package]
+name = "chorus-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "chorus"
+path = "src/main.rs"
+
+[dependencies]
+chorus-common = { path = "../chorus-common" }
+chorus-codec = { path = "../chorus-codec" }
+chorus-storage = { path = "../chorus-storage" }
+chorus-txn = { path = "../chorus-txn" }
+chorus-sql = { path = "../chorus-sql" }
+chorus-pg = { path = "../chorus-pg" }
+chorus-admin = { path = "../chorus-admin" }
+chorus-consensus = { path = "../chorus-consensus" }
+serde_json = "1.0.151"
+toml = "1.1.2"
+thiserror = "2.0.19"

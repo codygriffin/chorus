@@ -1,0 +1,13 @@
+[package]
+name = "chorus-pg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chorus-common = { path = "../chorus-common" }
+chorus-sql = { path = "../chorus-sql" }
+chorus-txn = { path = "../chorus-txn" }
+chorus-storage = { path = "../chorus-storage" }
+thiserror = "2.0.19"
+uuid = { version = "1.22.0", features = ["v4"] }

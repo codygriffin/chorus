@@ -1,0 +1,13 @@
+[package]
+name = "chorus-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chorus-common = { path = "../chorus-common" }
+chorus-codec = { path = "../chorus-codec" }
+chorus-storage = { path = "../chorus-storage" }
+chorus-txn = { path = "../chorus-txn" }
+thiserror = "2.0.19"
+serde = { version = "1.0.228", features = ["derive"] }

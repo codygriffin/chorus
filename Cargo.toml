@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/chorus-common",
+    "crates/chorus-codec",
+    "crates/chorus-storage",
+    "crates/chorus-txn",
+    "crates/chorus-sql",
+    "crates/chorus-pg",
+    "crates/chorus-admin",
+    "crates/chorus-consensus",
+    "crates/chorus-node",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

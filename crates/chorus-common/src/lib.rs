@@ -556,4 +556,14 @@ mod tests {
             r#"{"a":2,"b":1}"#
         );
     }
+    #[test]
+    fn temporal_text_is_stable() {
+        assert_eq!(format_date(0), "1970-01-01");
+        assert_eq!(format_date(19_723), "2024-01-01");
+        assert_eq!(
+            format_timestamp(1_704_067_200_123_000),
+            "2024-01-01 00:00:00.123"
+        );
+        assert_eq!(Datum::Date(0).display_text(), "1970-01-01");
+    }
 }

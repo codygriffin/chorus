@@ -7,6 +7,8 @@
 //! memory and file implementations make the repository useful before a redb
 //! adapter is introduced, while preserving the same on-disk logical format.
 
+pub mod consensus_log;
+
 use chorus_codec::{
     ApplyResult, CommitTransactionV1, EncodedRowV1, KvMutationV1, LogicalSnapshot, MAX_ROW_BYTES,
     NodeOriginState, PhysicalKey, ReplicatedCommandV1, SchemaOperationV1, canonical_mutations,

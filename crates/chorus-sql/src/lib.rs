@@ -1719,8 +1719,15 @@ impl SqlSession {
             .transpose()?
             .cloned();
         if let Some(table) = table {
+            SelectBindingScope::for_query(tx.snapshot.catalog(), &table, &q)?;
             let checker = self.cancellation_checker();
             let mut rows = scan(tx, &table, checker)?;
+            let base_qualifier = q.from_alias.as_deref().unwrap_or(&table.name);
+            for row in &mut rows {
+                for cell in &mut row.cells {
+                    cell.qualifier = Some(base_qualifier.to_string());
+                }
+            }
             if !q.joins.is_empty() {
                 rows =
                     self.join_rows(tx, &table, q.from_alias.as_deref(), rows, &q.joins, params)?;
@@ -1802,6 +1809,7 @@ impl SqlSession {
                 notices: Vec::new(),
             })
         } else {
+            SelectBindingScope::default().validate_query_expressions(&q)?;
             let columns = q
                 .projection
                 .iter()
@@ -2025,6 +2033,14 @@ impl SqlSession {
                 SqlError::new("42P01", format!("relation \"{relation}\" does not exist"))
             })?;
         let table = virtual_table(relation, &columns);
+        let qualifier = q
+            .from_alias
+            .as_deref()
+            .unwrap_or_else(|| relation_leaf(relation))
+            .to_string();
+        let mut binding = SelectBindingScope::default();
+        binding.add_table(&table, &qualifier)?;
+        binding.validate_query_expressions(&q)?;
         let checker = self.cancellation_checker();
         let mut rows = values
             .into_iter()
@@ -2034,7 +2050,7 @@ impl SqlSession {
                     .zip(values)
                     .map(|((name, _), value)| Cell {
                         name: name.clone(),
-                        qualifier: None,
+                        qualifier: Some(qualifier.clone()),
                         value,
                     })
                     .collect(),
@@ -2544,17 +2560,10 @@ impl SqlSession {
                 .get(n - 1)
                 .cloned()
                 .ok_or_else(|| SqlError::new("42P02", "missing parameter")),
-            Expr::Column(n) => row
-                .iter()
-                .find(|c| c.name == *n)
-                .map(|c| c.value.clone())
-                .ok_or_else(|| SqlError::new("42703", format!("column {n} does not exist"))),
-            Expr::Qualified(q, n) => row
-                .iter()
-                .find(|c| c.qualifier.as_deref() == Some(q.as_str()) && c.name == *n)
-                .or_else(|| row.iter().find(|c| c.name == *n))
-                .map(|c| c.value.clone())
-                .ok_or_else(|| SqlError::new("42703", format!("column {q}.{n} does not exist"))),
+            Expr::Column(n) => resolve_row_column(row, n).map(|cell| cell.value.clone()),
+            Expr::Qualified(q, n) => {
+                resolve_row_qualified(row, q, n).map(|cell| cell.value.clone())
+            }
             Expr::Star => Err(SqlError::new("42601", "* is only valid in a SELECT list")),
             Expr::Unary(op, x) => {
                 let v = self.eval(x, row, params)?;
@@ -2802,12 +2811,243 @@ impl Statement {
     }
 }
 
+#[derive(Default)]
+struct SelectBindingScope {
+    qualifiers: Vec<String>,
+    columns: Vec<(String, String)>,
+}
+
+impl SelectBindingScope {
+    fn for_query(
+        catalog: &Catalog,
+        base: &TableDescriptor,
+        query: &Select,
+    ) -> std::result::Result<Self, SqlError> {
+        let mut scope = Self::default();
+        scope.add_table(base, query.from_alias.as_deref().unwrap_or(&base.name))?;
+        for join in &query.joins {
+            let table = find_table(catalog, &join.relation)?;
+            scope.add_table(table, join.alias.as_deref().unwrap_or(&table.name))?;
+            // An ON clause can see the left side and the relation currently
+            // being joined, but not relations appearing later in the query.
+            scope.validate_expr(&join.on)?;
+        }
+        scope.validate_query_expressions(query)?;
+        Ok(scope)
+    }
+
+    fn add_table(
+        &mut self,
+        table: &TableDescriptor,
+        qualifier: &str,
+    ) -> std::result::Result<(), SqlError> {
+        if self.qualifiers.iter().any(|old| old == qualifier) {
+            return Err(SqlError::new(
+                "42712",
+                format!("table name \"{qualifier}\" specified more than once"),
+            ));
+        }
+        self.qualifiers.push(qualifier.to_string());
+        self.columns.extend(
+            table
+                .columns
+                .iter()
+                .filter(|column| column.state == ColumnState::Live)
+                .map(|column| (qualifier.to_string(), column.name.clone())),
+        );
+        Ok(())
+    }
+
+    fn validate_query_expressions(&self, query: &Select) -> std::result::Result<(), SqlError> {
+        for expression in &query.projection {
+            self.validate_expr(expression)?;
+        }
+        if let Some(expression) = &query.selection {
+            self.validate_expr(expression)?;
+        }
+        for expression in &query.group_by {
+            self.validate_expr(expression)?;
+        }
+        if let Some(expression) = &query.having {
+            self.validate_expr(expression)?;
+        }
+        for (expression, _) in &query.order {
+            self.validate_expr(expression)?;
+        }
+        Ok(())
+    }
+
+    fn validate_expr(&self, expression: &Expr) -> std::result::Result<(), SqlError> {
+        match expression {
+            Expr::Column(name) => self.resolve_unqualified(name),
+            Expr::Qualified(qualifier, name) => self.resolve_qualified(qualifier, name),
+            Expr::Unary(_, expression)
+            | Expr::IsNull(expression, _)
+            | Expr::Cast(expression, _) => self.validate_expr(expression),
+            Expr::Binary(left, _, right) | Expr::Like(left, right, _) => {
+                self.validate_expr(left)?;
+                self.validate_expr(right)
+            }
+            Expr::In(expression, values, _) => {
+                self.validate_expr(expression)?;
+                for value in values {
+                    self.validate_expr(value)?;
+                }
+                Ok(())
+            }
+            Expr::Between(expression, lower, upper, _) => {
+                self.validate_expr(expression)?;
+                self.validate_expr(lower)?;
+                self.validate_expr(upper)
+            }
+            Expr::Func(_, arguments) => {
+                for argument in arguments {
+                    self.validate_expr(argument)?;
+                }
+                Ok(())
+            }
+            Expr::Case(branches, otherwise) => {
+                for (condition, value) in branches {
+                    self.validate_expr(condition)?;
+                    self.validate_expr(value)?;
+                }
+                self.validate_expr(otherwise)
+            }
+            Expr::Literal(_) | Expr::Param(_) | Expr::Star => Ok(()),
+        }
+    }
+
+    fn resolve_unqualified(&self, name: &str) -> std::result::Result<(), SqlError> {
+        let matches = self
+            .columns
+            .iter()
+            .filter(|(_, column)| column == name)
+            .take(2)
+            .count();
+        match matches {
+            0 => Err(SqlError::new(
+                "42703",
+                format!("column \"{name}\" does not exist"),
+            )),
+            1 => Ok(()),
+            _ => Err(SqlError::new(
+                "42702",
+                format!("column reference \"{name}\" is ambiguous"),
+            )),
+        }
+    }
+
+    fn resolve_qualified(&self, qualifier: &str, name: &str) -> std::result::Result<(), SqlError> {
+        if !self.qualifiers.iter().any(|old| old == qualifier) {
+            return Err(SqlError::new(
+                "42P01",
+                format!("missing FROM-clause entry for table \"{qualifier}\""),
+            ));
+        }
+        if self
+            .columns
+            .iter()
+            .any(|(relation, column)| relation == qualifier && column == name)
+        {
+            Ok(())
+        } else {
+            Err(SqlError::new(
+                "42703",
+                format!("column {qualifier}.{name} does not exist"),
+            ))
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Cell {
     name: String,
     qualifier: Option<String>,
     value: Datum,
 }
+
+fn resolve_row_column<'a>(row: &'a [Cell], name: &str) -> std::result::Result<&'a Cell, SqlError> {
+    // DML and ON CONFLICT use qualifier=None for the target-row namespace;
+    // preserve its precedence over the separately-qualified `excluded` row.
+    let mut target = row
+        .iter()
+        .filter(|cell| cell.qualifier.is_none() && cell.name == name);
+    if let Some(first) = target.next() {
+        if target.next().is_some() {
+            return Err(SqlError::new(
+                "42702",
+                format!("column reference \"{name}\" is ambiguous"),
+            ));
+        }
+        return Ok(first);
+    }
+
+    let mut matches = row.iter().filter(|cell| cell.name == name);
+    match (matches.next(), matches.next()) {
+        (Some(cell), None) => Ok(cell),
+        (Some(_), Some(_)) => Err(SqlError::new(
+            "42702",
+            format!("column reference \"{name}\" is ambiguous"),
+        )),
+        _ => Err(SqlError::new(
+            "42703",
+            format!("column \"{name}\" does not exist"),
+        )),
+    }
+}
+
+fn resolve_row_qualified<'a>(
+    row: &'a [Cell],
+    qualifier: &str,
+    name: &str,
+) -> std::result::Result<&'a Cell, SqlError> {
+    let mut exact = row
+        .iter()
+        .filter(|cell| cell.qualifier.as_deref() == Some(qualifier) && cell.name == name);
+    match (exact.next(), exact.next()) {
+        (Some(cell), None) => return Ok(cell),
+        (Some(_), Some(_)) => {
+            return Err(SqlError::new(
+                "42702",
+                format!("column reference \"{qualifier}.{name}\" is ambiguous"),
+            ));
+        }
+        _ => {}
+    }
+
+    // Target rows in DML do not carry a qualifier in this compact executor.
+    // SELECT rows are statically bound and always carry effective aliases, so
+    // this compatibility fallback cannot mask a bad SELECT qualifier.
+    let mut target = row
+        .iter()
+        .filter(|cell| cell.qualifier.is_none() && cell.name == name);
+    match (target.next(), target.next()) {
+        (Some(cell), None) => return Ok(cell),
+        (Some(_), Some(_)) => {
+            return Err(SqlError::new(
+                "42702",
+                format!("column reference \"{name}\" is ambiguous"),
+            ));
+        }
+        _ => {}
+    }
+
+    if row
+        .iter()
+        .any(|cell| cell.qualifier.as_deref() == Some(qualifier))
+    {
+        Err(SqlError::new(
+            "42703",
+            format!("column {qualifier}.{name} does not exist"),
+        ))
+    } else {
+        Err(SqlError::new(
+            "42P01",
+            format!("missing FROM-clause entry for table \"{qualifier}\""),
+        ))
+    }
+}
+
 struct Row {
     key: Vec<u8>,
     row: chorus_codec::EncodedRowV1,
@@ -4242,6 +4482,135 @@ mod tests {
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][1], Datum::Int32(10));
         assert!(result.rows[1][1].is_null());
+    }
+
+    #[test]
+    fn select_binding_rejects_ambiguous_and_invalid_names_before_scan() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(13);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE alpha (id integer primary key, alpha_value text);",
+                &[],
+            )
+            .unwrap();
+        session
+            .execute(
+                "CREATE TABLE beta (id integer primary key, beta_value text);",
+                &[],
+            )
+            .unwrap();
+
+        // Both tables are empty: binding errors must not depend on row
+        // evaluation taking place.
+        assert_eq!(
+            session
+                .execute(
+                    "SELECT id FROM alpha AS a JOIN beta AS b ON a.id = b.id;",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "42702"
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "SELECT a.id FROM alpha AS a JOIN beta AS b ON a.id = b.id WHERE id = 1;",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "42702"
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "SELECT a.id FROM alpha AS a JOIN beta AS b ON id = id;",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "42702"
+        );
+        for sql in [
+            "SELECT a.id FROM alpha AS a JOIN beta AS b ON a.id = b.id GROUP BY id;",
+            "SELECT count(*) FROM alpha AS a JOIN beta AS b ON a.id = b.id HAVING id = 1;",
+            "SELECT a.id FROM alpha AS a JOIN beta AS b ON a.id = b.id ORDER BY id;",
+        ] {
+            assert_eq!(session.execute(sql, &[]).unwrap_err().code, "42702");
+        }
+        assert_eq!(
+            session
+                .execute(
+                    "SELECT missing_alias.id FROM alpha AS a JOIN beta AS b ON a.id = b.id;",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "42P01"
+        );
+        assert_eq!(
+            session
+                .execute("SELECT a.missing FROM alpha AS a;", &[])
+                .unwrap_err()
+                .code,
+            "42703"
+        );
+        assert_eq!(
+            session
+                .execute("SELECT missing FROM alpha AS a;", &[])
+                .unwrap_err()
+                .code,
+            "42703"
+        );
+        assert_eq!(
+            session
+                .execute("SELECT alpha.id FROM alpha AS a;", &[])
+                .unwrap_err()
+                .code,
+            "42P01",
+            "an alias hides the underlying relation name"
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "SELECT a.id FROM alpha AS a JOIN beta AS a ON a.id = a.id;",
+                    &[],
+                )
+                .unwrap_err()
+                .code,
+            "42712"
+        );
+
+        let empty = session
+            .execute(
+                "SELECT a.id, b.id FROM alpha AS a JOIN beta AS b ON a.id = b.id;",
+                &[],
+            )
+            .unwrap();
+        assert!(empty.rows.is_empty());
+
+        session
+            .execute("INSERT INTO alpha VALUES (1, 'left');", &[])
+            .unwrap();
+        session
+            .execute("INSERT INTO beta VALUES (1, 'right');", &[])
+            .unwrap();
+        let qualified = session
+            .execute(
+                "SELECT a.id, b.beta_value FROM alpha AS a JOIN beta AS b ON a.id = b.id;",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            qualified.rows,
+            vec![vec![Datum::Int32(1), Datum::Text("right".into())]]
+        );
     }
 
     #[test]

@@ -31,8 +31,13 @@ const GSSENC_REQUEST_CODE: u32 = 80_877_104;
 
 type CancelKey = (u32, u32);
 
-fn cancel_registry() -> &'static Mutex<HashMap<CancelKey, Arc<AtomicBool>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>> = OnceLock::new();
+struct CancelRegistration {
+    active: AtomicBool,
+    requested: Arc<AtomicBool>,
+}
+
+fn cancel_registry() -> &'static Mutex<HashMap<CancelKey, Arc<CancelRegistration>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<CancelKey, Arc<CancelRegistration>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -182,6 +187,7 @@ struct Connection {
     backend_pid: u32,
     secret: u32,
     cancel_token: Arc<AtomicBool>,
+    cancel_registration: Arc<CancelRegistration>,
     extended_error: bool,
 }
 #[derive(Clone)]
@@ -320,15 +326,20 @@ impl Drop for Connection {
 
 impl Connection {
     fn new(engine: Arc<SqlEngine>, io: Box<dyn Io>) -> Self {
-        let session = engine.session();
         let pid = next_backend_pid();
         let secret = pid
             .rotate_left(13)
             .wrapping_add(NEXT_BACKEND_PID.load(Ordering::Relaxed));
         let cancel_token = Arc::new(AtomicBool::new(false));
+        let cancel_registration = Arc::new(CancelRegistration {
+            active: AtomicBool::new(false),
+            requested: Arc::clone(&cancel_token),
+        });
         if let Ok(mut registry) = cancel_registry().lock() {
-            registry.insert((pid, secret), Arc::clone(&cancel_token));
+            registry.insert((pid, secret), Arc::clone(&cancel_registration));
         }
+        let mut session = engine.session();
+        session.set_cancellation_checker(Some(cancel_token.clone()));
         Self {
             io,
             session,
@@ -337,6 +348,7 @@ impl Connection {
             backend_pid: pid,
             secret,
             cancel_token,
+            cancel_registration,
             extended_error: false,
         }
     }
@@ -415,8 +427,10 @@ impl Connection {
                 let pid = u32::from_be_bytes(body[..4].try_into().unwrap());
                 let secret = u32::from_be_bytes(body[4..].try_into().unwrap());
                 if let Ok(registry) = cancel_registry().lock() {
-                    if let Some(token) = registry.get(&(pid, secret)) {
-                        token.store(true, Ordering::Release);
+                    if let Some(registration) = registry.get(&(pid, secret)) {
+                        if registration.active.load(Ordering::Acquire) {
+                            registration.requested.store(true, Ordering::Release);
+                        }
                     }
                 }
                 return Ok(false);
@@ -492,8 +506,19 @@ impl Connection {
         self.extended_error = true;
         Ok(())
     }
-    fn query_cancelled(&self) -> bool {
-        self.cancel_token.swap(false, Ordering::AcqRel)
+    fn begin_query(&self) {
+        // A request received while the backend was idle belongs to no query.
+        // Clear it before opening the active window observed by CancelRequest.
+        self.cancel_token.store(false, Ordering::Release);
+        self.cancel_registration
+            .active
+            .store(true, Ordering::Release);
+    }
+    fn end_query(&self) {
+        self.cancel_registration
+            .active
+            .store(false, Ordering::Release);
+        self.cancel_token.store(false, Ordering::Release);
     }
     fn sync(&mut self) -> std::io::Result<()> {
         self.extended_error = false;
@@ -515,22 +540,11 @@ impl Connection {
             self.write_message(b'I', &[])?;
             return self.ready();
         }
-        if self.query_cancelled() {
-            self.error(&SqlError::new(
-                "57014",
-                "canceling statement due to user request",
-            ))?;
-            return self.ready();
-        }
-        match self.session.execute(&sql, &[]) {
+        self.begin_query();
+        let result = self.session.execute(&sql, &[]);
+        self.end_query();
+        match result {
             Ok(r) => {
-                if self.query_cancelled() {
-                    self.error(&SqlError::new(
-                        "57014",
-                        "canceling statement due to user request",
-                    ))?;
-                    return self.ready();
-                }
                 self.result(&r)?;
                 self.ready()
             }
@@ -720,29 +734,20 @@ impl Connection {
             Ok(value) => value,
             Err(e) => return self.extended_failure(&e),
         };
-        if self.query_cancelled() {
-            return self.extended_failure(&SqlError::new(
-                "57014",
-                "canceling statement due to user request",
-            ));
-        }
         let Some(mut p) = self.portals.get(&portal).cloned() else {
             return self.extended_failure(&SqlError::new("34000", "portal does not exist"));
         };
-        let mut result = if let Some(pending) = p.pending.take() {
-            pending
+        self.begin_query();
+        let result = if let Some(pending) = p.pending.take() {
+            Ok(pending)
         } else {
-            match self.session.execute(&p.sql, &p.params) {
-                Ok(r) => r,
-                Err(e) => return self.extended_failure(&e),
-            }
+            self.session.execute(&p.sql, &p.params)
         };
-        if self.query_cancelled() {
-            return self.extended_failure(&SqlError::new(
-                "57014",
-                "canceling statement due to user request",
-            ));
-        }
+        self.end_query();
+        let mut result = match result {
+            Ok(result) => result,
+            Err(e) => return self.extended_failure(&e),
+        };
         if max > 0 && result.rows.len() > max {
             let remaining = result.rows.split_off(max);
             let formats = p.result_formats.clone();

@@ -10,6 +10,7 @@ members = [
     "crates/chorus-admin",
     "crates/chorus-consensus",
     "crates/chorus-testkit",
+    "crates/chorus-raft-contract",
     "crates/chorus-node",
 ]
 

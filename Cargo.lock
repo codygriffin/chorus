@@ -114,6 +114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chorus-raft-contract"
+version = "0.1.0"
+dependencies = [
+ "chorus-codec",
+ "chorus-common",
+ "chorus-storage",
+]
+
+[[package]]
 name = "chorus-sql"
 version = "0.1.0"
 dependencies = [

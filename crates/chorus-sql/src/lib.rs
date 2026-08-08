@@ -14,6 +14,7 @@ use chorus_storage::{
 use chorus_txn::{CommitSequencer, Committer, Transaction, TransactionStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Debug)]
 pub struct ResultColumn {
@@ -39,6 +40,33 @@ impl QueryResult {
             affected_rows: rows,
             notices: Vec::new(),
         }
+    }
+}
+
+/// A cooperative cancellation hook supplied by a protocol adapter.
+///
+/// The SQL executor only observes this hook at bounded statement and row-work
+/// checkpoints.  Implementations must be safe to query while the protocol
+/// adapter's cancellation request is being handled on another thread.
+pub trait CancellationChecker: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
+
+impl CancellationChecker for AtomicBool {
+    fn is_cancelled(&self) -> bool {
+        self.load(Ordering::Acquire)
+    }
+}
+
+fn cancellation_error() -> SqlError {
+    SqlError::new("57014", "canceling statement due to user request")
+}
+
+fn check_cancelled(checker: Option<&dyn CancellationChecker>) -> std::result::Result<(), SqlError> {
+    if checker.is_some_and(CancellationChecker::is_cancelled) {
+        Err(cancellation_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -101,6 +129,7 @@ impl SqlEngine {
             engine: Arc::clone(self),
             txn: None,
             failed: false,
+            cancellation_checker: None,
             settings: SessionSettings::default(),
             prepared: HashMap::new(),
             sequencer: Arc::clone(&self.sequencer),
@@ -1302,6 +1331,7 @@ pub struct SqlSession {
     engine: Arc<SqlEngine>,
     txn: Option<Transaction>,
     failed: bool,
+    cancellation_checker: Option<Arc<dyn CancellationChecker>>,
     settings: SessionSettings,
     prepared: HashMap<String, String>,
     sequencer: Arc<CommitSequencer>,
@@ -1309,6 +1339,13 @@ pub struct SqlSession {
     statement_timestamp_us: Option<i64>,
 }
 impl SqlSession {
+    /// Install or clear the cooperative cancellation hook for this session.
+    ///
+    /// A missing hook preserves the historical behavior and never cancels.
+    pub fn set_cancellation_checker(&mut self, checker: Option<Arc<dyn CancellationChecker>>) {
+        self.cancellation_checker = checker;
+    }
+
     pub fn settings(&self) -> &SessionSettings {
         &self.settings
     }
@@ -1360,7 +1397,9 @@ impl SqlSession {
         }
         let mut last = QueryResult::command("", 0);
         for statement in statements {
-            match self.exec_statement(statement, params) {
+            let result = check_cancelled(self.cancellation_checker())
+                .and_then(|()| self.exec_statement(statement, params));
+            match result {
                 Ok(r) => last = r,
                 Err(e) => {
                     if implicit {
@@ -1376,6 +1415,10 @@ impl SqlSession {
             }
         }
         if implicit {
+            if let Err(error) = check_cancelled(self.cancellation_checker()) {
+                self.rollback_internal();
+                return Err(error);
+            }
             self.commit_internal()?;
         }
         Ok(last)
@@ -1458,6 +1501,14 @@ impl SqlSession {
             }
             Statement::Unsupported(m) => Err(SqlError::unsupported(m)),
         }
+    }
+    fn cancellation_checker(&self) -> Option<&dyn CancellationChecker> {
+        self.cancellation_checker
+            .as_ref()
+            .map(|checker| checker.as_ref())
+    }
+    fn check_cancelled(&self) -> std::result::Result<(), SqlError> {
+        check_cancelled(self.cancellation_checker())
     }
     fn start_txn(&mut self) -> std::result::Result<(), SqlError> {
         let snapshot = self.engine.committer.read_barrier().map_err(to_sql)?;
@@ -1668,7 +1719,8 @@ impl SqlSession {
             .transpose()?
             .cloned();
         if let Some(table) = table {
-            let mut rows = scan(tx, &table)?;
+            let checker = self.cancellation_checker();
+            let mut rows = scan(tx, &table, checker)?;
             if !q.joins.is_empty() {
                 rows =
                     self.join_rows(tx, &table, q.from_alias.as_deref(), rows, &q.joins, params)?;
@@ -1676,6 +1728,7 @@ impl SqlSession {
             if let Some(w) = &q.selection {
                 let mut filtered = Vec::with_capacity(rows.len());
                 for row in rows {
+                    check_cancelled(checker)?;
                     if self.eval(w, &row.cells, params)?.truthy() == Some(true) {
                         filtered.push(row);
                     }
@@ -1691,6 +1744,7 @@ impl SqlSession {
             for (e, desc) in q.order.iter().rev() {
                 let mut keyed = Vec::with_capacity(rows.len());
                 for row in rows {
+                    check_cancelled(checker)?;
                     let key = self.eval(e, &row.cells, params)?;
                     keyed.push((row, key));
                 }
@@ -1730,6 +1784,7 @@ impl SqlSession {
                 .collect();
             let mut out = Vec::new();
             for r in rows {
+                check_cancelled(checker)?;
                 let values = projection
                     .iter()
                     .map(|e| self.eval(e, &r.cells, params))
@@ -1774,8 +1829,10 @@ impl SqlSession {
         q: Select,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
+        let checker = self.cancellation_checker();
         let mut groups: Vec<(Vec<Datum>, Vec<Row>)> = Vec::new();
         for row in rows {
+            check_cancelled(checker)?;
             let key = q
                 .group_by
                 .iter()
@@ -1805,6 +1862,7 @@ impl SqlSession {
         let columns = projection.iter().map(|e| result_column(e, table)).collect();
         let mut out = Vec::new();
         for (_, group) in groups {
+            check_cancelled(checker)?;
             if let Some(having) = &q.having {
                 if self.eval_group(having, &group, params)?.truthy() != Some(true) {
                     continue;
@@ -1891,14 +1949,17 @@ impl SqlSession {
         joins: &[JoinSpec],
         params: &[Datum],
     ) -> std::result::Result<Vec<Row>, SqlError> {
+        let checker = self.cancellation_checker();
         let mut current = rows;
         for join in joins {
             let right = find_table(tx.snapshot.catalog(), &join.relation)?.clone();
-            let right_rows = scan(tx, &right)?;
+            let right_rows = scan(tx, &right, checker)?;
             let mut next = Vec::new();
             for left in current {
+                check_cancelled(checker)?;
                 let mut matched = false;
                 for candidate in &right_rows {
+                    check_cancelled(checker)?;
                     let mut cells = left.cells.clone();
                     cells.extend(candidate.cells.iter().cloned().map(|mut cell| {
                         cell.qualifier = Some(join.alias.as_deref().unwrap_or(&right.name).into());
@@ -1922,6 +1983,7 @@ impl SqlSession {
                     }
                 }
                 if !matched && join.kind == JoinKind::Left {
+                    check_cancelled(checker)?;
                     let mut cells = left.cells.clone();
                     for column in right
                         .columns
@@ -1963,6 +2025,7 @@ impl SqlSession {
                 SqlError::new("42P01", format!("relation \"{relation}\" does not exist"))
             })?;
         let table = virtual_table(relation, &columns);
+        let checker = self.cancellation_checker();
         let mut rows = values
             .into_iter()
             .map(|values| VirtualRow {
@@ -1980,6 +2043,7 @@ impl SqlSession {
         if let Some(w) = &q.selection {
             let mut filtered = Vec::with_capacity(rows.len());
             for row in rows {
+                check_cancelled(checker)?;
                 if self.eval(w, &row.cells, params)?.truthy() == Some(true) {
                     filtered.push(row);
                 }
@@ -1989,6 +2053,7 @@ impl SqlSession {
         for (e, desc) in q.order.iter().rev() {
             let mut keyed = Vec::with_capacity(rows.len());
             for row in rows {
+                check_cancelled(checker)?;
                 let key = self.eval(e, &row.cells, params)?;
                 keyed.push((row, key));
             }
@@ -2027,6 +2092,7 @@ impl SqlSession {
             .collect();
         let mut out = Vec::new();
         for row in rows {
+            check_cancelled(checker)?;
             let projected = projection
                 .iter()
                 .map(|e| self.eval(e, &row.cells, params))
@@ -2069,6 +2135,7 @@ impl SqlSession {
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
+        let checker = self.cancellation_checker();
         let cols: Vec<_> = if q.columns.is_empty() {
             table
                 .columns
@@ -2092,6 +2159,7 @@ impl SqlSession {
         let mut ret = Vec::new();
         let mut count = 0u64;
         for (i, vals) in q.values.iter().enumerate() {
+            check_cancelled(checker)?;
             if vals.len() != cols.len() {
                 return Err(SqlError::new("42601", "INSERT has mismatched values"));
             }
@@ -2117,25 +2185,27 @@ impl SqlSession {
             let conflict_key = if tx.get(&key).is_some() {
                 Some(key.clone())
             } else {
-                scan(tx, &table)?.into_iter().find_map(|candidate| {
-                    let candidate_indexes = index_entries(
-                        tx.snapshot.catalog(),
-                        &table,
-                        &candidate.row,
-                        &candidate.key,
-                    )
-                    .ok()?;
-                    if new_index_entries.iter().any(|(entry, unique)| {
-                        *unique
-                            && candidate_indexes
-                                .iter()
-                                .any(|(other, other_unique)| *other_unique && other == entry)
-                    }) {
-                        Some(candidate.key)
-                    } else {
-                        None
-                    }
-                })
+                scan(tx, &table, checker)?
+                    .into_iter()
+                    .find_map(|candidate| {
+                        let candidate_indexes = index_entries(
+                            tx.snapshot.catalog(),
+                            &table,
+                            &candidate.row,
+                            &candidate.key,
+                        )
+                        .ok()?;
+                        if new_index_entries.iter().any(|(entry, unique)| {
+                            *unique
+                                && candidate_indexes
+                                    .iter()
+                                    .any(|(other, other_unique)| *other_unique && other == entry)
+                        }) {
+                            Some(candidate.key)
+                        } else {
+                            None
+                        }
+                    })
             };
             if conflict_key.is_some()
                 || new_index_entries
@@ -2281,10 +2351,12 @@ impl SqlSession {
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
-        let targets = scan(tx, &table)?;
+        let checker = self.cancellation_checker();
+        let targets = scan(tx, &table, checker)?;
         let mut ret = Vec::new();
         let mut count = 0u64;
         for target in targets {
+            check_cancelled(checker)?;
             if let Some(w) = &q.selection {
                 if self.eval(w, &target.cells, params)?.truthy() != Some(true) {
                     continue;
@@ -2383,10 +2455,12 @@ impl SqlSession {
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
-        let targets = scan(tx, &table)?;
+        let checker = self.cancellation_checker();
+        let targets = scan(tx, &table, checker)?;
         let mut ret = Vec::new();
         let mut count = 0u64;
         for target in targets {
+            check_cancelled(checker)?;
             if let Some(w) = &q.selection {
                 if self.eval(w, &target.cells, params)?.truthy() != Some(true) {
                     continue;
@@ -2795,6 +2869,7 @@ fn aggregate_value(
         }
         let mut count = 0i64;
         for row in group {
+            engine.check_cancelled()?;
             if !engine.eval(&args[0], &row.cells, params)?.is_null() {
                 count = count
                     .checked_add(1)
@@ -2808,6 +2883,7 @@ fn aggregate_value(
         .ok_or_else(|| SqlError::new("42803", "aggregate requires an argument"))?;
     let mut values = Vec::new();
     for row in group {
+        engine.check_cancelled()?;
         let value = engine.eval(arg, &row.cells, params)?;
         if !value.is_null() {
             values.push(value);
@@ -3251,7 +3327,11 @@ fn datum_size(value: &Datum) -> usize {
         Datum::Text(text) | Datum::Jsonb(text) => text.len(),
     }
 }
-fn scan(tx: &Transaction, t: &TableDescriptor) -> std::result::Result<Vec<Row>, SqlError> {
+fn scan(
+    tx: &Transaction,
+    t: &TableDescriptor,
+    checker: Option<&dyn CancellationChecker>,
+) -> std::result::Result<Vec<Row>, SqlError> {
     let p = [
         0x20,
         (t.oid >> 24) as u8,
@@ -3262,6 +3342,7 @@ fn scan(tx: &Transaction, t: &TableDescriptor) -> std::result::Result<Vec<Row>, 
     let end = chorus_codec::successor(&p);
     let mut out = Vec::new();
     for (key, bytes) in tx.scan(&p, end.as_deref()) {
+        check_cancelled(checker)?;
         let row = chorus_codec::EncodedRowV1::decode(&bytes).map_err(codec_sql)?;
         out.push(Row {
             key,

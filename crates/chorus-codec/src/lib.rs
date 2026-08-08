@@ -6,17 +6,27 @@
 //! persisted database.
 
 use chorus_common::{
-    ChorusError, Datum, FORMAT_VERSION, LogId, MAX_INDEXED_VALUE_BYTES, MAX_KEY_BYTES, OriginId,
-    RequestId, Result as ChorusResult, SqlError, SqlType, checked_add_u64,
+    ChorusError, Datum, LogId, MAX_INDEXED_VALUE_BYTES, MAX_KEY_BYTES, OriginId, RequestId, SqlType,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MEMCOMPARABLE_VERSION: u8 = 1;
 pub const ROW_VERSION: u8 = 1;
 pub const COMMAND_VERSION: u8 = 1;
 pub const SNAPSHOT_VERSION: u16 = 1;
+/// The row format is bounded before decoding so a malformed length prefix
+/// cannot cause an unbounded allocation in the state machine.
+pub const MAX_ROW_BYTES: usize = 256 * 1024;
+/// Commands are carried in the Raft log and are bounded by the transaction
+/// limits.  The limit also protects the JSON compatibility envelope below.
+pub const MAX_COMMAND_BYTES: usize = 4 * 1024 * 1024;
+/// A logical snapshot is streamed in production; this in-memory reference
+/// codec still rejects bodies larger than the supported snapshot budget.
+pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_SNAPSHOT_ENTRIES: usize = 10_000_000;
+const SNAPSHOT_BODY_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct PhysicalKey(pub Vec<u8>);
@@ -98,12 +108,15 @@ pub fn payload_hash(
     base_epoch: u64,
     payload: &[u8],
 ) -> [u8; 32] {
-    let mut b = Vec::with_capacity(1 + 8 + 16 + 8 + 8 + payload.len());
+    let mut b = Vec::new();
     b.push(command_version);
     put_u64(&mut b, request_id.origin.node_id);
     b.extend_from_slice(&request_id.origin.boot_nonce);
     put_u64(&mut b, request_id.sequence);
     put_u64(&mut b, base_epoch);
+    // Length-frame the command body.  Without this boundary, two different
+    // canonical payloads can hash as the same concatenated request prefix.
+    put_u64(&mut b, payload.len() as u64);
     b.extend_from_slice(payload);
     hash32(&b)
 }
@@ -132,21 +145,12 @@ fn encode_memcomparable_into(
     let (tag, bytes, variable): (u8, Vec<u8>, bool) = match d {
         Datum::Null => (0, Vec::new(), false),
         Datum::Boolean(v) => (1, vec![*v as u8], false),
-        Datum::Int16(v) => (
-            2,
-            ((i16::from_be_bytes(v.to_be_bytes()) ^ i16::MIN).to_be_bytes()).to_vec(),
-            false,
-        ),
-        Datum::Int32(v) => (
-            3,
-            ((i32::from_be_bytes(v.to_be_bytes()) ^ i32::MIN).to_be_bytes()).to_vec(),
-            false,
-        ),
-        Datum::Int64(v) => (
-            4,
-            ((i64::from_be_bytes(v.to_be_bytes()) ^ i64::MIN).to_be_bytes()).to_vec(),
-            false,
-        ),
+        // Datum's canonical comparator treats all signed integer widths as
+        // one numeric domain.  Normalize to i64 so byte order agrees across
+        // Int16/Int32/Int64 as well as within each width.
+        Datum::Int16(v) => (2, ((*v as i64) ^ i64::MIN).to_be_bytes().to_vec(), false),
+        Datum::Int32(v) => (2, ((*v as i64) ^ i64::MIN).to_be_bytes().to_vec(), false),
+        Datum::Int64(v) => (2, ((*v) ^ i64::MIN).to_be_bytes().to_vec(), false),
         Datum::Float64(v) => (5, float_key(*v).to_vec(), false),
         Datum::Date(v) => (
             6,
@@ -166,8 +170,17 @@ fn encode_memcomparable_into(
         Datum::Uuid(v) => (9, v.to_vec(), false),
         Datum::Text(v) => (10, v.as_bytes().to_vec(), true),
         Datum::Bytes(v) => (11, v.clone(), true),
-        Datum::Jsonb(v) => (12, v.as_bytes().to_vec(), true),
+        Datum::Jsonb(v) => {
+            let canonical =
+                Datum::canonical_json(v).map_err(|e| CodecError::InvalidJson(e.message))?;
+            (12, canonical.into_bytes(), true)
+        }
     };
+    if variable && bytes.len() > MAX_INDEXED_VALUE_BYTES {
+        return Err(CodecError::Limit(
+            "encoded indexed value exceeds 4 KiB".into(),
+        ));
+    }
     out.push(if descending { !tag } else { tag });
     if variable {
         for b in bytes {
@@ -186,7 +199,7 @@ fn encode_memcomparable_into(
             *b = !*b;
         }
     }
-    if out.len() > MAX_INDEXED_VALUE_BYTES + 32 {
+    if out.len().saturating_sub(start) > MAX_INDEXED_VALUE_BYTES + 2 {
         return Err(CodecError::Limit(
             "encoded indexed value exceeds limit".into(),
         ));
@@ -197,6 +210,10 @@ fn encode_memcomparable_into(
 fn float_key(value: f64) -> [u8; 8] {
     let bits = if value.is_nan() {
         f64::NAN.to_bits()
+    } else if value == 0.0 {
+        // SQL equality treats -0.0 and +0.0 as equal; canonicalize them so
+        // the key codec does not split one logical value into two keys.
+        0
     } else {
         value.to_bits()
     };
@@ -245,11 +262,33 @@ pub struct EncodedRowV1 {
 
 impl EncodedRowV1 {
     pub fn new(schema_version: u32, mut fields: Vec<(u32, Datum)>) -> Result<Self, CodecError> {
+        if fields.len() > 256 {
+            return Err(CodecError::Limit("too many row fields".into()));
+        }
+        // JSONB is a logical value, so canonicalize it before it becomes
+        // durable. This keeps equivalent JSON values from receiving
+        // different state hashes or index keys.
+        for (_, datum) in &mut fields {
+            if let Datum::Jsonb(value) = datum {
+                *value =
+                    Datum::canonical_json(value).map_err(|e| CodecError::InvalidJson(e.message))?;
+            }
+        }
         fields.sort_by_key(|(id, _)| *id);
         for w in fields.windows(2) {
             if w[0].0 == w[1].0 {
                 return Err(CodecError::Malformed("duplicate column id".into()));
             }
+        }
+        let mut encoded_bytes = 1usize + 4 + 4;
+        for (_, datum) in &fields {
+            let payload_len = datum_payload_len(datum)?;
+            encoded_bytes = encoded_bytes
+                .checked_add(4 + 1 + 4 + payload_len)
+                .ok_or_else(|| CodecError::Limit("row size exhausted".into()))?;
+        }
+        if encoded_bytes > MAX_ROW_BYTES {
+            return Err(CodecError::Limit("encoded row exceeds 256 KiB".into()));
         }
         Ok(Self {
             format_version: ROW_VERSION,
@@ -261,16 +300,29 @@ impl EncodedRowV1 {
         if self.format_version != ROW_VERSION {
             return Err(CodecError::InvalidVersion(self.format_version as u64));
         }
+        if self.fields.len() > 256 {
+            return Err(CodecError::Limit("too many row fields".into()));
+        }
         let mut out = vec![self.format_version];
         put_u32(&mut out, self.schema_version);
-        put_u32(&mut out, self.fields.len() as u32);
+        put_u32(
+            &mut out,
+            u32::try_from(self.fields.len())
+                .map_err(|_| CodecError::Limit("too many row fields".into()))?,
+        );
         for (id, d) in &self.fields {
             put_u32(&mut out, *id);
             encode_datum(&mut out, d)?;
         }
+        if out.len() > MAX_ROW_BYTES {
+            return Err(CodecError::Limit("encoded row exceeds 256 KiB".into()));
+        }
         Ok(out)
     }
     pub fn decode(mut bytes: &[u8]) -> Result<Self, CodecError> {
+        if bytes.len() > MAX_ROW_BYTES {
+            return Err(CodecError::Limit("encoded row exceeds 256 KiB".into()));
+        }
         let version = take_u8(&mut bytes)?;
         if version != ROW_VERSION {
             return Err(CodecError::InvalidVersion(version as u64));
@@ -311,24 +363,63 @@ fn encode_datum(out: &mut Vec<u8>, d: &Datum) -> Result<(), CodecError> {
         Datum::Timestamp(v) => (9, v.to_be_bytes().to_vec()),
         Datum::TimestampTz(v) => (10, v.to_be_bytes().to_vec()),
         Datum::Uuid(v) => (11, v.to_vec()),
-        Datum::Jsonb(v) => (12, v.as_bytes().to_vec()),
+        Datum::Jsonb(v) => {
+            let canonical =
+                Datum::canonical_json(v).map_err(|e| CodecError::InvalidJson(e.message))?;
+            (12, canonical.into_bytes())
+        }
     };
+    if payload.len() > MAX_ROW_BYTES {
+        return Err(CodecError::Limit("datum exceeds row limit".into()));
+    }
     out.push(tag);
-    put_u32(out, payload.len() as u32);
+    put_u32(
+        out,
+        u32::try_from(payload.len())
+            .map_err(|_| CodecError::Limit("datum length exceeds u32".into()))?,
+    );
     out.extend_from_slice(&payload);
     Ok(())
+}
+
+fn datum_payload_len(d: &Datum) -> Result<usize, CodecError> {
+    let len = match d {
+        Datum::Null => 0,
+        Datum::Boolean(_) => 1,
+        Datum::Int16(_) => 2,
+        Datum::Int32(_) | Datum::Date(_) => 4,
+        Datum::Int64(_) | Datum::Float64(_) | Datum::Timestamp(_) | Datum::TimestampTz(_) => 8,
+        Datum::Uuid(_) => 16,
+        Datum::Text(v) => v.len(),
+        Datum::Bytes(v) => v.len(),
+        Datum::Jsonb(v) => Datum::canonical_json(v)
+            .map_err(|e| CodecError::InvalidJson(e.message))?
+            .len(),
+    };
+    if len > MAX_ROW_BYTES {
+        return Err(CodecError::Limit("datum exceeds row limit".into()));
+    }
+    Ok(len)
+}
+
+/// Encode one logical datum using the stable row-datum representation. The
+/// storage hash uses this helper instead of serializer output.
+pub fn encode_datum_v1(d: &Datum) -> Result<Vec<u8>, CodecError> {
+    let mut out = Vec::new();
+    encode_datum(&mut out, d)?;
+    Ok(out)
 }
 fn decode_datum(input: &mut &[u8]) -> Result<Datum, CodecError> {
     let tag = take_u8(input)?;
     let len = take_u32(input)? as usize;
-    if len > 1024 * 1024 {
+    if len > MAX_ROW_BYTES {
         return Err(CodecError::Limit("datum exceeds limit".into()));
     }
     let p = take(input, len)?;
     let wrong = || CodecError::Malformed("invalid datum length".into());
     Ok(match tag {
         0 if len == 0 => Datum::Null,
-        1 if len == 1 => Datum::Boolean(p[0] != 0),
+        1 if len == 1 && p[0] <= 1 => Datum::Boolean(p[0] != 0),
         2 if len == 2 => Datum::Int16(i16::from_be_bytes([p[0], p[1]])),
         3 if len == 4 => Datum::Int32(i32::from_be_bytes(p.try_into().map_err(|_| wrong())?)),
         4 if len == 8 => Datum::Int64(i64::from_be_bytes(p.try_into().map_err(|_| wrong())?)),
@@ -372,6 +463,56 @@ impl KvMutationV1 {
             Self::Delete { key } => 1 + 4 + key.len(),
         }
     }
+}
+
+/// Canonical, length-framed mutation bytes used by the replicated payload
+/// hash.  Framing every key/value prevents ambiguous concatenations such as
+/// `(key="ab", value="c")` and `(key="a", value="bc")` from sharing a
+/// digest, while sorting makes the hash independent of producer iteration
+/// order.
+pub fn canonical_mutations(mutations: &[KvMutationV1]) -> Result<Vec<u8>, CodecError> {
+    let mut ordered = mutations.to_vec();
+    ordered.sort_by(|a, b| {
+        a.key().cmp(b.key()).then_with(|| match (a, b) {
+            (KvMutationV1::Put { value: av, .. }, KvMutationV1::Put { value: bv, .. }) => {
+                av.cmp(bv)
+            }
+            (KvMutationV1::Delete { .. }, KvMutationV1::Delete { .. }) => std::cmp::Ordering::Equal,
+            (KvMutationV1::Put { .. }, KvMutationV1::Delete { .. }) => std::cmp::Ordering::Less,
+            (KvMutationV1::Delete { .. }, KvMutationV1::Put { .. }) => std::cmp::Ordering::Greater,
+        })
+    });
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(ordered.len()).map_err(|_| CodecError::Limit("too many mutations".into()))?,
+    );
+    for mutation in ordered {
+        out.push(match mutation {
+            KvMutationV1::Put { .. } => 1,
+            KvMutationV1::Delete { .. } => 2,
+        });
+        put_u32(
+            &mut out,
+            u32::try_from(mutation.key().len())
+                .map_err(|_| CodecError::Limit("mutation key exceeds u32".into()))?,
+        );
+        out.extend_from_slice(mutation.key());
+        if let KvMutationV1::Put { value, .. } = mutation {
+            put_u32(
+                &mut out,
+                u32::try_from(value.len())
+                    .map_err(|_| CodecError::Limit("mutation value exceeds u32".into()))?,
+            );
+            out.extend_from_slice(&value);
+        }
+        if out.len() > MAX_COMMAND_BYTES {
+            return Err(CodecError::Limit(
+                "canonical mutation payload exceeds 4 MiB".into(),
+            ));
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -523,7 +664,7 @@ impl LogicalSnapshot {
         mut entries: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Self {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let body = snapshot_body(&meta, &entries);
+        let body = snapshot_body(&meta, &entries).unwrap_or_default();
         let digest = hash32(&body);
         let count = entries.len() as u64;
         Self {
@@ -545,19 +686,108 @@ impl LogicalSnapshot {
             entries,
         }
     }
-    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
-        let body = snapshot_body(&self.meta, &self.entries);
-        if hash32(&body) != self.header.digest {
-            return Err(CodecError::Malformed("snapshot digest mismatch".into()));
+    pub fn try_new(
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+        last_included: LogId,
+        membership_log_id: LogId,
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+        db_epoch: u64,
+        catalog_epoch: u64,
+        meta: BTreeMap<String, Vec<u8>>,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Self, CodecError> {
+        let snapshot = Self::new(
+            cluster_id,
+            cluster_incarnation,
+            last_included,
+            membership_log_id,
+            voters,
+            learners,
+            db_epoch,
+            catalog_epoch,
+            meta,
+            entries,
+        );
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+    pub fn validate(&self) -> Result<(), CodecError> {
+        if self.header.format_version != SNAPSHOT_VERSION {
+            return Err(CodecError::InvalidVersion(
+                self.header.format_version as u64,
+            ));
         }
+        if self.header.cluster_incarnation == 0 {
+            return Err(CodecError::Malformed(
+                "snapshot cluster incarnation must be nonzero".into(),
+            ));
+        }
+        if self.header.membership_log_id.index > self.header.last_included.index {
+            return Err(CodecError::Malformed(
+                "snapshot membership log is newer than the included log".into(),
+            ));
+        }
+        validate_membership(&self.header.voters, &self.header.learners)?;
+        if self.entries.len() > MAX_SNAPSHOT_ENTRIES {
+            return Err(CodecError::Limit("too many snapshot entries".into()));
+        }
+        for (key, _) in &self.entries {
+            if key.is_empty() || key.len() > MAX_KEY_BYTES {
+                return Err(CodecError::Limit("snapshot key exceeds 8 KiB".into()));
+            }
+        }
+        for pair in self.entries.windows(2) {
+            if pair[0].0 >= pair[1].0 {
+                return Err(CodecError::Malformed(
+                    "snapshot entries are not strictly sorted".into(),
+                ));
+            }
+        }
+        for key in self.meta.keys() {
+            if key.is_empty() || key.len() > 63 {
+                return Err(CodecError::Malformed(
+                    "invalid snapshot metadata key".into(),
+                ));
+            }
+        }
+        let body = snapshot_body(&self.meta, &self.entries)?;
+        if self.header.entry_count != self.entries.len() as u64 {
+            return Err(CodecError::Malformed(
+                "snapshot entry count mismatch".into(),
+            ));
+        }
+        if self.header.uncompressed_bytes != body.len() as u64 {
+            return Err(CodecError::Malformed("snapshot byte count mismatch".into()));
+        }
+        if hash32(&body) != self.header.digest {
+            return Err(CodecError::Malformed(
+                "snapshot logical digest mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        self.validate()?;
         let encoded = serde_json::to_vec(self).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        if encoded.len() > MAX_SNAPSHOT_BYTES {
+            return Err(CodecError::Limit("snapshot exceeds 256 MiB".into()));
+        }
         let mut out = b"CHORUS-SNAPSHOT\0".to_vec();
-        put_u32(&mut out, encoded.len() as u32);
+        put_u32(
+            &mut out,
+            u32::try_from(encoded.len())
+                .map_err(|_| CodecError::Limit("snapshot length exceeds u32".into()))?,
+        );
         out.extend_from_slice(&encoded);
         out.extend_from_slice(&hash32(&encoded));
         Ok(out)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        if bytes.len() > MAX_SNAPSHOT_BYTES {
+            return Err(CodecError::Limit("snapshot exceeds 256 MiB".into()));
+        }
         if bytes.len() < 16 + 4 + 32 || &bytes[..16] != b"CHORUS-SNAPSHOT\0" {
             return Err(CodecError::Malformed("invalid snapshot magic".into()));
         }
@@ -568,36 +798,108 @@ impl LogicalSnapshot {
         if hash32(data) != digest {
             return Err(CodecError::Malformed("snapshot checksum mismatch".into()));
         }
+        if !rest.is_empty() {
+            return Err(CodecError::Malformed("trailing snapshot bytes".into()));
+        }
         let s: Self =
             serde_json::from_slice(data).map_err(|e| CodecError::Malformed(e.to_string()))?;
-        let body = snapshot_body(&s.meta, &s.entries);
-        if hash32(&body) != s.header.digest {
-            return Err(CodecError::Malformed(
-                "snapshot logical digest mismatch".into(),
-            ));
-        }
+        s.validate()?;
         Ok(s)
     }
 }
 
-fn snapshot_body(meta: &BTreeMap<String, Vec<u8>>, entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
-    serde_json::to_vec(&(meta, entries)).unwrap_or_default()
+fn validate_membership(voters: &[u64], learners: &[u64]) -> Result<(), CodecError> {
+    if voters.len() > 10_000 || learners.len() > 10_000 {
+        return Err(CodecError::Limit("invalid snapshot membership size".into()));
+    }
+    let mut all = BTreeSet::new();
+    for id in voters.iter().chain(learners) {
+        if *id == 0 || !all.insert(*id) {
+            return Err(CodecError::Malformed(
+                "snapshot membership contains duplicate or invalid node id".into(),
+            ));
+        }
+    }
+    if voters.windows(2).any(|w| w[0] >= w[1]) || learners.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(CodecError::Malformed(
+            "snapshot membership is not sorted".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_body(
+    meta: &BTreeMap<String, Vec<u8>>,
+    entries: &[(Vec<u8>, Vec<u8>)],
+) -> Result<Vec<u8>, CodecError> {
+    if entries.len() > MAX_SNAPSHOT_ENTRIES {
+        return Err(CodecError::Limit("too many snapshot entries".into()));
+    }
+    let mut out = Vec::new();
+    out.push(SNAPSHOT_BODY_VERSION);
+    put_u32(
+        &mut out,
+        u32::try_from(meta.len())
+            .map_err(|_| CodecError::Limit("too many snapshot metadata records".into()))?,
+    );
+    for (key, value) in meta {
+        push_blob(&mut out, key.as_bytes())?;
+        push_blob(&mut out, value)?;
+    }
+    put_u32(
+        &mut out,
+        u32::try_from(entries.len())
+            .map_err(|_| CodecError::Limit("too many snapshot entries".into()))?,
+    );
+    for (key, value) in entries {
+        push_blob(&mut out, key)?;
+        push_blob(&mut out, value)?;
+    }
+    Ok(out)
+}
+
+fn push_blob(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CodecError> {
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| CodecError::Limit("snapshot field length exceeds u32".into()))?;
+    let required = 4usize
+        .checked_add(bytes.len())
+        .and_then(|n| out.len().checked_add(n))
+        .ok_or_else(|| CodecError::Limit("snapshot size exhausted".into()))?;
+    if required > MAX_SNAPSHOT_BYTES {
+        return Err(CodecError::Limit("snapshot exceeds 256 MiB".into()));
+    }
+    put_u32(out, len);
+    out.extend_from_slice(bytes);
+    Ok(())
 }
 
 pub fn encode_command(command: &ReplicatedCommandV1) -> Result<Vec<u8>, CodecError> {
     let data = serde_json::to_vec(command).map_err(|e| CodecError::Malformed(e.to_string()))?;
+    if data.len() > MAX_COMMAND_BYTES {
+        return Err(CodecError::Limit("command exceeds 4 MiB".into()));
+    }
     let mut out = vec![COMMAND_VERSION];
-    put_u32(&mut out, data.len() as u32);
+    put_u32(
+        &mut out,
+        u32::try_from(data.len())
+            .map_err(|_| CodecError::Limit("command length exceeds u32".into()))?,
+    );
     out.extend_from_slice(&data);
     Ok(out)
 }
 pub fn decode_command(bytes: &[u8]) -> Result<ReplicatedCommandV1, CodecError> {
+    if bytes.len() > MAX_COMMAND_BYTES + 5 {
+        return Err(CodecError::Limit("command exceeds 4 MiB".into()));
+    }
     let mut b = bytes;
     let version = take_u8(&mut b)?;
     if version != COMMAND_VERSION {
         return Err(CodecError::InvalidVersion(version as u64));
     }
     let len = take_u32(&mut b)? as usize;
+    if len > MAX_COMMAND_BYTES {
+        return Err(CodecError::Limit("command exceeds 4 MiB".into()));
+    }
     let data = take(&mut b, len)?;
     if !b.is_empty() {
         return Err(CodecError::Malformed("trailing command bytes".into()));

@@ -8,13 +8,15 @@
 //! adapter is introduced, while preserving the same on-disk logical format.
 
 use chorus_codec::{
-    ApplyResult, CommitTransactionV1, EncodedRowV1, KvMutationV1, LogicalSnapshot, NodeOriginState,
-    PhysicalKey, ReplicatedCommandV1, SchemaOperationV1, encode_command, encode_composite, hash32,
-    payload_hash,
+    ApplyResult, CommitTransactionV1, EncodedRowV1, KvMutationV1, LogicalSnapshot, MAX_ROW_BYTES,
+    NodeOriginState, PhysicalKey, ReplicatedCommandV1, SchemaOperationV1, canonical_mutations,
+    encode_composite, hash32, payload_hash,
 };
-use chorus_common::{ChorusError, Datum, LogId, OriginId, RequestId, Result, SqlError, SqlType};
+use chorus_common::{
+    ChorusError, Datum, LogId, MAX_KEY_BYTES, OriginId, Result, SqlError, SqlType,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +24,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub const META_DB_EPOCH: &str = "db_epoch";
 pub const META_CATALOG_EPOCH: &str = "catalog_epoch";
+const STATE_FILE_MAGIC: &[u8] = b"CHORUS-STATE\0";
+const STATE_FILE_VERSION: u8 = 1;
+const MAX_STATE_FILE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ObjectState {
@@ -246,6 +251,12 @@ pub trait StateStore: Send + Sync + 'static {
     fn snapshot(&self) -> Result<StateSnapshot>;
     fn apply(&self, log_id: LogId, command: &ReplicatedCommandV1) -> Result<ApplyResult>;
     fn install(&self, snapshot: &LogicalSnapshot) -> Result<()>;
+    /// Restore an exact pre-apply image during an atomic replication rollback.
+    /// Ordinary snapshot installation remains monotonic; consensus adapters
+    /// use this separate hook only after an entry was never acknowledged.
+    fn rollback(&self, snapshot: &LogicalSnapshot) -> Result<()> {
+        self.install(snapshot)
+    }
     fn state_hash(&self) -> Result<[u8; 32]>;
     fn status(&self) -> StoreStatus;
 }
@@ -318,6 +329,42 @@ impl StateStore for MemoryStateStore {
         result
     }
     fn install(&self, snapshot: &LogicalSnapshot) -> Result<()> {
+        self.install_snapshot(snapshot, true)
+    }
+    fn rollback(&self, snapshot: &LogicalSnapshot) -> Result<()> {
+        self.install_snapshot(snapshot, false)
+    }
+    fn state_hash(&self) -> Result<[u8; 32]> {
+        Ok(self.snapshot()?.state_hash())
+    }
+    fn status(&self) -> StoreStatus {
+        let d = self.data();
+        StoreStatus {
+            db_epoch: d.db_epoch,
+            catalog_epoch: d.catalog_epoch,
+            last_applied: d.last_applied,
+            state_hash: canonical_state_hash(&d),
+            healthy: true,
+        }
+    }
+}
+
+impl MemoryStateStore {
+    fn install_snapshot(&self, snapshot: &LogicalSnapshot, enforce_order: bool) -> Result<()> {
+        snapshot
+            .validate()
+            .map_err(|e| ChorusError::Serialization(format!("snapshot validation: {e}")))?;
+        let current = self.data();
+        if enforce_order && snapshot.header.last_included.index < current.last_applied.index {
+            return Err(ChorusError::Protocol(
+                "snapshot is older than the applied state".into(),
+            ));
+        }
+        if current.cluster_id != [0; 16] && current.cluster_id != snapshot.header.cluster_id {
+            return Err(ChorusError::Protocol(
+                "snapshot cluster id does not match the bound store".into(),
+            ));
+        }
         let mut d = snapshot
             .meta
             .get("state")
@@ -327,6 +374,7 @@ impl StateStore for MemoryStateStore {
             })
             .transpose()?
             .unwrap_or_default();
+        validate_state_data(&d)?;
         if d.cluster_id != [0; 16] && d.cluster_id != snapshot.header.cluster_id {
             return Err(ChorusError::Protocol("snapshot cluster id mismatch".into()));
         }
@@ -348,24 +396,12 @@ impl StateStore for MemoryStateStore {
         for (k, v) in &snapshot.entries {
             d.kv.insert(k.clone(), v.clone());
         }
+        validate_state_data(&d)?;
         *self
             .inner
             .write()
             .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = d;
         Ok(())
-    }
-    fn state_hash(&self) -> Result<[u8; 32]> {
-        Ok(self.snapshot()?.state_hash())
-    }
-    fn status(&self) -> StoreStatus {
-        let d = self.data();
-        StoreStatus {
-            db_epoch: d.db_epoch,
-            catalog_epoch: d.catalog_epoch,
-            last_applied: d.last_applied,
-            state_hash: canonical_state_hash(&d),
-            healthy: true,
-        }
     }
 }
 
@@ -387,8 +423,11 @@ impl FileStateStore {
             let mut bytes = Vec::new();
             f.read_to_end(&mut bytes)
                 .map_err(|e| ChorusError::Storage(e.to_string()))?;
-            let data: StateData = serde_json::from_slice(&bytes)
-                .map_err(|e| ChorusError::Storage(format!("state decode: {e}")))?;
+            if bytes.len() > MAX_STATE_FILE_BYTES {
+                return Err(ChorusError::Storage("state file exceeds 256 MiB".into()));
+            }
+            let data = decode_state_file(&bytes)?;
+            validate_state_data(&data)?;
             MemoryStateStore::from_data(data)
         } else {
             if let Some(parent) = path.parent() {
@@ -403,8 +442,9 @@ impl FileStateStore {
         })
     }
     fn persist(&self) -> Result<()> {
-        let bytes = serde_json::to_vec(&self.memory.data())
-            .map_err(|e| ChorusError::Storage(e.to_string()))?;
+        let data = self.memory.data();
+        validate_state_data(&data)?;
+        let bytes = encode_state_file(&data)?;
         let tmp = self.path.with_extension("tmp");
         let mut f = File::create(&tmp).map_err(|e| ChorusError::Storage(e.to_string()))?;
         f.write_all(&bytes)
@@ -432,6 +472,7 @@ impl FileStateStore {
             .persist_lock
             .lock()
             .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
+        let before = self.memory.data();
         {
             let mut data = self
                 .memory
@@ -447,32 +488,254 @@ impl FileStateStore {
             };
             data.origins.clear();
         }
-        self.persist()
+        if let Err(error) = self.persist() {
+            *self
+                .memory
+                .inner
+                .write()
+                .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
+            return Err(error);
+        }
+        Ok(())
     }
     pub fn initialize_cluster(&self, cluster_id: [u8; 16], incarnation: u64) -> Result<()> {
-        let needs_init = {
-            let data = self.data();
-            data.cluster_id == [0; 16] && data.last_applied == LogId::ZERO && data.db_epoch == 0
-        };
-        if needs_init {
-            let _persist_guard = self
-                .persist_lock
-                .lock()
-                .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
-            {
-                let mut data = self
-                    .memory
-                    .inner
-                    .write()
-                    .map_err(|_| ChorusError::Storage("state lock poisoned".into()))?;
-                data.cluster_id = cluster_id;
-                data.cluster_incarnation = incarnation;
+        if incarnation == 0 {
+            return Err(ChorusError::Protocol(
+                "cluster incarnation must be nonzero".into(),
+            ));
+        }
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
+        let mut data = self
+            .memory
+            .inner
+            .write()
+            .map_err(|_| ChorusError::Storage("state lock poisoned".into()))?;
+        let needs_init =
+            data.cluster_id == [0; 16] && data.last_applied == LogId::ZERO && data.db_epoch == 0;
+        if !needs_init {
+            if data.cluster_id != cluster_id || data.cluster_incarnation != incarnation {
+                return Err(ChorusError::Protocol(
+                    "store is already bound to a different cluster".into(),
+                ));
             }
-            self.persist()
-        } else {
-            Ok(())
+            return Ok(());
+        }
+        let before = data.clone();
+        data.cluster_id = cluster_id;
+        data.cluster_incarnation = incarnation;
+        drop(data);
+        if let Err(error) = self.persist() {
+            *self
+                .memory
+                .inner
+                .write()
+                .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+fn encode_state_file(data: &StateData) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec(data).map_err(|e| ChorusError::Storage(e.to_string()))?;
+    let required = STATE_FILE_MAGIC
+        .len()
+        .checked_add(1 + 4 + json.len() + 32)
+        .ok_or_else(|| ChorusError::Storage("state file size exhausted".into()))?;
+    if required > MAX_STATE_FILE_BYTES {
+        return Err(ChorusError::Storage("state file exceeds 256 MiB".into()));
+    }
+    let mut out = Vec::with_capacity(required);
+    out.extend_from_slice(STATE_FILE_MAGIC);
+    out.push(STATE_FILE_VERSION);
+    out.extend_from_slice(
+        &u32::try_from(json.len())
+            .map_err(|_| ChorusError::Storage("state file length exceeds u32".into()))?
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(&json);
+    out.extend_from_slice(&hash32(&json));
+    Ok(out)
+}
+
+fn decode_state_file(bytes: &[u8]) -> Result<StateData> {
+    if bytes.starts_with(STATE_FILE_MAGIC) {
+        let header_len = STATE_FILE_MAGIC.len() + 1 + 4;
+        if bytes.len() < header_len + 32 {
+            return Err(ChorusError::Storage("truncated state file".into()));
+        }
+        let version = bytes[STATE_FILE_MAGIC.len()];
+        if version != STATE_FILE_VERSION {
+            return Err(ChorusError::Storage(format!(
+                "unsupported state file version {version}"
+            )));
+        }
+        let len_start = STATE_FILE_MAGIC.len() + 1;
+        let len = u32::from_be_bytes(
+            bytes[len_start..len_start + 4]
+                .try_into()
+                .map_err(|_| ChorusError::Storage("invalid state length".into()))?,
+        ) as usize;
+        let data_start = header_len;
+        let data_end = data_start
+            .checked_add(len)
+            .ok_or_else(|| ChorusError::Storage("state file length exhausted".into()))?;
+        if data_end + 32 != bytes.len() {
+            return Err(ChorusError::Storage("invalid state file length".into()));
+        }
+        let json = &bytes[data_start..data_end];
+        if hash32(json) != bytes[data_end..] {
+            return Err(ChorusError::Storage("state file checksum mismatch".into()));
+        }
+        return serde_json::from_slice(json)
+            .map_err(|e| ChorusError::Storage(format!("state decode: {e}")));
+    }
+    // Read legacy JSON files once so a rolling upgrade remains possible; all
+    // subsequent writes use the checksummed envelope above.
+    serde_json::from_slice(bytes).map_err(|e| ChorusError::Storage(format!("state decode: {e}")))
+}
+
+fn validate_membership(membership: &Membership) -> Result<()> {
+    if membership.voters.len() > 10_000 || membership.learners.len() > 10_000 {
+        return Err(ChorusError::Limit("membership size exceeds limit".into()));
+    }
+    let mut ids = BTreeSet::new();
+    for id in membership.voters.iter().chain(&membership.learners) {
+        if *id == 0 || !ids.insert(*id) {
+            return Err(ChorusError::Protocol(
+                "membership contains duplicate or invalid node id".into(),
+            ));
         }
     }
+    if membership.voters.windows(2).any(|w| w[0] >= w[1])
+        || membership.learners.windows(2).any(|w| w[0] >= w[1])
+    {
+        return Err(ChorusError::Protocol("membership is not sorted".into()));
+    }
+    Ok(())
+}
+
+fn validate_state_data(data: &StateData) -> Result<()> {
+    if data.format_version != 1 {
+        return Err(ChorusError::Serialization(format!(
+            "unsupported state format version {}",
+            data.format_version
+        )));
+    }
+    if data.cluster_incarnation == 0 {
+        return Err(ChorusError::Protocol(
+            "cluster incarnation must be nonzero".into(),
+        ));
+    }
+    validate_membership(&data.membership)?;
+    if data.catalog.tables.len() > 1_024 || data.catalog.indexes.len() > 32 * 1_024 {
+        return Err(ChorusError::Limit(
+            "catalog object count exceeds limit".into(),
+        ));
+    }
+    let mut object_ids = BTreeSet::new();
+    let mut max_object_id = 0u32;
+    for (oid, table) in &data.catalog.tables {
+        if *oid == 0 || *oid != table.oid || !object_ids.insert(*oid) {
+            return Err(ChorusError::Serialization("invalid table object id".into()));
+        }
+        max_object_id = max_object_id.max(*oid);
+        if table.schema_oid == 0 || table.name.is_empty() || table.name.len() > 63 {
+            return Err(ChorusError::Serialization(
+                "invalid table descriptor".into(),
+            ));
+        }
+        if table.columns.is_empty() || table.columns.len() > 256 {
+            return Err(ChorusError::Limit("invalid table column count".into()));
+        }
+        let mut column_ids = BTreeSet::new();
+        let mut column_names = BTreeSet::new();
+        for column in &table.columns {
+            if column.id == 0
+                || !column_ids.insert(column.id)
+                || column.name.is_empty()
+                || column.name.len() > 63
+                || !column_names.insert(&column.name)
+            {
+                return Err(ChorusError::Serialization(
+                    "invalid column descriptor".into(),
+                ));
+            }
+            max_object_id = max_object_id.max(column.id);
+        }
+        if let Some(primary) = table.primary_key {
+            if !column_ids.contains(&primary) {
+                return Err(ChorusError::Serialization(
+                    "primary key references missing column".into(),
+                ));
+            }
+        }
+        if table.secondary_indexes.len() > 32
+            || table
+                .secondary_indexes
+                .iter()
+                .any(|index| !data.catalog.indexes.contains_key(index))
+        {
+            return Err(ChorusError::Limit("invalid table index references".into()));
+        }
+    }
+    for (oid, index) in &data.catalog.indexes {
+        if *oid == 0 || *oid != index.oid || !object_ids.insert(*oid) {
+            return Err(ChorusError::Serialization("invalid index object id".into()));
+        }
+        max_object_id = max_object_id.max(*oid);
+        if index.table_oid == 0 || index.name.is_empty() || index.name.len() > 63 {
+            return Err(ChorusError::Serialization(
+                "invalid index descriptor".into(),
+            ));
+        }
+        if index.columns.is_empty() || index.columns.len() > 16 {
+            return Err(ChorusError::Limit("invalid index column count".into()));
+        }
+        let table =
+            data.catalog.tables.get(&index.table_oid).ok_or_else(|| {
+                ChorusError::Serialization("index references missing table".into())
+            })?;
+        if !table.secondary_indexes.contains(oid) {
+            return Err(ChorusError::Serialization(
+                "index is not referenced by table".into(),
+            ));
+        }
+        for column in &index.columns {
+            if !table.columns.iter().any(|c| c.id == column.column_id) {
+                return Err(ChorusError::Serialization(
+                    "index references missing column".into(),
+                ));
+            }
+        }
+    }
+    if max_object_id < u32::MAX && data.catalog.next_object_id <= max_object_id {
+        return Err(ChorusError::Serialization(
+            "catalog allocator is not ahead of object ids".into(),
+        ));
+    }
+    for (key, value) in &data.kv {
+        if key.is_empty() || key.len() > MAX_KEY_BYTES {
+            return Err(ChorusError::Limit("physical key exceeds 8 KiB".into()));
+        }
+        if key.first() == Some(&0x20) && value.len() > MAX_ROW_BYTES {
+            return Err(ChorusError::Limit("row exceeds 256 KiB".into()));
+        }
+    }
+    for (node_id, origin) in &data.origins {
+        if *node_id == 0 || origin.active_origin.node_id != *node_id {
+            return Err(ChorusError::Protocol("invalid origin state".into()));
+        }
+        if origin.recent_results.len() > 16 {
+            return Err(ChorusError::Limit(
+                "origin deduplication history exceeds limit".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl StateStore for FileStateStore {
@@ -513,6 +776,23 @@ impl StateStore for FileStateStore {
         }
         Ok(())
     }
+    fn rollback(&self, snapshot: &LogicalSnapshot) -> Result<()> {
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| ChorusError::Storage("persist lock poisoned".into()))?;
+        let before = self.memory.data();
+        self.memory.rollback(snapshot)?;
+        if let Err(error) = self.persist() {
+            *self
+                .memory
+                .inner
+                .write()
+                .map_err(|_| ChorusError::Storage("state lock poisoned".into()))? = before;
+            return Err(error);
+        }
+        Ok(())
+    }
     fn state_hash(&self) -> Result<[u8; 32]> {
         self.memory.state_hash()
     }
@@ -526,28 +806,35 @@ fn apply_command(
     log_id: LogId,
     command: &ReplicatedCommandV1,
 ) -> Result<ApplyResult> {
-    if log_id <= data.last_applied && !matches!(command, ReplicatedCommandV1::Noop) {
+    // A replayed entry is terminal at the state-machine boundary. In
+    // particular, a stale Noop must not move last_applied backwards.
+    // Raft log indexes are globally monotonic even when a new term starts;
+    // comparing the derived `(term, index)` ordering alone would allow a
+    // higher-term, lower-index adversarial entry to move the state machine
+    // cursor backwards.
+    if log_id.index <= data.last_applied.index {
         return Ok(ApplyResult::Noop);
     }
     let result = match command {
         ReplicatedCommandV1::Noop => ApplyResult::Noop,
         ReplicatedCommandV1::Membership { voters, learners } => {
-            let voters = sorted_unique(voters);
-            let learners = sorted_unique(learners);
-            if voters.iter().any(|id| learners.binary_search(id).is_ok())
+            let voters_sorted = voters.windows(2).all(|w| w[0] < w[1]);
+            let learners_sorted = learners.windows(2).all(|w| w[0] < w[1]);
+            if !voters_sorted
+                || !learners_sorted
+                || voters.iter().any(|id| learners.binary_search(id).is_ok())
                 || voters.contains(&0)
                 || learners.contains(&0)
             {
-                return Ok(ApplyResult::Rejected(
-                    "membership contains overlapping or invalid node ids".into(),
-                ));
+                ApplyResult::Rejected("membership contains overlapping or invalid node ids".into())
+            } else {
+                data.membership = Membership {
+                    log_id,
+                    voters: voters.clone(),
+                    learners: learners.clone(),
+                };
+                ApplyResult::Noop
             }
-            data.membership = Membership {
-                log_id,
-                voters,
-                learners,
-            };
-            ApplyResult::Noop
         }
         ReplicatedCommandV1::ActivateOrigin(a) => {
             if !data
@@ -573,23 +860,16 @@ fn apply_command(
     Ok(result)
 }
 
-fn sorted_unique(values: &[u64]) -> Vec<u64> {
-    let mut v = values.to_vec();
-    v.sort_unstable();
-    v.dedup();
-    v
-}
-
 fn apply_commit(
     data: &mut StateData,
     log_id: LogId,
     c: &CommitTransactionV1,
 ) -> Result<ApplyResult> {
     let origin = c.request_id.origin;
-    let state = data
-        .origins
-        .get(&origin.node_id)
-        .ok_or_else(|| ChorusError::Protocol("origin is not activated".into()))?;
+    let state = match data.origins.get(&origin.node_id) {
+        Some(state) => state,
+        None => return Ok(ApplyResult::StaleOrigin),
+    };
     if state.active_origin != origin {
         return Ok(ApplyResult::StaleOrigin);
     }
@@ -615,17 +895,8 @@ fn apply_commit(
     if c.request_id.sequence != expected_sequence {
         return Ok(ApplyResult::ProtocolError("request sequence gap".into()));
     }
-    let mut canonical = Vec::new();
-    for m in &c.mutations {
-        canonical.extend_from_slice(m.key());
-        canonical.push(match m {
-            KvMutationV1::Put { .. } => 1,
-            KvMutationV1::Delete { .. } => 2,
-        });
-        if let KvMutationV1::Put { value, .. } = m {
-            canonical.extend_from_slice(value);
-        }
-    }
+    let canonical =
+        canonical_mutations(&c.mutations).map_err(|e| ChorusError::Serialization(e.to_string()))?;
     let expected_hash = payload_hash(1, &c.request_id, c.base_epoch, &canonical);
     if expected_hash != c.payload_hash {
         let result = ApplyResult::ProtocolError("payload hash mismatch".into());
@@ -800,10 +1071,10 @@ fn apply_schema(
 ) -> Result<ApplyResult> {
     let origin = c.request_id.origin;
     {
-        let state = data
-            .origins
-            .get(&origin.node_id)
-            .ok_or_else(|| ChorusError::Protocol("origin is not activated".into()))?;
+        let state = match data.origins.get(&origin.node_id) {
+            Some(state) => state,
+            None => return Ok(ApplyResult::StaleOrigin),
+        };
         if state.active_origin != origin {
             return Ok(ApplyResult::StaleOrigin);
         }
@@ -1316,15 +1587,16 @@ fn canonical_state_hash(data: &StateData) -> [u8; 32] {
 
 pub fn snapshot_from_store(store: &dyn StateStore) -> Result<LogicalSnapshot> {
     let s = store.snapshot()?;
+    let data = s.to_data();
     let mut meta = BTreeMap::new();
     meta.insert(
         "state".into(),
-        serde_json::to_vec(&s.to_data()).map_err(|e| ChorusError::Serialization(e.to_string()))?,
+        serde_json::to_vec(&data).map_err(|e| ChorusError::Serialization(e.to_string()))?,
     );
     let entries = s.kv().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    Ok(LogicalSnapshot::new(
+    LogicalSnapshot::try_new(
         s.cluster_id(),
-        1,
+        data.cluster_incarnation,
         s.last_applied(),
         s.membership().log_id,
         s.membership().voters.clone(),
@@ -1333,14 +1605,15 @@ pub fn snapshot_from_store(store: &dyn StateStore) -> Result<LogicalSnapshot> {
         s.catalog_epoch(),
         meta,
         entries,
-    ))
+    )
+    .map_err(|e| ChorusError::Serialization(format!("snapshot build: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chorus_common::RequestId;
     fn command(
-        store: &MemoryStateStore,
         origin: OriginId,
         seq: u64,
         epoch: u64,
@@ -1352,10 +1625,7 @@ mod tests {
             key: key.to_vec(),
             value: val.to_vec(),
         }];
-        let mut canonical = Vec::new();
-        canonical.extend_from_slice(key);
-        canonical.push(1);
-        canonical.extend_from_slice(val);
+        let canonical = canonical_mutations(&m).unwrap();
         let h = payload_hash(1, &id, epoch, &canonical);
         ReplicatedCommandV1::CommitTransaction(CommitTransactionV1 {
             request_id: id,
@@ -1374,7 +1644,7 @@ mod tests {
                 &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 { origin: o }),
             )
             .unwrap();
-        let c = command(&store, o, 1, 0, b"k", b"v");
+        let c = command(o, 1, 0, b"k", b"v");
         let r = store.apply(LogId { term: 1, index: 2 }, &c).unwrap();
         assert!(matches!(r, ApplyResult::Committed { epoch: 1, .. }));
         let r2 = store.apply(LogId { term: 1, index: 3 }, &c).unwrap();
@@ -1391,12 +1661,24 @@ mod tests {
                 &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 { origin: o }),
             )
             .unwrap();
-        let c = command(&store, o, 1, 5, b"k", b"v");
+        let c = command(o, 1, 5, b"k", b"v");
         assert!(matches!(
             store.apply(LogId { term: 1, index: 2 }, &c).unwrap(),
             ApplyResult::SerializationFailure { .. }
         ));
         assert!(store.snapshot().unwrap().get(b"k").is_none());
+    }
+
+    #[test]
+    fn higher_term_lower_index_cannot_regress_cursor() {
+        let store = MemoryStateStore::new();
+        store
+            .apply(LogId { term: 1, index: 5 }, &ReplicatedCommandV1::Noop)
+            .unwrap();
+        store
+            .apply(LogId { term: 2, index: 1 }, &ReplicatedCommandV1::Noop)
+            .unwrap();
+        assert_eq!(store.snapshot().unwrap().last_applied().index, 5);
     }
 
     #[test]

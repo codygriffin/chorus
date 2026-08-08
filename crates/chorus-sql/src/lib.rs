@@ -5,10 +5,11 @@
 //! private to this crate.
 
 use chorus_codec::{ApplyResult, SchemaOperationV1, encode_composite, hash32};
-use chorus_common::{ChorusError, Datum, Limits, OriginId, Result, SqlError, SqlType};
+#[cfg(test)]
+use chorus_common::OriginId;
+use chorus_common::{ChorusError, Datum, Limits, SqlError, SqlType, unix_now_us};
 use chorus_storage::{
-    Catalog, ColumnDescriptor, ColumnState, IndexDescriptor, ObjectState, StateSnapshot,
-    StateStore, TableDescriptor,
+    Catalog, ColumnDescriptor, ColumnState, ObjectState, StateSnapshot, StateStore, TableDescriptor,
 };
 use chorus_txn::{CommitSequencer, Committer, Transaction, TransactionStatus};
 use std::collections::HashMap;
@@ -79,6 +80,7 @@ pub struct SqlEngine {
     store: Arc<dyn StateStore>,
     committer: Arc<dyn Committer>,
     limits: Limits,
+    sequencer: Arc<CommitSequencer>,
 }
 impl SqlEngine {
     pub fn new(
@@ -86,10 +88,12 @@ impl SqlEngine {
         committer: Arc<dyn Committer>,
         limits: Limits,
     ) -> Arc<Self> {
+        let sequencer = Arc::new(CommitSequencer::new(committer.origin()));
         Arc::new(Self {
             store,
             committer,
             limits,
+            sequencer,
         })
     }
     pub fn session(self: &Arc<Self>) -> SqlSession {
@@ -99,8 +103,9 @@ impl SqlEngine {
             failed: false,
             settings: SessionSettings::default(),
             prepared: HashMap::new(),
-            sequencer: Arc::new(CommitSequencer::new(self.committer.origin())),
+            sequencer: Arc::clone(&self.sequencer),
             transaction_timestamp_us: None,
+            statement_timestamp_us: None,
         }
     }
     pub fn store(&self) -> &Arc<dyn StateStore> {
@@ -997,6 +1002,24 @@ impl Parser {
             Some(Tok::Word(w)) if w == "true" => Ok(Some(Datum::Boolean(true))),
             Some(Tok::Word(w)) if w == "false" => Ok(Some(Datum::Boolean(false))),
             Some(Tok::Word(w)) if w == "null" => Ok(Some(Datum::Null)),
+            Some(Tok::Word(w)) if w == "current_date" => Ok(Some(Datum::Date(
+                unix_now_us().div_euclid(86_400_000_000) as i32,
+            ))),
+            Some(Tok::Word(w)) if w == "current_timestamp" || w == "now" => {
+                Ok(Some(Datum::Timestamp(unix_now_us())))
+            }
+            Some(Tok::Word(w)) if w == "date" || w == "timestamp" || w == "timestamptz" => {
+                let text = match self.next() {
+                    Some(Tok::Str(value)) => value,
+                    other => {
+                        return Err(SqlError::new(
+                            "42601",
+                            format!("expected temporal literal, got {other:?}"),
+                        ));
+                    }
+                };
+                Ok(Some(parse_temporal_literal(&w, &text)?))
+            }
             Some(x) => Err(SqlError::new(
                 "42601",
                 format!("expected literal, got {x:?}"),
@@ -1045,7 +1068,27 @@ impl Parser {
             Some(Tok::Word(w)) if w == "not" => Expr::Unary(Unary::Not, Box::new(self.primary()?)),
             Some(Tok::Word(w)) if w == "case" => self.case_expr()?,
             Some(Tok::Word(w)) => {
-                if self.eat(Tok::L) {
+                let temporal_start = self.p;
+                let temporal_kind = if w == "timestamp" && self.words(&["with", "time", "zone"]) {
+                    Some("timestamptz")
+                } else if matches!(w.as_str(), "date" | "timestamp" | "timestamptz") {
+                    Some(w.as_str())
+                } else {
+                    None
+                };
+                if let Some(kind) = temporal_kind {
+                    if let Some(Tok::Str(value)) = self.next() {
+                        Expr::Literal(parse_temporal_literal(kind, &value)?)
+                    } else {
+                        self.p = temporal_start;
+                        Expr::Column(w)
+                    }
+                } else if matches!(
+                    w.as_str(),
+                    "current_date" | "current_timestamp" | "localtimestamp"
+                ) {
+                    Expr::Func(w, Vec::new())
+                } else if self.eat(Tok::L) {
                     if w == "cast" {
                         let value = self.expr()?;
                         self.word("as")?;
@@ -1263,6 +1306,7 @@ pub struct SqlSession {
     prepared: HashMap<String, String>,
     sequencer: Arc<CommitSequencer>,
     transaction_timestamp_us: Option<i64>,
+    statement_timestamp_us: Option<i64>,
 }
 impl SqlSession {
     pub fn settings(&self) -> &SessionSettings {
@@ -1321,7 +1365,7 @@ impl SqlSession {
                 Err(e) => {
                     if implicit {
                         self.rollback_internal();
-                    } else if self.txn.is_some() && e.code != "25P02" {
+                    } else if self.txn.is_some() && e.code != "25P02" && e.code != "08006" {
                         self.failed = true;
                         if let Some(t) = self.txn.as_mut() {
                             t.fail();
@@ -1419,15 +1463,25 @@ impl SqlSession {
         let snapshot = self.engine.committer.read_barrier().map_err(to_sql)?;
         let transaction = Transaction::begin(snapshot, self.engine.limits.clone());
         self.transaction_timestamp_us = Some(transaction.transaction_timestamp_us);
+        self.statement_timestamp_us = Some(transaction.statement_timestamp_us);
         self.txn = Some(transaction);
         self.failed = false;
         Ok(())
     }
     fn commit_internal(&mut self) -> std::result::Result<(), SqlError> {
         if let Some(mut txn) = self.txn.take() {
-            let r = txn
-                .commit(self.engine.committer.as_ref(), &self.sequencer)
-                .map_err(to_sql)?;
+            let r = match txn.commit(self.engine.committer.as_ref(), &self.sequencer) {
+                Ok(result) => result,
+                Err(error @ ChorusError::Consensus(_)) => {
+                    // The transport outcome may be ambiguous. Preserve the
+                    // transaction overlay and exact sequencer request so a
+                    // client can retry COMMIT without rebuilding a different
+                    // mutation batch or reusing a sequence number.
+                    self.txn = Some(txn);
+                    return Err(to_sql(error));
+                }
+                Err(error) => return Err(to_sql(error)),
+            };
             if matches!(r, ApplyResult::SerializationFailure { .. }) {
                 return Err(SqlError::serialization(
                     "could not serialize access due to concurrent update",
@@ -1436,6 +1490,7 @@ impl SqlSession {
         }
         self.failed = false;
         self.transaction_timestamp_us = None;
+        self.statement_timestamp_us = None;
         Ok(())
     }
     fn rollback_internal(&mut self) {
@@ -1445,6 +1500,13 @@ impl SqlSession {
         self.txn = None;
         self.failed = false;
         self.transaction_timestamp_us = None;
+        self.statement_timestamp_us = None;
+    }
+    fn prepare_statement(&mut self, tx: &mut Transaction) -> std::result::Result<(), SqlError> {
+        tx.check_age().map_err(to_sql)?;
+        tx.set_statement_time().map_err(to_sql)?;
+        self.statement_timestamp_us = Some(tx.statement_timestamp_us);
+        Ok(())
     }
     fn tx(&mut self) -> std::result::Result<&mut Transaction, SqlError> {
         if self.failed {
@@ -1578,6 +1640,10 @@ impl SqlSession {
             self.start_txn()?;
         }
         let mut tx = self.txn.take().expect("transaction initialized");
+        if let Err(error) = self.prepare_statement(&mut tx) {
+            self.txn = Some(tx);
+            return Err(error);
+        }
         let result = self.select_tx(&mut tx, q, params);
         self.txn = Some(tx);
         result
@@ -1589,7 +1655,6 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
-        tx.set_statement_time().map_err(to_sql)?;
         if q.from
             .as_deref()
             .is_some_and(|name| is_virtual_relation(name))
@@ -1609,11 +1674,13 @@ impl SqlSession {
                     self.join_rows(tx, &table, q.from_alias.as_deref(), rows, &q.joins, params)?;
             }
             if let Some(w) = &q.selection {
-                rows.retain(|r| {
-                    self.eval(w, &r.cells, params)
-                        .map(|v| v.truthy() == Some(true))
-                        .unwrap_or(false)
-                });
+                let mut filtered = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if self.eval(w, &row.cells, params)?.truthy() == Some(true) {
+                        filtered.push(row);
+                    }
+                }
+                rows = filtered;
             }
             if !q.group_by.is_empty()
                 || q.projection.iter().any(has_aggregate)
@@ -1622,9 +1689,12 @@ impl SqlSession {
                 return self.select_grouped(&table, rows, q, params);
             }
             for (e, desc) in q.order.iter().rev() {
-                rows.sort_by(|a, b| {
-                    let x = self.eval(e, &a.cells, params).unwrap_or(Datum::Null);
-                    let y = self.eval(e, &b.cells, params).unwrap_or(Datum::Null);
+                let mut keyed = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let key = self.eval(e, &row.cells, params)?;
+                    keyed.push((row, key));
+                }
+                keyed.sort_by(|(_, x), (_, y)| {
                     let mut c = x.cmp(&y);
                     if x.is_null() || y.is_null() {
                         c = if x.is_null() && y.is_null() {
@@ -1637,6 +1707,7 @@ impl SqlSession {
                     }
                     if *desc { c.reverse() } else { c }
                 });
+                rows = keyed.into_iter().map(|(row, _)| row).collect();
             }
             let rows = rows
                 .into_iter()
@@ -1907,16 +1978,21 @@ impl SqlSession {
             })
             .collect::<Vec<_>>();
         if let Some(w) = &q.selection {
-            rows.retain(|r| {
-                self.eval(w, &r.cells, params)
-                    .map(|v| v.truthy() == Some(true))
-                    .unwrap_or(false)
-            });
+            let mut filtered = Vec::with_capacity(rows.len());
+            for row in rows {
+                if self.eval(w, &row.cells, params)?.truthy() == Some(true) {
+                    filtered.push(row);
+                }
+            }
+            rows = filtered;
         }
         for (e, desc) in q.order.iter().rev() {
-            rows.sort_by(|a, b| {
-                let x = self.eval(e, &a.cells, params).unwrap_or(Datum::Null);
-                let y = self.eval(e, &b.cells, params).unwrap_or(Datum::Null);
+            let mut keyed = Vec::with_capacity(rows.len());
+            for row in rows {
+                let key = self.eval(e, &row.cells, params)?;
+                keyed.push((row, key));
+            }
+            keyed.sort_by(|(_, x), (_, y)| {
                 let mut c = x.cmp(&y);
                 if x.is_null() || y.is_null() {
                     c = if x.is_null() && y.is_null() {
@@ -1929,6 +2005,7 @@ impl SqlSession {
                 }
                 if *desc { c.reverse() } else { c }
             });
+            rows = keyed.into_iter().map(|(row, _)| row).collect();
         }
         let rows = rows
             .into_iter()
@@ -1976,6 +2053,10 @@ impl SqlSession {
             self.start_txn()?;
         }
         let mut tx = self.txn.take().expect("transaction initialized");
+        if let Err(error) = self.prepare_statement(&mut tx) {
+            self.txn = Some(tx);
+            return Err(error);
+        }
         let result = self.insert_tx(&mut tx, q, params);
         self.txn = Some(tx);
         result
@@ -1987,7 +2068,6 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
-        tx.set_statement_time().map_err(to_sql)?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let cols: Vec<_> = if q.columns.is_empty() {
             table
@@ -2025,19 +2105,11 @@ impl SqlSession {
                 .filter(|c| c.state == ColumnState::Live)
             {
                 if !fields.iter().any(|(id, _)| *id == c.id) {
-                    let v = c.default.clone().unwrap_or(Datum::Null);
-                    if v.is_null() && !c.nullable {
-                        return Err(SqlError::new(
-                            "23502",
-                            format!(
-                                "null value in column {} violates not-null constraint",
-                                c.name
-                            ),
-                        ));
-                    }
+                    let v = coerce(c.default.clone().unwrap_or(Datum::Null), c.data_type)?;
                     fields.push((c.id, v));
                 }
             }
+            validate_fields(&table, &fields)?;
             let row =
                 chorus_codec::EncodedRowV1::new(table.schema_version, fields).map_err(codec_sql)?;
             let key = key_for(tx, &table, &row, i as u32)?;
@@ -2145,14 +2217,15 @@ impl SqlSession {
                             "duplicate key value violates unique constraint",
                         ));
                     }
-                    tx.put(replacement_key, replacement.encode().map_err(codec_sql)?)
+                    validate_fields(&table, &replacement.fields)?;
+                    tx.put(replacement_key, encode_row_checked(tx, &replacement)?)
                         .map_err(to_sql)?;
                     for (entry, _) in replacement_indexes {
                         tx.put(entry, Vec::new()).map_err(to_sql)?;
                     }
                     count += 1;
                     if !q.returning.is_empty() {
-                        ret.push(self.returning(&q.returning, &table, &replacement, params)?);
+                        self.push_returning(&mut ret, &q.returning, &table, &replacement, params)?;
                     }
                     continue;
                 }
@@ -2161,21 +2234,21 @@ impl SqlSession {
                     "duplicate key value violates unique constraint",
                 ));
             }
-            tx.put(key.clone(), row.encode().map_err(codec_sql)?)
+            tx.put(key.clone(), encode_row_checked(tx, &row)?)
                 .map_err(to_sql)?;
             for (entry, _) in new_index_entries {
                 tx.put(entry, Vec::new()).map_err(to_sql)?;
             }
             count += 1;
             if !q.returning.is_empty() {
-                ret.push(self.returning(&q.returning, &table, &row, params)?);
+                self.push_returning(&mut ret, &q.returning, &table, &row, params)?;
             }
         }
         Ok(QueryResult {
             columns: q
                 .returning
                 .iter()
-                .map(|e| result_column(e, &table))
+                .flat_map(|e| returning_columns(e, &table))
                 .collect(),
             rows: ret,
             affected_rows: count,
@@ -2192,6 +2265,10 @@ impl SqlSession {
             self.start_txn()?;
         }
         let mut tx = self.txn.take().expect("transaction initialized");
+        if let Err(error) = self.prepare_statement(&mut tx) {
+            self.txn = Some(tx);
+            return Err(error);
+        }
         let result = self.update_tx(&mut tx, q, params);
         self.txn = Some(tx);
         result
@@ -2203,7 +2280,6 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
-        tx.set_statement_time().map_err(to_sql)?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let targets = scan(tx, &table)?;
         let mut ret = Vec::new();
@@ -2229,6 +2305,7 @@ impl SqlSession {
                 }
             }
             row.fields.sort_by_key(|(id, _)| *id);
+            validate_fields(&table, &row.fields)?;
             // Remove the old row and all of its index entries before checking
             // the replacement.  This makes UPDATE of a unique key behave as
             // PostgreSQL does when the value is unchanged.
@@ -2259,13 +2336,13 @@ impl SqlSession {
                     "duplicate key value violates unique constraint",
                 ));
             }
-            tx.put(new_key, row.encode().map_err(codec_sql)?)
+            tx.put(new_key, encode_row_checked(tx, &row)?)
                 .map_err(to_sql)?;
             for (entry, _) in new_indexes {
                 tx.put(entry, Vec::new()).map_err(to_sql)?;
             }
             if !q.returning.is_empty() {
-                ret.push(self.returning(&q.returning, &table, &row, params)?);
+                self.push_returning(&mut ret, &q.returning, &table, &row, params)?;
             }
             count += 1;
         }
@@ -2273,7 +2350,7 @@ impl SqlSession {
             columns: q
                 .returning
                 .iter()
-                .map(|e| result_column(e, &table))
+                .flat_map(|e| returning_columns(e, &table))
                 .collect(),
             rows: ret,
             affected_rows: count,
@@ -2290,6 +2367,10 @@ impl SqlSession {
             self.start_txn()?;
         }
         let mut tx = self.txn.take().expect("transaction initialized");
+        if let Err(error) = self.prepare_statement(&mut tx) {
+            self.txn = Some(tx);
+            return Err(error);
+        }
         let result = self.delete_tx(&mut tx, q, params);
         self.txn = Some(tx);
         result
@@ -2301,7 +2382,6 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
-        tx.set_statement_time().map_err(to_sql)?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let targets = scan(tx, &table)?;
         let mut ret = Vec::new();
@@ -2313,7 +2393,7 @@ impl SqlSession {
                 }
             }
             if !q.returning.is_empty() {
-                ret.push(self.returning(&q.returning, &table, &target.row, params)?);
+                self.push_returning(&mut ret, &q.returning, &table, &target.row, params)?;
             }
             tx.delete(target.key.clone()).map_err(to_sql)?;
             for (entry, _) in
@@ -2327,7 +2407,7 @@ impl SqlSession {
             columns: q
                 .returning
                 .iter()
-                .map(|e| result_column(e, &table))
+                .flat_map(|e| returning_columns(e, &table))
                 .collect(),
             rows: ret,
             affected_rows: count,
@@ -2344,7 +2424,39 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<Vec<Datum>, SqlError> {
         let cs = cells(table, row);
-        exprs.iter().map(|e| self.eval(e, &cs, params)).collect()
+        let mut out = Vec::new();
+        for expr in exprs {
+            if matches!(expr, Expr::Star) {
+                out.extend(cs.iter().map(|cell| cell.value.clone()));
+            } else {
+                out.push(self.eval(expr, &cs, params)?);
+            }
+        }
+        Ok(out)
+    }
+    fn push_returning(
+        &self,
+        rows: &mut Vec<Vec<Datum>>,
+        exprs: &[Expr],
+        table: &TableDescriptor,
+        row: &chorus_codec::EncodedRowV1,
+        params: &[Datum],
+    ) -> std::result::Result<(), SqlError> {
+        let values = self.returning(exprs, table, row, params)?;
+        let bytes = rows
+            .iter()
+            .map(|old| old.iter().map(datum_size).sum::<usize>())
+            .sum::<usize>()
+            .checked_add(values.iter().map(datum_size).sum::<usize>())
+            .ok_or_else(|| SqlError::new("54000", "RETURNING result exceeds configured limit"))?;
+        if bytes > self.engine.limits.max_returning_bytes {
+            return Err(SqlError::new(
+                "54000",
+                "RETURNING result exceeds configured limit",
+            ));
+        }
+        rows.push(values);
+        Ok(())
     }
     fn eval(
         &self,
@@ -2467,11 +2579,27 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<Datum, SqlError> {
         let n = name.to_ascii_lowercase();
-        if n == "now" || n == "transaction_timestamp" || n == "statement_timestamp" {
-            return Ok(Datum::Timestamp(
+        if n == "now"
+            || n == "transaction_timestamp"
+            || n == "statement_timestamp"
+            || n == "current_timestamp"
+            || n == "localtimestamp"
+        {
+            let timestamp = if n == "statement_timestamp" {
+                self.statement_timestamp_us
+                    .or(self.transaction_timestamp_us)
+                    .unwrap_or_else(chorus_common::unix_now_us)
+            } else {
                 self.transaction_timestamp_us
-                    .unwrap_or_else(chorus_common::unix_now_us),
-            ));
+                    .unwrap_or_else(chorus_common::unix_now_us)
+            };
+            return Ok(Datum::Timestamp(timestamp));
+        }
+        if n == "current_date" {
+            let timestamp = self
+                .transaction_timestamp_us
+                .unwrap_or_else(chorus_common::unix_now_us);
+            return Ok(Datum::Date(timestamp.div_euclid(86_400_000_000) as i32));
         }
         if n == "version" {
             return Ok(Datum::Text(
@@ -3074,6 +3202,55 @@ fn cells(t: &TableDescriptor, r: &chorus_codec::EncodedRowV1) -> Vec<Cell> {
         })
         .collect()
 }
+fn validate_fields(
+    table: &TableDescriptor,
+    fields: &[(u32, Datum)],
+) -> std::result::Result<(), SqlError> {
+    for column in table
+        .columns
+        .iter()
+        .filter(|c| c.state == ColumnState::Live)
+    {
+        let value = fields
+            .iter()
+            .find(|(id, _)| *id == column.id)
+            .map(|(_, value)| value)
+            .or_else(|| column.default.as_ref())
+            .unwrap_or(&Datum::Null);
+        if value.is_null() && !column.nullable {
+            return Err(SqlError::new(
+                "23502",
+                format!(
+                    "null value in column {} violates not-null constraint",
+                    column.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+fn encode_row_checked(
+    tx: &Transaction,
+    row: &chorus_codec::EncodedRowV1,
+) -> std::result::Result<Vec<u8>, SqlError> {
+    let bytes = row.encode().map_err(codec_sql)?;
+    if bytes.len() > tx.limits.max_row_bytes {
+        return Err(SqlError::new("54000", "row exceeds configured size limit"));
+    }
+    Ok(bytes)
+}
+fn datum_size(value: &Datum) -> usize {
+    1 + match value {
+        Datum::Null => 0,
+        Datum::Boolean(_) => 1,
+        Datum::Int16(_) => 2,
+        Datum::Int32(_) | Datum::Date(_) => 4,
+        Datum::Int64(_) | Datum::Timestamp(_) | Datum::TimestampTz(_) | Datum::Float64(_) => 8,
+        Datum::Uuid(_) => 16,
+        Datum::Bytes(bytes) => bytes.len(),
+        Datum::Text(text) | Datum::Jsonb(text) => text.len(),
+    }
+}
 fn scan(tx: &Transaction, t: &TableDescriptor) -> std::result::Result<Vec<Row>, SqlError> {
     let p = [
         0x20,
@@ -3194,6 +3371,22 @@ fn result_column(e: &Expr, t: &TableDescriptor) -> ResultColumn {
         },
     }
 }
+fn returning_columns(e: &Expr, t: &TableDescriptor) -> Vec<ResultColumn> {
+    if matches!(e, Expr::Star) {
+        t.columns
+            .iter()
+            .filter(|c| c.state == ColumnState::Live)
+            .map(|c| ResultColumn {
+                name: c.name.clone(),
+                data_type: c.data_type,
+                table_oid: t.oid,
+                column_oid: c.id,
+            })
+            .collect()
+    } else {
+        vec![result_column(e, t)]
+    }
+}
 fn codec_sql(e: chorus_codec::CodecError) -> SqlError {
     SqlError::new("XX000", e.to_string())
 }
@@ -3286,6 +3479,13 @@ fn cast_value(v: Datum, ty: SqlType) -> std::result::Result<Datum, SqlError> {
         (Datum::Text(text), SqlType::Jsonb) => chorus_common::Datum::canonical_json(&text)
             .map(Datum::Jsonb)
             .map_err(|e| SqlError::new("22P02", e.message)),
+        (Datum::Text(text), SqlType::Date) => parse_date_literal(&text).map(Datum::Date),
+        (Datum::Text(text), SqlType::Timestamp) => {
+            parse_timestamp_literal(&text).map(Datum::Timestamp)
+        }
+        (Datum::Text(text), SqlType::TimestampTz) => {
+            parse_timestamp_literal(&text).map(Datum::TimestampTz)
+        }
         (Datum::Text(text), SqlType::Uuid) => parse_uuid_text(&text)
             .map(Datum::Uuid)
             .ok_or_else(|| SqlError::new("22P02", "invalid input syntax for uuid")),
@@ -3315,6 +3515,106 @@ fn parse_uuid_text(text: &str) -> Option<[u8; 16]> {
     }
     Some(out)
 }
+
+fn parse_temporal_literal(kind: &str, text: &str) -> std::result::Result<Datum, SqlError> {
+    match kind {
+        "date" => parse_date_literal(text).map(Datum::Date),
+        "timestamp" => parse_timestamp_literal(text).map(Datum::Timestamp),
+        "timestamptz" => parse_timestamp_literal(text).map(Datum::TimestampTz),
+        _ => Err(SqlError::new("42804", "unsupported temporal literal type")),
+    }
+}
+
+fn parse_date_literal(text: &str) -> std::result::Result<i32, SqlError> {
+    let mut parts = text.trim().split('-');
+    let year = parts
+        .next()
+        .ok_or_else(|| SqlError::new("22007", "invalid date"))?
+        .parse::<i64>()
+        .map_err(|_| SqlError::new("22007", "invalid date"))?;
+    let month = parts
+        .next()
+        .ok_or_else(|| SqlError::new("22007", "invalid date"))?
+        .parse::<i64>()
+        .map_err(|_| SqlError::new("22007", "invalid date"))?;
+    let day = parts
+        .next()
+        .ok_or_else(|| SqlError::new("22007", "invalid date"))?
+        .parse::<i64>()
+        .map_err(|_| SqlError::new("22007", "invalid date"))?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(SqlError::new("22007", "invalid date"));
+    }
+    let y = year - i64::from(month <= 2);
+    let era = (if y >= 0 { y } else { y - 399 }).div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    i32::try_from(days).map_err(|_| SqlError::new("22008", "date out of range"))
+}
+
+fn parse_timestamp_literal(text: &str) -> std::result::Result<i64, SqlError> {
+    let text = text
+        .trim()
+        .trim_end_matches("+00:00")
+        .trim_end_matches("+00");
+    let (date, time) = text
+        .split_once([' ', 'T'])
+        .ok_or_else(|| SqlError::new("22007", "invalid timestamp"))?;
+    let days = i64::from(parse_date_literal(date)?);
+    let mut fields = time.split(':');
+    let hour = fields
+        .next()
+        .ok_or_else(|| SqlError::new("22007", "invalid timestamp"))?
+        .parse::<i64>()
+        .map_err(|_| SqlError::new("22007", "invalid timestamp"))?;
+    let minute = fields
+        .next()
+        .ok_or_else(|| SqlError::new("22007", "invalid timestamp"))?
+        .parse::<i64>()
+        .map_err(|_| SqlError::new("22007", "invalid timestamp"))?;
+    let second_text = fields
+        .next()
+        .ok_or_else(|| SqlError::new("22007", "invalid timestamp"))?;
+    if fields.next().is_some() || hour > 23 || minute > 59 {
+        return Err(SqlError::new("22007", "invalid timestamp"));
+    }
+    let (second, micros) = if let Some((whole, fraction)) = second_text.split_once('.') {
+        let second = whole
+            .parse::<i64>()
+            .map_err(|_| SqlError::new("22007", "invalid timestamp"))?;
+        let mut fraction = fraction.to_string();
+        if fraction.len() > 6 {
+            fraction.truncate(6);
+        }
+        while fraction.len() < 6 {
+            fraction.push('0');
+        }
+        let micros = fraction
+            .parse::<i64>()
+            .map_err(|_| SqlError::new("22007", "invalid timestamp"))?;
+        (second, micros)
+    } else {
+        (
+            second_text
+                .parse::<i64>()
+                .map_err(|_| SqlError::new("22007", "invalid timestamp"))?,
+            0,
+        )
+    };
+    if !(0..=59).contains(&second) {
+        return Err(SqlError::new("22007", "invalid timestamp"));
+    }
+    days.checked_mul(86_400_000_000)
+        .and_then(|value| value.checked_add(hour * 3_600_000_000))
+        .and_then(|value| value.checked_add(minute * 60_000_000))
+        .and_then(|value| value.checked_add(second * 1_000_000))
+        .and_then(|value| value.checked_add(micros))
+        .ok_or_else(|| SqlError::new("22008", "timestamp out of range"))
+}
+
 fn eval_binary(a: &Datum, op: BinOp, b: &Datum) -> std::result::Result<Datum, SqlError> {
     use BinOp::*;
     if matches!(op, And | Or) {
@@ -3702,6 +4002,7 @@ mod tests {
     use super::*;
     use chorus_storage::MemoryStateStore;
     use chorus_txn::LocalCommitter;
+    use std::collections::BTreeMap;
     #[test]
     fn crud() {
         let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
@@ -3725,6 +4026,26 @@ mod tests {
     fn parser_values() {
         let x = Parser::batch("SELECT 1 + 2").unwrap();
         assert_eq!(x.len(), 1);
+    }
+
+    #[test]
+    fn temporal_literals_and_current_date_are_typed() {
+        let parsed = Parser::batch(
+            "SELECT DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05.123', current_date",
+        )
+        .unwrap();
+        let Statement::Select(select) = &parsed[0] else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            select.projection[0],
+            Expr::Literal(Datum::Date(_))
+        ));
+        assert!(matches!(
+            select.projection[1],
+            Expr::Literal(Datum::Timestamp(_))
+        ));
+        assert!(matches!(select.projection[2], Expr::Func(ref name, _) if name == "current_date"));
     }
 
     #[test]
@@ -3888,5 +4209,49 @@ mod tests {
         assert_eq!(result.rows[0][0], Datum::Int64(8));
         assert_eq!(result.rows[0][1], Datum::Text("42".into()));
         assert_eq!(result.rows[0][2], Datum::Text("ok".into()));
+    }
+
+    #[test]
+    fn engine_shares_sequencer_across_sessions() {
+        let mut data = chorus_storage::StateData::default();
+        data.catalog.next_object_id = 10;
+        data.catalog.tables = BTreeMap::from([(
+            1,
+            TableDescriptor {
+                oid: 1,
+                schema_oid: 2200,
+                name: "items".into(),
+                schema_version: 1,
+                columns: vec![ColumnDescriptor {
+                    id: 2,
+                    name: "id".into(),
+                    data_type: SqlType::Integer,
+                    nullable: false,
+                    default: None,
+                    state: ColumnState::Live,
+                }],
+                primary_key: Some(2),
+                secondary_indexes: Vec::new(),
+                row_count: 0,
+                state: ObjectState::Live,
+            },
+        )]);
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::from_data(data));
+        let origin = OriginId::new(12);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
+        let engine = SqlEngine::new(store.clone(), committer, Limits::default());
+        let mut first = engine.session();
+        let mut second = engine.session();
+
+        first.execute("INSERT INTO items VALUES (1);", &[]).unwrap();
+        assert_eq!(store.snapshot().unwrap().db_epoch(), 1);
+        assert_eq!(engine.sequencer.next_sequence_hint(), 2);
+
+        second
+            .execute("INSERT INTO items VALUES (2);", &[])
+            .unwrap();
+        assert_eq!(store.snapshot().unwrap().db_epoch(), 2);
+        assert_eq!(engine.sequencer.next_sequence_hint(), 3);
     }
 }

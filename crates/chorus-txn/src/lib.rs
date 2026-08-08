@@ -3,13 +3,14 @@
 //! Snapshot/overlay transactions and the per-origin commit sequencer.
 
 use chorus_codec::{
-    ApplyResult, CommitTransactionV1, KvMutationV1, SchemaCommandV1, SchemaOperationV1,
+    ApplyResult, CommitTransactionV1, KvMutationV1, ReplicatedCommandV1, SchemaCommandV1,
+    SchemaOperationV1, canonical_mutations as encode_canonical_mutations, encode_command,
     payload_hash,
 };
 use chorus_common::{ChorusError, Limits, LogId, OriginId, RequestId, Result, unix_now_us};
-use chorus_storage::{StateSnapshot, StateStore};
 #[cfg(test)]
 use chorus_storage::MemoryStateStore;
+use chorus_storage::{StateSnapshot, StateStore};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,6 +21,23 @@ pub trait Committer: Send + Sync {
     fn submit(&self, command: CommitTransactionV1) -> Result<ApplyResult>;
     fn submit_schema(&self, command: SchemaCommandV1) -> Result<ApplyResult>;
     fn origin(&self) -> OriginId;
+}
+
+/// The size charged for one mutation in the versioned command envelope.
+/// Keep this in lock-step with `KvMutationV1::encoded_len`; unlike a plain
+/// key/value sum it accounts for the operation and length fields too.
+fn mutation_size(key_len: usize, value: Option<&[u8]>) -> Result<usize> {
+    let base = 1usize
+        .checked_add(4)
+        .and_then(|n| n.checked_add(key_len))
+        .ok_or_else(|| ChorusError::Limit("transaction mutation bytes exhausted".into()))?;
+    match value {
+        Some(value) => base
+            .checked_add(4)
+            .and_then(|n| n.checked_add(value.len()))
+            .ok_or_else(|| ChorusError::Limit("transaction mutation bytes exhausted".into())),
+        None => Ok(base),
+    }
 }
 
 /// Direct single-process committer. It is useful for development, tests and
@@ -91,6 +109,8 @@ pub struct Overlay {
     bytes: usize,
     max_bytes: usize,
     max_mutations: usize,
+    max_key_bytes: usize,
+    max_row_bytes: usize,
 }
 
 impl Overlay {
@@ -100,6 +120,8 @@ impl Overlay {
             bytes: 0,
             max_bytes: limits.max_transaction_bytes,
             max_mutations: limits.max_mutations,
+            max_key_bytes: limits.max_key_bytes,
+            max_row_bytes: limits.max_row_bytes,
         }
     }
     pub fn get<'a>(&'a self, snapshot: &'a StateSnapshot, key: &[u8]) -> Option<Option<&'a [u8]>> {
@@ -118,16 +140,27 @@ impl Overlay {
         self.insert(key, None)
     }
     fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
-        let old = self
-            .values
-            .get(&key)
-            .map(|v| v.as_ref().map(Vec::len).unwrap_or(0))
-            .unwrap_or(0);
-        let new = value.as_ref().map(Vec::len).unwrap_or(0);
+        if key.len() > self.max_key_bytes {
+            return Err(ChorusError::Limit(
+                "physical key exceeds configured limit".into(),
+            ));
+        }
+        if value.as_ref().is_some_and(|v| v.len() > self.max_row_bytes) {
+            return Err(ChorusError::Limit(
+                "row value exceeds configured limit".into(),
+            ));
+        }
+        let old_bytes = match self.values.get(&key) {
+            Some(old) => mutation_size(key.len(), old.as_deref())?,
+            None => 0,
+        };
+        let new_bytes = mutation_size(key.len(), value.as_deref())?;
         let projected = self
             .bytes
-            .saturating_sub(key.len() + old)
-            .saturating_add(key.len() + new);
+            .checked_sub(old_bytes)
+            .ok_or_else(|| ChorusError::Internal("overlay byte accounting underflow".into()))?
+            .checked_add(new_bytes)
+            .ok_or_else(|| ChorusError::Limit("transaction mutation bytes exhausted".into()))?;
         if projected > self.max_bytes {
             return Err(ChorusError::Limit(
                 "transaction mutation bytes exceed limit".into(),
@@ -239,11 +272,16 @@ impl Transaction {
         t
     }
     pub fn set_statement_time(&mut self) -> Result<()> {
+        let ordinal = match self.statement_ordinal.checked_add(1) {
+            Some(ordinal) => ordinal,
+            None => {
+                self.status = TransactionStatus::Aborted;
+                self.overlay.clear();
+                return Err(ChorusError::Limit("statement ordinal exhausted".into()));
+            }
+        };
         self.statement_timestamp_us = unix_now_us();
-        self.statement_ordinal = self
-            .statement_ordinal
-            .checked_add(1)
-            .ok_or_else(|| ChorusError::Limit("statement ordinal exhausted".into()))?;
+        self.statement_ordinal = ordinal;
         Ok(())
     }
     pub fn check_age(&self) -> Result<()> {
@@ -265,6 +303,16 @@ impl Transaction {
         }
         Ok(())
     }
+    fn check_age_for_write(&mut self) -> Result<()> {
+        match self.check_age() {
+            Err(error @ ChorusError::Limit(_)) => {
+                self.status = TransactionStatus::Aborted;
+                self.overlay.clear();
+                Err(error)
+            }
+            other => other,
+        }
+    }
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.overlay
             .get(&self.snapshot, key)
@@ -274,7 +322,7 @@ impl Transaction {
         self.overlay.scan(&self.snapshot, start, end)
     }
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        self.check_age()?;
+        self.check_age_for_write()?;
         if self.read_only {
             return Err(ChorusError::Sql(chorus_common::SqlError::new(
                 "25006",
@@ -285,7 +333,7 @@ impl Transaction {
         self.overlay.put(key, value)
     }
     pub fn delete(&mut self, key: Vec<u8>) -> Result<()> {
-        self.check_age()?;
+        self.check_age_for_write()?;
         if self.read_only {
             return Err(ChorusError::Sql(chorus_common::SqlError::new(
                 "25006",
@@ -312,7 +360,7 @@ impl Transaction {
         committer: &dyn Committer,
         sequencer: &CommitSequencer,
     ) -> Result<ApplyResult> {
-        self.check_age()?;
+        self.check_age_for_write()?;
         if self.overlay.is_empty() {
             self.status = TransactionStatus::Committed;
             return Ok(ApplyResult::Noop);
@@ -329,7 +377,13 @@ impl Transaction {
             })
             .collect();
         let canonical = canonical_mutations(&mutations);
-        let seq = sequencer.next_sequence()?;
+        // An uncertain submit leaves an exact command pending.  Reusing its
+        // sequence is intentional; the sequencer compares the encoded
+        // command before retrying and rejects any changed payload.
+        let seq = match sequencer.pending_sequence() {
+            Some(sequence) => sequence,
+            None => sequencer.next_sequence()?,
+        };
         let id = RequestId::new(sequencer.origin(), seq);
         let hash = payload_hash(1, &id, self.base_epoch, &canonical);
         let command = CommitTransactionV1 {
@@ -338,68 +392,107 @@ impl Transaction {
             base_epoch: self.base_epoch,
             mutations,
         };
-        let result = sequencer.submit(committer, command)?;
+        let result = match sequencer.submit(committer, command) {
+            Ok(result) => result,
+            Err(error) => {
+                // A committer/transport error is retryable and leaves this
+                // transaction active.  A sequencer protocol error means the
+                // pending request belongs to a different transaction or the
+                // command changed, so this transaction cannot safely proceed.
+                if matches!(error, ChorusError::Protocol(_)) {
+                    self.status = TransactionStatus::Aborted;
+                }
+                return Err(error);
+            }
+        };
+        let outcome = validate_apply_result(&result);
+        if let Err(error) = outcome {
+            self.status = TransactionStatus::Aborted;
+            return Err(error);
+        }
         match result {
             ApplyResult::Committed { .. } | ApplyResult::Duplicate(_) => {
                 self.status = TransactionStatus::Committed;
                 self.overlay.clear();
                 Ok(result)
             }
-            ApplyResult::SerializationFailure { .. } => {
-                self.status = TransactionStatus::Aborted;
-                Err(ChorusError::Sql(chorus_common::SqlError::serialization(
-                    "could not serialize access due to concurrent update",
-                )))
-            }
-            ApplyResult::StaleOrigin => {
-                self.status = TransactionStatus::Aborted;
-                Err(ChorusError::Sql(
-                    chorus_common::SqlError::cluster_unavailable("node origin has been fenced"),
-                ))
-            }
-            ApplyResult::Rejected(message) | ApplyResult::ProtocolError(message) => {
-                self.status = TransactionStatus::Aborted;
-                Err(ChorusError::Internal(message))
-            }
-            other => {
-                self.status = TransactionStatus::Aborted;
-                Ok(other)
-            }
+            // `validate_apply_result` rejects every other terminal outcome.
+            _ => unreachable!("non-success apply result passed validation"),
         }
+    }
+}
+
+/// Convert a replicated terminal result into the transaction-layer outcome.
+/// A duplicate is only successful when the cached result was successful; a
+/// cached serialization failure or rejection must retain its original error
+/// semantics rather than being mistaken for a committed transaction.
+fn validate_apply_result(result: &ApplyResult) -> Result<()> {
+    match result {
+        ApplyResult::Committed { .. } => Ok(()),
+        ApplyResult::Duplicate(inner) => validate_apply_result(inner),
+        ApplyResult::SerializationFailure { .. } => {
+            Err(ChorusError::Sql(chorus_common::SqlError::serialization(
+                "could not serialize access due to concurrent update",
+            )))
+        }
+        ApplyResult::StaleOrigin => Err(ChorusError::Sql(
+            chorus_common::SqlError::cluster_unavailable("node origin has been fenced"),
+        )),
+        ApplyResult::Rejected(message) | ApplyResult::ProtocolError(message) => {
+            Err(ChorusError::Internal(message.clone()))
+        }
+        ApplyResult::AlreadyProcessed => Err(ChorusError::Protocol(
+            "request outcome is no longer available for retry".into(),
+        )),
+        ApplyResult::Noop | ApplyResult::Activated => Err(ChorusError::Internal(
+            "committer returned a non-terminal transaction result".into(),
+        )),
     }
 }
 
 pub fn canonical_mutations(mutations: &[KvMutationV1]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for m in mutations {
-        bytes.extend_from_slice(m.key());
-        bytes.push(match m {
-            KvMutationV1::Put { .. } => 1,
-            KvMutationV1::Delete { .. } => 2,
-        });
-        if let KvMutationV1::Put { value, .. } = m {
-            bytes.extend_from_slice(value);
-        }
-    }
-    bytes
+    encode_canonical_mutations(mutations).unwrap_or_default()
 }
 
+#[derive(Clone)]
 pub struct CommitSequencer {
     origin: OriginId,
-    state: Mutex<SequencerState>,
+    // Cloning a sequencer shares the per-origin state.  A process should keep
+    // one clone at the engine/session boundary so sessions cannot reuse a
+    // sequence number concurrently.
+    state: Arc<Mutex<SequencerState>>,
 }
+
+#[derive(Clone)]
+enum PendingCommand {
+    Transaction {
+        command: CommitTransactionV1,
+        encoded: Vec<u8>,
+    },
+    Schema {
+        command: SchemaCommandV1,
+        encoded: Vec<u8>,
+    },
+}
+
 struct SequencerState {
     next: u64,
-    unresolved: bool,
+    // `reserved` closes the small gap between allocating a sequence and
+    // recording the exact command.  `pending` then remains populated across
+    // an uncertain committer error so a retry is byte-for-byte identical.
+    reserved: bool,
+    pending: Option<PendingCommand>,
 }
+
 impl CommitSequencer {
     pub fn new(origin: OriginId) -> Self {
         Self {
             origin,
-            state: Mutex::new(SequencerState {
+            state: Arc::new(Mutex::new(SequencerState {
                 next: 1,
-                unresolved: false,
-            }),
+                reserved: false,
+                pending: None,
+            })),
         }
     }
     pub fn origin(&self) -> OriginId {
@@ -410,45 +503,136 @@ impl CommitSequencer {
             .state
             .lock()
             .map_err(|_| ChorusError::Internal("commit sequencer lock poisoned".into()))?;
-        if s.unresolved {
+        if s.reserved || s.pending.is_some() {
             return Err(ChorusError::Protocol(
                 "one unresolved command is already in flight for this origin".into(),
             ));
         }
-        s.unresolved = true;
+        // A sequence at u64::MAX cannot be followed by another contiguous
+        // sequence, so fail closed before reserving it.
+        if s.next == u64::MAX {
+            return Err(ChorusError::Limit("request sequence exhausted".into()));
+        }
+        s.reserved = true;
         Ok(s.next)
     }
+
+    /// Returns the sequence of an exact command awaiting a retry.  It is
+    /// intentionally read-only; callers still pass the full command to
+    /// `submit`, which verifies its encoded bytes against the pending copy.
+    pub fn pending_sequence(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        match state.pending.as_ref() {
+            Some(PendingCommand::Transaction { command, .. }) => Some(command.request_id.sequence),
+            Some(PendingCommand::Schema { command, .. }) => Some(command.request_id.sequence),
+            None => None,
+        }
+    }
+
     fn submit(
         &self,
         committer: &dyn Committer,
         command: CommitTransactionV1,
     ) -> Result<ApplyResult> {
+        let encoded = match encode_command(&ReplicatedCommandV1::CommitTransaction(command.clone()))
+        {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.release_reservation(command.request_id.sequence)?;
+                return Err(ChorusError::Serialization(error.to_string()));
+            }
+        };
+        let command = {
+            let mut s = self
+                .state
+                .lock()
+                .map_err(|_| ChorusError::Internal("commit sequencer lock poisoned".into()))?;
+            match s.pending.as_ref() {
+                Some(PendingCommand::Transaction {
+                    command: pending,
+                    encoded: pending_encoded,
+                }) if pending_encoded == &encoded => pending.clone(),
+                Some(PendingCommand::Transaction { .. }) => {
+                    return Err(ChorusError::Protocol(
+                        "retry payload differs from the unresolved transaction command".into(),
+                    ));
+                }
+                Some(PendingCommand::Schema { .. }) => {
+                    return Err(ChorusError::Protocol(
+                        "a schema command is unresolved for this origin".into(),
+                    ));
+                }
+                None => {
+                    if !s.reserved
+                        || command.request_id.origin != self.origin
+                        || command.request_id.sequence != s.next
+                    {
+                        return Err(ChorusError::Protocol(
+                            "transaction command sequence is not reserved for this origin".into(),
+                        ));
+                    }
+                    s.pending = Some(PendingCommand::Transaction {
+                        command: command.clone(),
+                        encoded,
+                    });
+                    command
+                }
+            }
+        };
         let result = committer.submit(command);
+        self.finish(result.is_ok())?;
+        result
+    }
+
+    fn release_reservation(&self, sequence: u64) -> Result<()> {
         let mut s = self
             .state
             .lock()
             .map_err(|_| ChorusError::Internal("commit sequencer lock poisoned".into()))?;
-        if result.is_ok() {
-            s.next = s
-                .next
-                .checked_add(1)
-                .ok_or_else(|| ChorusError::Limit("request sequence exhausted".into()))?;
-            s.unresolved = false;
-        } else {
-            s.unresolved = false;
+        if s.pending.is_none() && s.reserved && sequence == s.next {
+            s.reserved = false;
         }
-        result
+        Ok(())
     }
+
+    fn finish(&self, result_ok: bool) -> Result<()> {
+        let mut s = self
+            .state
+            .lock()
+            .map_err(|_| ChorusError::Internal("commit sequencer lock poisoned".into()))?;
+        if result_ok {
+            s.pending = None;
+            s.reserved = false;
+            // Keep MAX as a permanent exhausted sentinel.  The command at
+            // MAX is already terminal and must not be replayed with a reused
+            // sequence, while no subsequent sequence may be allocated.
+            if s.next != u64::MAX {
+                s.next = s
+                    .next
+                    .checked_add(1)
+                    .ok_or_else(|| ChorusError::Limit("request sequence exhausted".into()))?;
+            }
+        }
+        // An Err is deliberately left pending: the command may have reached
+        // a quorum even though the caller observed a transport error.
+        Ok(())
+    }
+
     pub fn submit_schema(
         &self,
         committer: &dyn Committer,
         base_epoch: u64,
         operation: SchemaOperationV1,
     ) -> Result<ApplyResult> {
-        let sequence = self.next_sequence()?;
-        let request_id = RequestId::new(self.origin, sequence);
+        // Serialize before reserving a sequence so a local encoding failure
+        // cannot strand an unresolved reservation.
         let payload = serde_json::to_vec(&operation)
             .map_err(|e| ChorusError::Serialization(e.to_string()))?;
+        let sequence = match self.pending_sequence() {
+            Some(sequence) => sequence,
+            None => self.next_sequence()?,
+        };
+        let request_id = RequestId::new(self.origin, sequence);
         let payload_hash = payload_hash(1, &request_id, base_epoch, &payload);
         let command = SchemaCommandV1 {
             request_id,
@@ -456,20 +640,74 @@ impl CommitSequencer {
             base_epoch,
             operation,
         };
+        let encoded = match encode_command(&ReplicatedCommandV1::SchemaChange(command.clone())) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.release_reservation(command.request_id.sequence)?;
+                return Err(ChorusError::Serialization(error.to_string()));
+            }
+        };
+        let command = {
+            let mut s = self
+                .state
+                .lock()
+                .map_err(|_| ChorusError::Internal("commit sequencer lock poisoned".into()))?;
+            match s.pending.as_ref() {
+                Some(PendingCommand::Schema {
+                    command: pending,
+                    encoded: pending_encoded,
+                }) if pending_encoded == &encoded => pending.clone(),
+                Some(PendingCommand::Schema { .. }) => {
+                    return Err(ChorusError::Protocol(
+                        "retry payload differs from the unresolved schema command".into(),
+                    ));
+                }
+                Some(PendingCommand::Transaction { .. }) => {
+                    return Err(ChorusError::Protocol(
+                        "a transaction command is unresolved for this origin".into(),
+                    ));
+                }
+                None => {
+                    if !s.reserved
+                        || command.request_id.origin != self.origin
+                        || command.request_id.sequence != s.next
+                    {
+                        return Err(ChorusError::Protocol(
+                            "schema command sequence is not reserved for this origin".into(),
+                        ));
+                    }
+                    s.pending = Some(PendingCommand::Schema {
+                        command: command.clone(),
+                        encoded,
+                    });
+                    command
+                }
+            }
+        };
         let result = committer.submit_schema(command);
-        let mut s = self
-            .state
-            .lock()
-            .map_err(|_| ChorusError::Internal("commit sequencer lock poisoned".into()))?;
-        if result.is_ok() {
-            s.next = s
-                .next
-                .checked_add(1)
-                .ok_or_else(|| ChorusError::Limit("request sequence exhausted".into()))?;
-        }
-        s.unresolved = false;
+        self.finish(result.is_ok())?;
         result
     }
+
+    /// Resolve the command left by an ambiguous transport response.  The
+    /// caller need not reconstruct its payload; the encoded pending copy is
+    /// submitted exactly as it was first sent.
+    pub fn retry_pending(&self, committer: &dyn Committer) -> Result<ApplyResult> {
+        let pending = self
+            .state
+            .lock()
+            .map_err(|_| ChorusError::Internal("commit sequencer lock poisoned".into()))?
+            .pending
+            .clone()
+            .ok_or_else(|| ChorusError::Protocol("no unresolved command".into()))?;
+        let result = match pending {
+            PendingCommand::Transaction { command, .. } => committer.submit(command),
+            PendingCommand::Schema { command, .. } => committer.submit_schema(command),
+        };
+        self.finish(result.is_ok())?;
+        result
+    }
+
     pub fn next_sequence_hint(&self) -> u64 {
         self.state.lock().map(|s| s.next).unwrap_or(0)
     }
@@ -531,5 +769,27 @@ mod tests {
             t.commit(c.as_ref(), &manager.sequencer).unwrap(),
             ApplyResult::Committed { epoch: 1, .. }
         ));
+    }
+
+    #[test]
+    fn encoding_failure_releases_reserved_sequence() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(1);
+        let c = Arc::new(LocalCommitter::new(store, origin).unwrap());
+        let sequencer = CommitSequencer::new(origin);
+        let sequence = sequencer.next_sequence().unwrap();
+        let command = CommitTransactionV1 {
+            request_id: RequestId::new(origin, sequence),
+            payload_hash: [0; 32],
+            base_epoch: 0,
+            // JSON encodes bytes as an array; this exceeds the 4 MiB command
+            // envelope even though the raw value itself is modest.
+            mutations: vec![KvMutationV1::Put {
+                key: b"oversized".to_vec(),
+                value: vec![u8::MAX; 1_100_000],
+            }],
+        };
+        assert!(sequencer.submit(c.as_ref(), command).is_err());
+        assert_eq!(sequencer.next_sequence().unwrap(), sequence);
     }
 }

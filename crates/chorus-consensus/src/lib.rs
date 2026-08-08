@@ -4,9 +4,11 @@
 //! and exposes a synchronous adapter that can be backed by OpenRaft or the
 //! deterministic in-process cluster used by tests and local development.
 
-use chorus_codec::{ApplyResult, CommitTransactionV1, ReplicatedCommandV1, SchemaCommandV1};
+use chorus_codec::{
+    ApplyResult, CommitTransactionV1, LogicalSnapshot, ReplicatedCommandV1, SchemaCommandV1,
+};
 use chorus_common::{ChorusError, LogId, Result};
-use chorus_storage::{StateSnapshot, StateStore, StoreStatus};
+use chorus_storage::{StateSnapshot, StateStore, StoreStatus, snapshot_from_store};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -37,6 +39,24 @@ pub trait Consensus: Send + Sync {
     fn read_barrier(&self) -> Result<StateSnapshot>;
     fn submit(&self, command: CommitTransactionV1) -> Result<ApplyResult>;
     fn submit_schema(&self, command: SchemaCommandV1) -> Result<ApplyResult>;
+    /// Bootstrap the configured initial membership.  Implementations that do
+    /// not own a multi-node transport (for example a test committer) may
+    /// retain the default rejection.  Bootstrap is deliberately explicit;
+    /// ordinary SQL readiness must never create a new cluster as a side
+    /// effect of an unreachable peer set.
+    fn bootstrap(&self) -> Result<()> {
+        Err(ChorusError::Consensus(
+            "explicit bootstrap is not supported by this adapter".into(),
+        ))
+    }
+    /// Submit an explicit membership change.  Membership is part of the
+    /// replicated state machine and is therefore never changed by a local
+    /// liveness timeout.
+    fn change_membership(&self, _voters: Vec<u64>, _learners: Vec<u64>) -> Result<()> {
+        Err(ChorusError::Consensus(
+            "membership changes are not supported by this adapter".into(),
+        ))
+    }
     fn wait_applied(&self, log_id: LogId) -> Result<()>;
     fn status(&self) -> ConsensusStatus;
     fn store(&self) -> Arc<dyn StateStore>;
@@ -148,7 +168,7 @@ impl Consensus for StandaloneConsensus {
         )
     }
     fn wait_applied(&self, log_id: LogId) -> Result<()> {
-        if self.store.snapshot()?.last_applied() >= log_id {
+        if self.store.snapshot()?.last_applied().index >= log_id.index {
             Ok(())
         } else {
             Err(ChorusError::Consensus(
@@ -192,25 +212,97 @@ pub struct NetworkConsensus {
     local_endpoint: String,
     store: Arc<dyn StateStore>,
     term: Mutex<u64>,
+    /// Only one proposal may be in the locally observed leader's commit
+    /// window at a time.  Without this gate two concurrent gateways could
+    /// both derive the same next log index and acknowledge different
+    /// commands for one slot.
+    proposal_lock: Mutex<()>,
+    /// A command that was applied locally but did not yet reach a quorum is
+    /// retained until a later proposal retries it.  This closes the most
+    /// dangerous failure window in this small transport: an unacknowledged
+    /// local apply must not be silently skipped by the next log index.
+    pending: Mutex<Option<PendingEntry>>,
+    cluster_id: [u8; 16],
+    cluster_incarnation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingEntry {
+    log_id: LogId,
+    command: ReplicatedCommandV1,
+    result: Option<ApplyResult>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum PeerRequest {
-    Ping,
+    Ping {
+        from: u64,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+    },
+    Status {
+        from: u64,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+    },
+    ReadBarrier {
+        from: u64,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+    },
+    Snapshot {
+        from: u64,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+    },
+    Prepare {
+        from: u64,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+        log_id: LogId,
+        command: ReplicatedCommandV1,
+    },
     Propose {
+        from: u64,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
         command: ReplicatedCommandV1,
     },
     Apply {
+        from: u64,
+        leader_id: u64,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
         log_id: LogId,
         command: ReplicatedCommandV1,
+    },
+    Install {
+        from: u64,
+        leader_id: u64,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+        snapshot: LogicalSnapshot,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum PeerResponse {
     Pong,
+    Status(PeerStatus),
+    Barrier { log_id: LogId },
+    Snapshot(LogicalSnapshot),
+    Prepared,
+    Installed,
+    NeedCatchUp { expected: LogId, actual: LogId },
     Applied(ApplyResult),
     Error(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PeerStatus {
+    node_id: u64,
+    last_applied: LogId,
+    healthy: bool,
 }
 
 impl NetworkConsensus {
@@ -219,6 +311,40 @@ impl NetworkConsensus {
         voters: Vec<u64>,
         learners: Vec<u64>,
         endpoints: BTreeMap<u64, String>,
+        store: Arc<dyn StateStore>,
+    ) -> Arc<Self> {
+        let (cluster_id, cluster_incarnation) = store
+            .snapshot()
+            .map(|snapshot| {
+                (
+                    snapshot.cluster_id(),
+                    snapshot.to_data().cluster_incarnation,
+                )
+            })
+            .unwrap_or(([0; 16], 1));
+        Self::new_with_identity(
+            node_id,
+            voters,
+            learners,
+            endpoints,
+            cluster_id,
+            cluster_incarnation,
+            store,
+        )
+    }
+
+    /// Construct a network adapter with the signed cluster identity from the
+    /// bootstrap manifest.  The old `new` constructor remains available for
+    /// local development and tests; production callers should use this
+    /// constructor so a node cannot accidentally talk to another cluster or
+    /// incarnation that happens to share an endpoint.
+    pub fn new_with_identity(
+        node_id: u64,
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+        endpoints: BTreeMap<u64, String>,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
         store: Arc<dyn StateStore>,
     ) -> Arc<Self> {
         let local_endpoint = endpoints.get(&node_id).cloned().unwrap_or_default();
@@ -236,6 +362,10 @@ impl NetworkConsensus {
             local_endpoint,
             store,
             term: Mutex::new(1),
+            proposal_lock: Mutex::new(()),
+            pending: Mutex::new(None),
+            cluster_id,
+            cluster_incarnation,
         })
     }
 
@@ -262,23 +392,164 @@ impl NetworkConsensus {
         Ok(())
     }
 
-    fn leader_id(&self) -> Option<u64> {
-        let mut reachable = self
-            .voters
+    fn identity_ok(&self, cluster_id: [u8; 16], cluster_incarnation: u64) -> Result<()> {
+        if cluster_id != self.cluster_id || cluster_incarnation != self.cluster_incarnation {
+            return Err(ChorusError::Protocol(
+                "peer cluster identity or incarnation mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn known_peer(&self, node_id: u64) -> bool {
+        self.voters.contains(&node_id) || self.learners.contains(&node_id)
+    }
+
+    fn validate_request(&self, request: &PeerRequest) -> Result<()> {
+        let (from, cluster_id, cluster_incarnation) = match request {
+            PeerRequest::Ping {
+                from,
+                cluster_id,
+                cluster_incarnation,
+            }
+            | PeerRequest::Status {
+                from,
+                cluster_id,
+                cluster_incarnation,
+            }
+            | PeerRequest::ReadBarrier {
+                from,
+                cluster_id,
+                cluster_incarnation,
+            }
+            | PeerRequest::Snapshot {
+                from,
+                cluster_id,
+                cluster_incarnation,
+            }
+            | PeerRequest::Prepare {
+                from,
+                cluster_id,
+                cluster_incarnation,
+                ..
+            }
+            | PeerRequest::Propose {
+                from,
+                cluster_id,
+                cluster_incarnation,
+                ..
+            }
+            | PeerRequest::Apply {
+                from,
+                cluster_id,
+                cluster_incarnation,
+                ..
+            }
+            | PeerRequest::Install {
+                from,
+                cluster_id,
+                cluster_incarnation,
+                ..
+            } => (*from, *cluster_id, *cluster_incarnation),
+        };
+        self.identity_ok(cluster_id, cluster_incarnation)?;
+        if !self.known_peer(from) {
+            return Err(ChorusError::Protocol(
+                "requester is not a cluster member".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn membership(&self) -> Result<(Vec<u64>, Vec<u64>)> {
+        let snapshot = self.store.snapshot()?;
+        // A zero membership log id denotes the unbootstrapped local store.
+        // Until the explicit Membership entry is committed, use only the
+        // signed static manifest for quorum calculations.
+        if snapshot.membership().log_id != LogId::ZERO {
+            Ok((
+                snapshot.membership().voters.clone(),
+                snapshot.membership().learners.clone(),
+            ))
+        } else {
+            Ok((self.voters.clone(), self.learners.clone()))
+        }
+    }
+
+    fn local_peer_status(&self) -> Result<PeerStatus> {
+        let snapshot = self.store.snapshot()?;
+        Ok(PeerStatus {
+            node_id: self.node_id,
+            last_applied: snapshot.last_applied(),
+            healthy: self.store.status().healthy,
+        })
+    }
+
+    fn observe(&self) -> Result<(Vec<u64>, Vec<u64>, Vec<PeerStatus>, u64, LogId)> {
+        let (voters, learners) = self.membership()?;
+        if voters.is_empty()
+            || voters.iter().any(|id| *id == 0)
+            || voters.iter().any(|id| learners.binary_search(id).is_ok())
+        {
+            return Err(ChorusError::Protocol(
+                "invalid replicated membership".into(),
+            ));
+        }
+        let mut statuses = Vec::with_capacity(voters.len() + learners.len());
+        if self.known_peer(self.node_id) {
+            statuses.push(self.local_peer_status()?);
+        }
+        for node_id in voters.iter().chain(learners.iter()) {
+            if *node_id == self.node_id {
+                continue;
+            }
+            let Some(endpoint) = self.endpoints.get(node_id) else {
+                continue;
+            };
+            let request = PeerRequest::Status {
+                from: self.node_id,
+                cluster_id: self.cluster_id,
+                cluster_incarnation: self.cluster_incarnation,
+            };
+            if let Ok(PeerResponse::Status(status)) = self.rpc(endpoint, &request) {
+                if status.healthy {
+                    statuses.push(status);
+                }
+            }
+        }
+        let reachable_voters = statuses
             .iter()
-            .copied()
-            .filter(|id| *id == self.node_id || self.ping(*id));
-        reachable.next()
+            .filter(|status| voters.binary_search(&status.node_id).is_ok())
+            .count();
+        if reachable_voters <= voters.len() / 2 {
+            return Err(ChorusError::Consensus("no majority is reachable".into()));
+        }
+        // This transport has no OpenRaft election object yet.  Select the
+        // freshest member observed by a quorum, with node id as a stable tie
+        // breaker.  A stale local replica can therefore never win a read
+        // barrier merely because it is the caller.
+        let leader = statuses
+            .iter()
+            .filter(|status| voters.binary_search(&status.node_id).is_ok())
+            .max_by(|a, b| {
+                a.last_applied
+                    .index
+                    .cmp(&b.last_applied.index)
+                    .then_with(|| a.last_applied.term.cmp(&b.last_applied.term))
+                    .then_with(|| b.node_id.cmp(&a.node_id))
+            })
+            .ok_or_else(|| ChorusError::Consensus("no leader is reachable".into()))?;
+        let leader_id = leader.node_id;
+        let leader_log = leader.last_applied;
+        Ok((voters, learners, statuses, leader_id, leader_log))
+    }
+
+    fn leader_id(&self) -> Option<u64> {
+        self.observe().ok().map(|(_, _, _, leader, _)| leader)
     }
 
     fn quorum(&self) -> bool {
-        let voters = self.voters.len();
-        let reachable = self
-            .voters
-            .iter()
-            .filter(|id| **id == self.node_id || self.ping(**id))
-            .count();
-        reachable > voters / 2
+        self.observe().is_ok()
     }
 
     fn ping(&self, node_id: u64) -> bool {
@@ -286,71 +557,365 @@ impl NetworkConsensus {
             return false;
         };
         if node_id == self.node_id {
-            return true;
+            return self.local_peer_status().is_ok_and(|status| status.healthy);
         }
         matches!(
-            self.rpc(endpoint, &PeerRequest::Ping),
+            self.rpc(
+                endpoint,
+                &PeerRequest::Ping {
+                    from: self.node_id,
+                    cluster_id: self.cluster_id,
+                    cluster_incarnation: self.cluster_incarnation,
+                },
+            ),
             Ok(PeerResponse::Pong)
         )
     }
 
-    fn append(&self, command: ReplicatedCommandV1) -> Result<ApplyResult> {
-        if !self.quorum() {
-            return Err(ChorusError::Consensus("no majority is reachable".into()));
+    fn snapshot_from_leader(&self, leader: u64) -> Result<StateSnapshot> {
+        if leader == self.node_id {
+            return self.store.snapshot();
         }
-        let leader = self
-            .leader_id()
-            .ok_or_else(|| ChorusError::Consensus("no leader is reachable".into()))?;
+        let endpoint = self
+            .endpoints
+            .get(&leader)
+            .ok_or_else(|| ChorusError::Consensus("leader endpoint is missing".into()))?;
+        let response = self.rpc(
+            endpoint,
+            &PeerRequest::Snapshot {
+                from: self.node_id,
+                cluster_id: self.cluster_id,
+                cluster_incarnation: self.cluster_incarnation,
+            },
+        )?;
+        let PeerResponse::Snapshot(snapshot) = response else {
+            return Err(ChorusError::Protocol("invalid snapshot response".into()));
+        };
+        let remote_log = snapshot.header.last_included;
+        let local_log = self.store.snapshot()?.last_applied();
+        if remote_log.index < local_log.index {
+            return Err(ChorusError::Consensus(
+                "leader snapshot is older than local state".into(),
+            ));
+        }
+        self.store.install(&snapshot)?;
+        self.store.snapshot()
+    }
+
+    fn barrier_local(&self) -> Result<LogId> {
+        let (_, _, _, leader, log_id) = self.observe()?;
+        if leader != self.node_id {
+            return Err(ChorusError::Consensus("not the quorum leader".into()));
+        }
+        Ok(log_id)
+    }
+
+    fn append(&self, command: ReplicatedCommandV1) -> Result<ApplyResult> {
+        self.append_from(self.node_id, command)
+    }
+
+    fn append_from(&self, requester: u64, command: ReplicatedCommandV1) -> Result<ApplyResult> {
+        self.identity_ok(self.cluster_id, self.cluster_incarnation)?;
+        match &command {
+            ReplicatedCommandV1::ActivateOrigin(a) if a.origin.node_id != requester => {
+                return Err(ChorusError::Protocol(
+                    "origin activation is not authorized by its node".into(),
+                ));
+            }
+            ReplicatedCommandV1::CommitTransaction(c)
+                if c.request_id.origin.node_id != requester =>
+            {
+                return Err(ChorusError::Protocol(
+                    "request origin is not authorized by its node".into(),
+                ));
+            }
+            ReplicatedCommandV1::SchemaChange(c) if c.request_id.origin.node_id != requester => {
+                return Err(ChorusError::Protocol(
+                    "request origin is not authorized by its node".into(),
+                ));
+            }
+            _ => {}
+        }
+        let (_, _, _, leader, _) = self.observe()?;
         if leader != self.node_id {
             let endpoint = self
                 .endpoints
                 .get(&leader)
                 .ok_or_else(|| ChorusError::Consensus("leader endpoint is missing".into()))?;
-            return match self.rpc(endpoint, &PeerRequest::Propose { command })? {
+            return match self.rpc(
+                endpoint,
+                &PeerRequest::Propose {
+                    from: requester,
+                    cluster_id: self.cluster_id,
+                    cluster_incarnation: self.cluster_incarnation,
+                    command,
+                },
+            )? {
                 PeerResponse::Applied(result) => Ok(result),
                 PeerResponse::Error(message) => Err(ChorusError::Consensus(message)),
                 _ => Err(ChorusError::Protocol("invalid proposal response".into())),
             };
         }
+        self.append_as_leader(command)
+    }
+
+    fn append_as_leader(&self, command: ReplicatedCommandV1) -> Result<ApplyResult> {
+        let _proposal_guard = self
+            .proposal_lock
+            .lock()
+            .map_err(|_| ChorusError::Consensus("proposal lock poisoned".into()))?;
+        // A previous proposal may have reached this state machine but lost
+        // its quorum response.  Finish that exact entry before allocating a
+        // new index; this is the local equivalent of retrying an OpenRaft
+        // proposal with the same request id and bytes.
+        if let Some(pending) = self
+            .pending
+            .lock()
+            .map_err(|_| ChorusError::Consensus("pending proposal lock poisoned".into()))?
+            .clone()
+        {
+            self.reapply_pending_locally(&pending)?;
+            if pending.command != command {
+                let result = self.replicate_entry(&pending)?;
+                self.pending
+                    .lock()
+                    .map_err(|_| ChorusError::Consensus("pending proposal lock poisoned".into()))?
+                    .take();
+                let _ = result;
+            } else {
+                return self.replicate_entry(&pending);
+            }
+        }
+        let (_, _, _, leader, _) = self.observe()?;
+        if leader != self.node_id {
+            return Err(ChorusError::Consensus(
+                "leadership changed during proposal".into(),
+            ));
+        }
         let snapshot = self.store.snapshot()?;
         let log_id = LogId {
-            term: *self.term.lock().unwrap(),
+            term: (*self.term.lock().unwrap()).max(snapshot.last_applied().term),
             index: snapshot.last_applied().index.saturating_add(1),
         };
-        // Preflight the voter set so a transient connection loss does not
-        // acknowledge an entry that never reached a majority.
-        let voters_reachable = self
-            .voters
-            .iter()
-            .filter(|id| **id == self.node_id || self.ping(**id))
-            .count();
-        if voters_reachable <= self.voters.len() / 2 {
-            return Err(ChorusError::Consensus("quorum disappeared".into()));
+        let before_snapshot = snapshot_from_store(self.store.as_ref())?;
+        let prepared = PendingEntry {
+            log_id,
+            command: command.clone(),
+            result: None,
+        };
+        // Do not mutate the local state machine until a quorum has accepted
+        // the exact next entry for preparation.  If the network disappears
+        // here, the proposal fails without a visible local mutation.
+        self.prepare_quorum(&prepared)?;
+        *self
+            .pending
+            .lock()
+            .map_err(|_| ChorusError::Consensus("pending proposal lock poisoned".into()))? =
+            Some(prepared);
+        let local_result = match self.store.apply(log_id, &command) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.pending.lock().map(|mut pending| pending.take());
+                return Err(error);
+            }
+        };
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(entry) = pending.as_mut() {
+                entry.result = Some(local_result.clone());
+            }
         }
-        let local_result = self.store.apply(log_id, &command)?;
-        let mut applied_voters = 1usize;
-        for node_id in self.voters.iter().chain(self.learners.iter()) {
+        let result = self.replicate_entry(&PendingEntry {
+            log_id,
+            command,
+            result: Some(local_result),
+        });
+        if result.is_err() {
+            // Keep the exact pending command for a retry, but hide an
+            // unacknowledged local state-machine apply.  `rollback` is a
+            // separate monotonicity escape hatch used only for this window.
+            let _ = self.store.rollback(&before_snapshot);
+        }
+        result
+    }
+
+    fn reapply_pending_locally(&self, pending: &PendingEntry) -> Result<()> {
+        let current = self.store.snapshot()?.last_applied();
+        if current < pending.log_id {
+            let result = self.store.apply(pending.log_id, &pending.command)?;
+            if let Ok(mut slot) = self.pending.lock() {
+                if let Some(existing) = slot.as_mut() {
+                    existing.result = Some(result);
+                }
+            }
+        } else if current.index > pending.log_id.index {
+            return Err(ChorusError::Consensus(
+                "pending proposal is behind the local state machine".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_quorum(&self, pending: &PendingEntry) -> Result<()> {
+        let (voters, learners, statuses, leader, _) = self.observe()?;
+        if leader != self.node_id {
+            return Err(ChorusError::Consensus("not the quorum leader".into()));
+        }
+        let quorum = voters.len() / 2 + 1;
+        let mut prepared_voters = 1usize;
+        for node_id in voters.iter().chain(learners.iter()) {
             if *node_id == self.node_id {
                 continue;
             }
             let Some(endpoint) = self.endpoints.get(node_id) else {
                 continue;
             };
-            if let Ok(PeerResponse::Applied(_)) = self.rpc(
-                endpoint,
-                &PeerRequest::Apply {
-                    log_id,
-                    command: command.clone(),
-                },
-            ) {
-                if self.voters.contains(node_id) {
-                    applied_voters += 1;
+            let peer_status = statuses
+                .iter()
+                .find(|status| status.node_id == *node_id)
+                .map(|status| status.last_applied);
+            if peer_status.is_some_and(|last| {
+                last.index < pending.log_id.index
+                    && last.index.saturating_add(1) < pending.log_id.index
+            }) {
+                let snapshot = snapshot_from_store(self.store.as_ref())?;
+                if !matches!(
+                    self.rpc(
+                        endpoint,
+                        &PeerRequest::Install {
+                            from: self.node_id,
+                            leader_id: self.node_id,
+                            cluster_id: self.cluster_id,
+                            cluster_incarnation: self.cluster_incarnation,
+                            snapshot,
+                        },
+                    ),
+                    Ok(PeerResponse::Installed)
+                ) {
+                    continue;
                 }
             }
+            if matches!(
+                self.rpc(
+                    endpoint,
+                    &PeerRequest::Prepare {
+                        from: self.node_id,
+                        cluster_id: self.cluster_id,
+                        cluster_incarnation: self.cluster_incarnation,
+                        log_id: pending.log_id,
+                        command: pending.command.clone(),
+                    },
+                ),
+                Ok(PeerResponse::Prepared)
+            ) && voters.binary_search(node_id).is_ok()
+            {
+                prepared_voters += 1;
+            }
         }
-        if applied_voters <= self.voters.len() / 2 {
-            return Err(ChorusError::Consensus("replication quorum failed".into()));
+        if prepared_voters < quorum {
+            return Err(ChorusError::Consensus(
+                "proposal was not durably prepared on a quorum".into(),
+            ));
         }
+        Ok(())
+    }
+
+    fn replicate_entry(&self, pending: &PendingEntry) -> Result<ApplyResult> {
+        let (voters, learners, statuses, leader, _) = self.observe()?;
+        if leader != self.node_id {
+            return Err(ChorusError::Consensus(
+                "leadership changed during replication".into(),
+            ));
+        }
+        let quorum = voters.len() / 2 + 1;
+        self.prepare_quorum(pending)?;
+
+        let local_result = pending
+            .result
+            .clone()
+            .ok_or_else(|| ChorusError::Consensus("leader apply result is missing".into()))?;
+        let mut applied_voters = 1usize;
+        for node_id in voters.iter().chain(learners.iter()) {
+            if *node_id == self.node_id {
+                continue;
+            }
+            let Some(endpoint) = self.endpoints.get(node_id) else {
+                continue;
+            };
+            let peer_status = statuses
+                .iter()
+                .find(|status| status.node_id == *node_id)
+                .map(|status| status.last_applied);
+            // A follower with a gap must be repaired from a logical snapshot
+            // before it receives this entry.  Applying a future log id
+            // directly would skip committed entries and permanently diverge
+            // its state machine.
+            if peer_status.is_some_and(|last| {
+                last < pending.log_id && last.index.saturating_add(1) < pending.log_id.index
+            }) {
+                let snapshot = snapshot_from_store(self.store.as_ref())?;
+                match self.rpc(
+                    endpoint,
+                    &PeerRequest::Install {
+                        from: self.node_id,
+                        leader_id: self.node_id,
+                        cluster_id: self.cluster_id,
+                        cluster_incarnation: self.cluster_incarnation,
+                        snapshot,
+                    },
+                ) {
+                    Ok(PeerResponse::Installed) => {}
+                    _ => continue,
+                }
+            }
+            let mut response = self.rpc(
+                endpoint,
+                &PeerRequest::Apply {
+                    from: self.node_id,
+                    leader_id: self.node_id,
+                    cluster_id: self.cluster_id,
+                    cluster_incarnation: self.cluster_incarnation,
+                    log_id: pending.log_id,
+                    command: pending.command.clone(),
+                },
+            );
+            if matches!(response, Ok(PeerResponse::NeedCatchUp { .. })) {
+                if let Ok(PeerResponse::Installed) = self.rpc(
+                    endpoint,
+                    &PeerRequest::Install {
+                        from: self.node_id,
+                        leader_id: self.node_id,
+                        cluster_id: self.cluster_id,
+                        cluster_incarnation: self.cluster_incarnation,
+                        snapshot: snapshot_from_store(self.store.as_ref())?,
+                    },
+                ) {
+                    response = self.rpc(
+                        endpoint,
+                        &PeerRequest::Apply {
+                            from: self.node_id,
+                            leader_id: self.node_id,
+                            cluster_id: self.cluster_id,
+                            cluster_incarnation: self.cluster_incarnation,
+                            log_id: pending.log_id,
+                            command: pending.command.clone(),
+                        },
+                    );
+                }
+            }
+            let applied = matches!(response, Ok(PeerResponse::Applied(_)));
+            if applied && voters.binary_search(node_id).is_ok() {
+                applied_voters += 1;
+            }
+        }
+        if applied_voters < quorum {
+            return Err(ChorusError::Consensus(
+                "replication quorum failed after local apply".into(),
+            ));
+        }
+        self.pending
+            .lock()
+            .map_err(|_| ChorusError::Consensus("pending proposal lock poisoned".into()))?
+            .take();
         Ok(local_result)
     }
 
@@ -374,16 +939,81 @@ impl NetworkConsensus {
 
     fn handle_stream(&self, mut stream: TcpStream) -> Result<()> {
         let request: PeerRequest = read_frame(&mut stream)?;
+        self.validate_request(&request)?;
         let response = match request {
-            PeerRequest::Ping => PeerResponse::Pong,
-            PeerRequest::Propose { command } => match self.append(command) {
+            PeerRequest::Ping { .. } => PeerResponse::Pong,
+            PeerRequest::Status { .. } => PeerResponse::Status(self.local_peer_status()?),
+            PeerRequest::ReadBarrier { .. } => match self.barrier_local() {
+                Ok(log_id) => PeerResponse::Barrier { log_id },
+                Err(error) => PeerResponse::Error(error.to_string()),
+            },
+            PeerRequest::Snapshot { .. } => {
+                PeerResponse::Snapshot(snapshot_from_store(self.store.as_ref())?)
+            }
+            PeerRequest::Prepare { log_id, .. } => {
+                if !self.store.status().healthy {
+                    PeerResponse::Error("state store is unhealthy".into())
+                } else {
+                    let current = self.store.snapshot()?.last_applied();
+                    if log_id.index > current.index.saturating_add(1) {
+                        PeerResponse::NeedCatchUp {
+                            expected: LogId {
+                                term: current.term,
+                                index: current.index.saturating_add(1),
+                            },
+                            actual: log_id,
+                        }
+                    } else {
+                        PeerResponse::Prepared
+                    }
+                }
+            }
+            PeerRequest::Propose { from, command, .. } => match self.append_from(from, command) {
                 Ok(result) => PeerResponse::Applied(result),
                 Err(error) => PeerResponse::Error(error.to_string()),
             },
-            PeerRequest::Apply { log_id, command } => match self.store.apply(log_id, &command) {
-                Ok(result) => PeerResponse::Applied(result),
-                Err(error) => PeerResponse::Error(error.to_string()),
-            },
+            PeerRequest::Apply {
+                from,
+                leader_id,
+                log_id,
+                command,
+                ..
+            } => {
+                if from != leader_id {
+                    PeerResponse::Error("apply sender is not the declared leader".into())
+                } else {
+                    let current = self.store.snapshot()?.last_applied();
+                    if log_id.index > current.index.saturating_add(1) {
+                        PeerResponse::NeedCatchUp {
+                            expected: LogId {
+                                term: current.term,
+                                index: current.index.saturating_add(1),
+                            },
+                            actual: log_id,
+                        }
+                    } else {
+                        match self.store.apply(log_id, &command) {
+                            Ok(result) => PeerResponse::Applied(result),
+                            Err(error) => PeerResponse::Error(error.to_string()),
+                        }
+                    }
+                }
+            }
+            PeerRequest::Install {
+                from,
+                leader_id,
+                snapshot,
+                ..
+            } => {
+                if from != leader_id {
+                    PeerResponse::Error("snapshot sender is not the declared leader".into())
+                } else {
+                    match self.store.install(&snapshot) {
+                        Ok(()) => PeerResponse::Installed,
+                        Err(error) => PeerResponse::Error(error.to_string()),
+                    }
+                }
+            }
         };
         write_frame(&mut stream, &response)
     }
@@ -391,14 +1021,60 @@ impl NetworkConsensus {
 
 impl Consensus for NetworkConsensus {
     fn activate_origin(&self, origin: chorus_common::OriginId) -> Result<()> {
+        if origin.node_id != self.node_id {
+            return Err(ChorusError::Protocol(
+                "origin activation must use this node's identity".into(),
+            ));
+        }
         self.append(ReplicatedCommandV1::ActivateOrigin(
             chorus_codec::ActivateOriginV1 { origin },
         ))
         .map(|_| ())
     }
     fn read_barrier(&self) -> Result<StateSnapshot> {
-        if !self.quorum() {
-            return Err(ChorusError::Consensus("no quorum".into()));
+        if self
+            .pending
+            .lock()
+            .map_err(|_| ChorusError::Consensus("pending proposal lock poisoned".into()))?
+            .is_some()
+        {
+            return Err(ChorusError::Consensus(
+                "an unacknowledged proposal is awaiting quorum recovery".into(),
+            ));
+        }
+        let (_, _, _, leader, observed_log) = self.observe()?;
+        let barrier = if leader == self.node_id {
+            observed_log
+        } else {
+            let endpoint = self
+                .endpoints
+                .get(&leader)
+                .ok_or_else(|| ChorusError::Consensus("leader endpoint is missing".into()))?;
+            match self.rpc(
+                endpoint,
+                &PeerRequest::ReadBarrier {
+                    from: self.node_id,
+                    cluster_id: self.cluster_id,
+                    cluster_incarnation: self.cluster_incarnation,
+                },
+            )? {
+                PeerResponse::Barrier { log_id } => log_id,
+                PeerResponse::Error(message) => return Err(ChorusError::Consensus(message)),
+                _ => {
+                    return Err(ChorusError::Protocol(
+                        "invalid read barrier response".into(),
+                    ));
+                }
+            }
+        };
+        let local = self.store.snapshot()?;
+        if local.last_applied().index < barrier.index {
+            let synced = self.snapshot_from_leader(leader)?;
+            if synced.last_applied().index < barrier.index {
+                return Err(ChorusError::Consensus(
+                    "local state did not catch up to read barrier".into(),
+                ));
+            }
         }
         self.store.snapshot()
     }
@@ -409,7 +1085,8 @@ impl Consensus for NetworkConsensus {
         self.append(ReplicatedCommandV1::SchemaChange(command))
     }
     fn wait_applied(&self, log_id: LogId) -> Result<()> {
-        if self.store.snapshot()?.last_applied() >= log_id {
+        let snapshot = self.read_barrier()?;
+        if snapshot.last_applied().index >= log_id.index {
             Ok(())
         } else {
             Err(ChorusError::Consensus("replica lagging".into()))
@@ -417,19 +1094,73 @@ impl Consensus for NetworkConsensus {
     }
     fn status(&self) -> ConsensusStatus {
         let state = self.store.status();
+        let observed = self.observe().ok();
         ConsensusStatus {
             node_id: self.node_id,
-            leader_id: if self.quorum() {
-                self.leader_id()
-            } else {
-                None
-            },
+            leader_id: observed.as_ref().map(|(_, _, _, leader, _)| *leader),
             term: *self.term.lock().unwrap(),
             commit_index: state.last_applied.index,
             applied_index: state.last_applied.index,
-            quorum: self.quorum(),
-            voters: self.voters.clone(),
-            learners: self.learners.clone(),
+            quorum: observed.is_some(),
+            voters: observed
+                .as_ref()
+                .map(|(voters, _, _, _, _)| voters.clone())
+                .unwrap_or_else(|| self.voters.clone()),
+            learners: observed
+                .as_ref()
+                .map(|(_, learners, _, _, _)| learners.clone())
+                .unwrap_or_else(|| self.learners.clone()),
+        }
+    }
+    fn bootstrap(&self) -> Result<()> {
+        let (voters, learners) = self.membership()?;
+        if self.node_id
+            != *voters
+                .first()
+                .ok_or_else(|| ChorusError::Consensus("bootstrap voter set is empty".into()))?
+        {
+            return Err(ChorusError::Consensus(
+                "only the lowest initial voter may bootstrap".into(),
+            ));
+        }
+        let snapshot = self.store.snapshot()?;
+        if snapshot.last_applied() != LogId::ZERO
+            || snapshot.db_epoch() != 0
+            || !snapshot.kv().is_empty()
+            || !snapshot.origins().is_empty()
+            || !snapshot.catalog().tables.is_empty()
+        {
+            return Err(ChorusError::Protocol(
+                "cannot bootstrap a non-empty durable state".into(),
+            ));
+        }
+        let result = self.append(ReplicatedCommandV1::Membership { voters, learners })?;
+        if !matches!(result, ApplyResult::Noop) {
+            return Err(ChorusError::Protocol(
+                "membership bootstrap returned an unexpected result".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn change_membership(&self, mut voters: Vec<u64>, mut learners: Vec<u64>) -> Result<()> {
+        voters.sort_unstable();
+        voters.dedup();
+        learners.sort_unstable();
+        learners.dedup();
+        if voters.is_empty()
+            || voters.contains(&0)
+            || learners.contains(&0)
+            || voters.iter().any(|id| learners.binary_search(id).is_ok())
+        {
+            return Err(ChorusError::Protocol("invalid membership change".into()));
+        }
+        let result = self.append(ReplicatedCommandV1::Membership { voters, learners })?;
+        if matches!(result, ApplyResult::Noop) {
+            Ok(())
+        } else {
+            Err(ChorusError::Consensus(
+                "membership change was not applied".into(),
+            ))
         }
     }
     fn store(&self) -> Arc<dyn StateStore> {
@@ -438,9 +1169,10 @@ impl Consensus for NetworkConsensus {
 }
 
 fn write_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
+    const MAX_PEER_FRAME: usize = 8 * 1024 * 1024;
     let bytes = serde_json::to_vec(value).map_err(|e| ChorusError::Serialization(e.to_string()))?;
-    if bytes.len() > 16 * 1024 * 1024 {
-        return Err(ChorusError::Limit("peer message exceeds 16 MiB".into()));
+    if bytes.len() > MAX_PEER_FRAME {
+        return Err(ChorusError::Limit("peer message exceeds 8 MiB".into()));
     }
     stream
         .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -449,13 +1181,14 @@ fn write_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
 }
 
 fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> Result<T> {
+    const MAX_PEER_FRAME: usize = 8 * 1024 * 1024;
     let mut length = [0; 4];
     stream
         .read_exact(&mut length)
         .map_err(|e| ChorusError::Consensus(e.to_string()))?;
     let length = u32::from_be_bytes(length) as usize;
-    if length > 16 * 1024 * 1024 {
-        return Err(ChorusError::Protocol("peer message exceeds 16 MiB".into()));
+    if length > MAX_PEER_FRAME {
+        return Err(ChorusError::Protocol("peer message exceeds 8 MiB".into()));
     }
     let mut bytes = vec![0; length];
     stream
@@ -548,14 +1281,35 @@ impl InMemoryCluster {
             return Err(ChorusError::Consensus("no majority is reachable".into()));
         }
         let mut i = self.next_index.lock().unwrap();
-        *i += 1;
+        let previous_index = *i;
+        *i = i.saturating_add(1);
         let log = LogId {
             term: *self.term.lock().unwrap(),
             index: *i,
         };
+        let mut replicas = self.replicas.lock().unwrap();
+        let mut before = Vec::new();
+        for replica in replicas.iter().filter(|replica| replica.healthy) {
+            before.push((replica.id, snapshot_from_store(replica.store.as_ref())?));
+        }
         let mut result = None;
-        for r in self.replicas.lock().unwrap().iter().filter(|r| r.healthy) {
-            let x = r.store.apply(log, &command)?;
+        for r in replicas.iter().filter(|r| r.healthy) {
+            let x = match r.store.apply(log, &command) {
+                Ok(result) => result,
+                Err(error) => {
+                    // A state-machine apply is atomic, but earlier healthy
+                    // replicas may already have applied this entry.  Roll
+                    // every participant back to its exact pre-entry logical
+                    // snapshot before exposing the error to the proposer.
+                    for (id, snapshot) in &before {
+                        if let Some(previous) = replicas.iter().find(|r| r.id == *id) {
+                            let _ = previous.store.rollback(snapshot);
+                        }
+                    }
+                    *i = previous_index;
+                    return Err(error);
+                }
+            };
             if result.is_none() {
                 result = Some(x);
             }
@@ -570,6 +1324,7 @@ pub struct ClusterConsensus {
 }
 impl Consensus for ClusterConsensus {
     fn activate_origin(&self, origin: chorus_common::OriginId) -> Result<()> {
+        self.local_store_if_healthy()?;
         let _ = self.cluster.append(ReplicatedCommandV1::ActivateOrigin(
             chorus_codec::ActivateOriginV1 { origin },
         ))?;
@@ -579,24 +1334,47 @@ impl Consensus for ClusterConsensus {
         if !self.cluster.quorum() {
             return Err(ChorusError::Consensus("no quorum".into()));
         }
-        let r = self.cluster.replicas.lock().unwrap();
-        let node = r
-            .iter()
-            .find(|x| x.id == self.node_id && x.healthy)
-            .or_else(|| r.iter().find(|x| x.healthy))
-            .ok_or_else(|| ChorusError::Consensus("node unavailable".into()))?;
-        node.store.snapshot()
+        let (local_store, leader_store) = {
+            let r = self.cluster.replicas.lock().unwrap();
+            let local = r
+                .iter()
+                .find(|x| x.id == self.node_id && x.healthy)
+                .ok_or_else(|| ChorusError::Consensus("node unavailable".into()))?;
+            let leader_id = r
+                .iter()
+                .filter(|x| x.healthy && !x.learner)
+                .map(|x| x.id)
+                .min()
+                .ok_or_else(|| ChorusError::Consensus("no leader is reachable".into()))?;
+            let leader = r
+                .iter()
+                .find(|x| x.id == leader_id)
+                .ok_or_else(|| ChorusError::Consensus("leader is unavailable".into()))?;
+            (local.store.clone(), leader.store.clone())
+        };
+        let local_snapshot = local_store.snapshot()?;
+        let leader_snapshot = leader_store.snapshot()?;
+        if local_snapshot.last_applied() < leader_snapshot.last_applied() {
+            local_store.install(&snapshot_from_store(leader_store.as_ref())?)?;
+        }
+        let snapshot = local_store.snapshot()?;
+        if snapshot.last_applied() < leader_snapshot.last_applied() {
+            return Err(ChorusError::Consensus("replica lagging".into()));
+        }
+        Ok(snapshot)
     }
     fn submit(&self, c: CommitTransactionV1) -> Result<ApplyResult> {
+        self.local_store_if_healthy()?;
         self.cluster
             .append(ReplicatedCommandV1::CommitTransaction(c))
     }
     fn submit_schema(&self, c: SchemaCommandV1) -> Result<ApplyResult> {
+        self.local_store_if_healthy()?;
         self.cluster.append(ReplicatedCommandV1::SchemaChange(c))
     }
     fn wait_applied(&self, log_id: LogId) -> Result<()> {
         let s = self.read_barrier()?;
-        if s.last_applied() >= log_id {
+        if s.last_applied().index >= log_id.index {
             Ok(())
         } else {
             Err(ChorusError::Consensus("replica lagging".into()))
@@ -660,10 +1438,23 @@ impl Consensus for ClusterConsensus {
     }
 }
 
+impl ClusterConsensus {
+    fn local_store_if_healthy(&self) -> Result<Arc<dyn StateStore>> {
+        self.cluster
+            .replicas
+            .lock()
+            .map_err(|_| ChorusError::Consensus("replica lock poisoned".into()))?
+            .iter()
+            .find(|replica| replica.id == self.node_id && replica.healthy)
+            .map(|replica| replica.store.clone())
+            .ok_or_else(|| ChorusError::Consensus("node unavailable".into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chorus_codec::{KvMutationV1, payload_hash};
+    use chorus_codec::{KvMutationV1, canonical_mutations, payload_hash};
     use chorus_common::{OriginId, RequestId};
     use chorus_storage::MemoryStateStore;
 
@@ -685,10 +1476,7 @@ mod tests {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
         };
-        let mut canonical = Vec::new();
-        canonical.extend_from_slice(mutation.key());
-        canonical.push(1);
-        canonical.extend_from_slice(b"v");
+        let canonical = canonical_mutations(std::slice::from_ref(&mutation)).unwrap();
         let command = CommitTransactionV1 {
             request_id: id,
             payload_hash: payload_hash(1, &id, 0, &canonical),
@@ -746,10 +1534,7 @@ mod tests {
             key: b"network-key".to_vec(),
             value: b"network-value".to_vec(),
         };
-        let mut canonical = Vec::new();
-        canonical.extend_from_slice(mutation.key());
-        canonical.push(1);
-        canonical.extend_from_slice(b"network-value");
+        let canonical = canonical_mutations(std::slice::from_ref(&mutation)).unwrap();
         let command = CommitTransactionV1 {
             request_id: id,
             payload_hash: payload_hash(1, &id, 0, &canonical),

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 chorus-common = { path = "../chorus-common" }
+chorus-codec = { path = "../chorus-codec" }
 chorus-storage = { path = "../chorus-storage" }
 chorus-consensus = { path = "../chorus-consensus" }
 serde = { version = "1.0.228", features = ["derive"] }

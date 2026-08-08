@@ -10,7 +10,7 @@ use chorus_consensus::ConsensusStatus;
 use chorus_storage::{FileStateStore, StateStore, StoreStatus};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -26,6 +26,10 @@ const MAX_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SQL_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RETURNING_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const IDENTITY_FILE_NAME: &str = "identity.toml";
+const IDENTITY_VERSION: u32 = 1;
+const MAX_IDENTITY_BYTES: u64 = 4096;
+static NEXT_IDENTITY_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -459,6 +463,9 @@ impl Config {
     pub fn state_path(&self) -> PathBuf {
         self.data_dir.join("state").join("active.json")
     }
+    pub fn identity_path(&self) -> PathBuf {
+        self.data_dir.join(IDENTITY_FILE_NAME)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -556,6 +563,7 @@ pub fn status(
 pub fn open_store(config: &Config) -> Result<FileStateStore, ConfigError> {
     config.validate()?;
     ensure_private_dir(&config.data_dir)?;
+    ensure_installation_identity(config)?;
     let state_path = config.state_path();
     if fs::symlink_metadata(&state_path)
         .map(|m| m.file_type().is_symlink())
@@ -667,6 +675,322 @@ fn ensure_private_dir(path: &Path) -> Result<(), ConfigError> {
     harden_file_permissions(path, true)
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallationIdentity {
+    format_version: u32,
+    cluster_id: String,
+    cluster_incarnation: u64,
+    node_id: u64,
+}
+
+impl InstallationIdentity {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            format_version: IDENTITY_VERSION,
+            cluster_id: config.cluster_id.clone(),
+            cluster_incarnation: config.cluster_incarnation,
+            node_id: config.node_id,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.format_version != IDENTITY_VERSION {
+            return Err(ConfigError::Invalid(format!(
+                "identity version {} is unsupported",
+                self.format_version
+            )));
+        }
+        if self.cluster_id.trim().is_empty() {
+            return Err(ConfigError::Invalid("identity cluster_id is empty".into()));
+        }
+        if self.cluster_id.len() > MAX_CLUSTER_ID_BYTES {
+            return Err(ConfigError::Invalid(format!(
+                "identity cluster_id exceeds {MAX_CLUSTER_ID_BYTES} bytes"
+            )));
+        }
+        if self.cluster_incarnation == 0 {
+            return Err(ConfigError::Invalid(
+                "identity cluster_incarnation must be nonzero".into(),
+            ));
+        }
+        if self.node_id == 0 {
+            return Err(ConfigError::Invalid(
+                "identity node_id must be nonzero".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn matches_config(&self, config: &Config) -> bool {
+        self.cluster_id == config.cluster_id
+            && self.cluster_incarnation == config.cluster_incarnation
+            && self.node_id == config.node_id
+    }
+}
+
+fn ensure_installation_identity(config: &Config) -> Result<(), ConfigError> {
+    let path = config.identity_path();
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            let identity = read_installation_identity(&path, &metadata)?;
+            identity.validate()?;
+            if !identity.matches_config(config) {
+                return Err(ConfigError::Invalid(
+                    "persisted installation identity does not match configuration".into(),
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(artifact) = existing_durable_artifact(config)? {
+                return Err(ConfigError::Invalid(format!(
+                    "identity is missing while durable state exists at {}; refusing to bind an existing installation",
+                    artifact.display()
+                )));
+            }
+            create_installation_identity(&path, &InstallationIdentity::from_config(config))
+        }
+        Err(error) => Err(ConfigError::Io(error.to_string())),
+    }
+}
+
+fn existing_durable_artifact(config: &Config) -> Result<Option<PathBuf>, ConfigError> {
+    let state_dir = config.data_dir.join("state");
+    match fs::symlink_metadata(&state_dir) {
+        Ok(metadata) if !metadata.is_dir() => return Ok(Some(state_dir)),
+        Ok(_) => {
+            let mut entries =
+                fs::read_dir(&state_dir).map_err(|error| ConfigError::Io(error.to_string()))?;
+            if let Some(entry) = entries.next() {
+                return entry
+                    .map(|entry| Some(entry.path()))
+                    .map_err(|error| ConfigError::Io(error.to_string()));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ConfigError::Io(error.to_string())),
+    }
+
+    let raft_redb = config.data_dir.join("raft.redb");
+    match fs::symlink_metadata(&raft_redb) {
+        Ok(_) => return Ok(Some(raft_redb)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ConfigError::Io(error.to_string())),
+    }
+    for entry in
+        fs::read_dir(&config.data_dir).map_err(|error| ConfigError::Io(error.to_string()))?
+    {
+        let entry = entry.map_err(|error| ConfigError::Io(error.to_string()))?;
+        if entry.file_name().to_string_lossy().ends_with(".raft.log") {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
+}
+
+fn read_installation_identity(
+    path: &Path,
+    path_metadata: &fs::Metadata,
+) -> Result<InstallationIdentity, ConfigError> {
+    if path_metadata.file_type().is_symlink() {
+        return Err(ConfigError::Invalid(
+            "identity path must not be a symbolic link".into(),
+        ));
+    }
+    if !path_metadata.is_file() {
+        return Err(ConfigError::Invalid(
+            "identity path is not a regular file".into(),
+        ));
+    }
+    if path_metadata.len() > MAX_IDENTITY_BYTES {
+        return Err(ConfigError::Invalid(format!(
+            "identity file exceeds {MAX_IDENTITY_BYTES} bytes"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path_metadata.permissions().mode() & 0o077 != 0 {
+            return Err(ConfigError::Invalid(
+                "identity file must not be group/world-readable".into(),
+            ));
+        }
+    }
+
+    // Linux's O_NOFOLLOW closes the check/open symlink race.  The
+    // create_new path below is likewise exclusive and never follows an
+    // existing identity symlink.  Other platforms retain the metadata
+    // recheck, which fails closed for ordinary path replacement.
+    let mut file = open_identity_read(path).map_err(|error| ConfigError::Io(error.to_string()))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| ConfigError::Io(error.to_string()))?;
+    let current_metadata =
+        fs::symlink_metadata(path).map_err(|error| ConfigError::Io(error.to_string()))?;
+    if current_metadata.file_type().is_symlink()
+        || !current_metadata.is_file()
+        || !same_file(&opened_metadata, &current_metadata)
+    {
+        return Err(ConfigError::Invalid(
+            "identity path changed while it was being opened".into(),
+        ));
+    }
+    if opened_metadata.len() > MAX_IDENTITY_BYTES {
+        return Err(ConfigError::Invalid(format!(
+            "identity file exceeds {MAX_IDENTITY_BYTES} bytes"
+        )));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_IDENTITY_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ConfigError::Io(error.to_string()))?;
+    if bytes.len() as u64 > MAX_IDENTITY_BYTES {
+        return Err(ConfigError::Invalid(format!(
+            "identity file exceeds {MAX_IDENTITY_BYTES} bytes"
+        )));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| ConfigError::Parse(format!("identity is not UTF-8: {error}")))?;
+    toml::from_str(text).map_err(|error| ConfigError::Parse(error.to_string()))
+}
+
+fn create_installation_identity(
+    path: &Path,
+    identity: &InstallationIdentity,
+) -> Result<(), ConfigError> {
+    let text =
+        toml::to_string_pretty(identity).map_err(|error| ConfigError::Parse(error.to_string()))?;
+    if text.len() as u64 > MAX_IDENTITY_BYTES {
+        return Err(ConfigError::Invalid(format!(
+            "identity file exceeds {MAX_IDENTITY_BYTES} bytes"
+        )));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| ConfigError::Invalid("identity path has no parent directory".into()))?;
+    let mut temporary = None;
+    for _ in 0..64 {
+        let sequence = NEXT_IDENTITY_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{IDENTITY_FILE_NAME}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ConfigError::Io(error.to_string())),
+        }
+    }
+    let (temporary_path, mut file) = temporary.ok_or_else(|| {
+        ConfigError::Io("could not allocate a unique identity temporary file".into())
+    })?;
+    harden_open_file_permissions(&file)?;
+    if let Err(error) = file
+        .write_all(text.as_bytes())
+        .and_then(|_| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&temporary_path);
+        return Err(ConfigError::Io(error.to_string()));
+    }
+    drop(file);
+
+    match fs::hard_link(&temporary_path, path) {
+        Ok(()) => {
+            // The hard link publishes a complete, synced inode without ever
+            // replacing an existing identity. Persist publication before
+            // removing the private staging name.
+            sync_parent(path)?;
+            fs::remove_file(&temporary_path).map_err(|error| ConfigError::Io(error.to_string()))?;
+            sync_parent(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&temporary_path).map_err(|error| ConfigError::Io(error.to_string()))?;
+            let metadata =
+                fs::symlink_metadata(path).map_err(|error| ConfigError::Io(error.to_string()))?;
+            let existing = read_installation_identity(path, &metadata)?;
+            existing.validate()?;
+            if &existing == identity {
+                Ok(())
+            } else {
+                Err(ConfigError::Invalid(
+                    "a different identity won concurrent first-open creation".into(),
+                ))
+            }
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary_path);
+            Err(ConfigError::Io(error.to_string()))
+        }
+    }
+}
+
+fn open_identity_read(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Linux O_NOFOLLOW; keep this read-only path from resolving a
+        // symlink between symlink_metadata and open.
+        options.custom_flags(0x20000);
+    }
+    options.open(path)
+}
+
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        left.len() == right.len()
+    }
+}
+
+fn harden_open_file_permissions(file: &fs::File) -> Result<(), ConfigError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| ConfigError::Io(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn sync_parent(path: &Path) -> Result<(), ConfigError> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| ConfigError::Invalid("identity path has no parent directory".into()))?;
+        let directory =
+            fs::File::open(parent).map_err(|error| ConfigError::Io(error.to_string()))?;
+        directory
+            .sync_all()
+            .map_err(|error| ConfigError::Io(error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn validate_tls_file(path: Option<&Path>, name: &str, private: bool) -> Result<(), ConfigError> {
     let path = path.ok_or_else(|| ConfigError::Invalid(format!("{name} is missing")))?;
     let metadata = fs::symlink_metadata(path)
@@ -730,6 +1054,212 @@ mod tests {
     use chorus_common::{LogId, OriginId, RequestId};
     use chorus_storage::StateStore;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "chorus-admin-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn optional_file_bytes(path: &Path) -> Option<Vec<u8>> {
+        match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read {}: {error}", path.display()),
+        }
+    }
+
+    fn make_private_file(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("set private test permissions");
+        }
+    }
+
+    #[test]
+    fn first_open_creates_private_identity_and_same_config_reopens() {
+        let directory = TestDirectory::new("identity-first-open");
+        let config = Config::defaults(directory.path(), 1);
+        let store = open_store(&config).expect("first open");
+        let before_hash = store.state_hash().expect("initial state hash");
+        drop(store);
+
+        let identity_bytes = fs::read(config.identity_path()).expect("identity bytes");
+        let identity: InstallationIdentity =
+            toml::from_slice(&identity_bytes).expect("identity TOML");
+        assert_eq!(identity, InstallationIdentity::from_config(&config));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(config.identity_path())
+                    .expect("identity metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(directory.path())
+                    .expect("data directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+
+        let reopened = open_store(&config).expect("same identity reopen");
+        assert_eq!(reopened.state_hash().expect("reopened hash"), before_hash);
+        assert_eq!(
+            fs::read(config.identity_path()).expect("identity after reopen"),
+            identity_bytes
+        );
+        assert!(
+            fs::read_dir(directory.path())
+                .expect("list data directory")
+                .all(|entry| !entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".identity.toml."))
+        );
+    }
+
+    #[test]
+    fn identity_mismatch_rejects_before_durable_state_access() {
+        let directory = TestDirectory::new("identity-mismatch");
+        let config = Config::defaults(directory.path(), 1);
+        drop(open_store(&config).expect("first open"));
+        let identity_before = fs::read(config.identity_path()).expect("identity before");
+        let state_before = optional_file_bytes(&config.state_path());
+        let log_path = config.state_path().with_extension("raft.log");
+        let log_before = optional_file_bytes(&log_path);
+
+        let mut wrong_node = config.clone();
+        wrong_node.node_id = 2;
+        wrong_node.initial_nodes[0].node_id = 2;
+        assert!(open_store(&wrong_node).is_err());
+
+        let mut wrong_cluster = config.clone();
+        wrong_cluster.cluster_id = "other-cluster".into();
+        assert!(open_store(&wrong_cluster).is_err());
+
+        let mut wrong_incarnation = config.clone();
+        wrong_incarnation.cluster_incarnation += 1;
+        assert!(open_store(&wrong_incarnation).is_err());
+
+        assert_eq!(
+            fs::read(config.identity_path()).expect("identity after mismatches"),
+            identity_before
+        );
+        assert_eq!(optional_file_bytes(&config.state_path()), state_before);
+        assert_eq!(optional_file_bytes(&log_path), log_before);
+    }
+
+    #[test]
+    fn missing_identity_never_rebinds_existing_state_or_raft_log() {
+        let directory = TestDirectory::new("identity-deleted");
+        let config = Config::defaults(directory.path(), 1);
+        drop(open_store(&config).expect("first open"));
+        let state_before = optional_file_bytes(&config.state_path());
+        let log_path = config.state_path().with_extension("raft.log");
+        let log_before = optional_file_bytes(&log_path);
+        fs::remove_file(config.identity_path()).expect("delete identity for recovery test");
+
+        let mut changed_node = config.clone();
+        changed_node.node_id = 2;
+        changed_node.initial_nodes[0].node_id = 2;
+        let error = match open_store(&changed_node) {
+            Err(error) => error,
+            Ok(_) => panic!("existing state must not be rebound"),
+        };
+        assert!(error.to_string().contains("identity is missing"));
+        assert!(!config.identity_path().exists());
+        assert_eq!(optional_file_bytes(&config.state_path()), state_before);
+        assert_eq!(optional_file_bytes(&log_path), log_before);
+
+        let log_only_directory = TestDirectory::new("identity-log-only");
+        fs::create_dir_all(log_only_directory.path()).expect("create log-only data directory");
+        let orphan_log = log_only_directory.path().join("orphan.raft.log");
+        fs::write(&orphan_log, b"durable raft bytes").expect("write orphan log");
+        let log_only_config = Config::defaults(log_only_directory.path(), 1);
+        assert!(open_store(&log_only_config).is_err());
+        assert_eq!(
+            fs::read(&orphan_log).expect("orphan log bytes"),
+            b"durable raft bytes"
+        );
+        assert!(!log_only_config.identity_path().exists());
+        assert!(!log_only_config.state_path().exists());
+    }
+
+    #[test]
+    fn malformed_and_oversize_identity_files_fail_closed() {
+        for (label, bytes) in [
+            ("malformed", b"format_version =".to_vec()),
+            ("oversize", vec![b'x'; MAX_IDENTITY_BYTES as usize + 1]),
+        ] {
+            let directory = TestDirectory::new(label);
+            fs::create_dir_all(directory.path()).expect("create data directory");
+            let config = Config::defaults(directory.path(), 1);
+            fs::write(config.identity_path(), &bytes).expect("write invalid identity");
+            make_private_file(&config.identity_path());
+            assert!(open_store(&config).is_err());
+            assert_eq!(
+                fs::read(config.identity_path()).expect("invalid identity unchanged"),
+                bytes
+            );
+            assert!(!config.state_path().exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_symlink_is_rejected_without_opening_state() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("identity-symlink");
+        fs::create_dir_all(directory.path()).expect("create data directory");
+        let config = Config::defaults(directory.path(), 1);
+        let target = directory.path().join("identity-target.toml");
+        fs::write(
+            &target,
+            toml::to_string(&InstallationIdentity::from_config(&config)).expect("identity TOML"),
+        )
+        .expect("write symlink target");
+        make_private_file(&target);
+        symlink(&target, config.identity_path()).expect("identity symlink");
+
+        assert!(open_store(&config).is_err());
+        assert!(!config.state_path().exists());
+        assert!(
+            fs::symlink_metadata(config.identity_path())
+                .expect("identity symlink metadata")
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn logical_backup_roundtrip_keeps_kv_in_single_entry_stream() {

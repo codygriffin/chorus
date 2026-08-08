@@ -251,7 +251,10 @@ impl DurableConsensusLog {
                 "consensus term cannot move backwards".into(),
             ));
         }
-        if term == inner.hard_state.current_term && voted_for != inner.hard_state.voted_for {
+        if term == inner.hard_state.current_term
+            && inner.hard_state.voted_for.is_some()
+            && voted_for != inner.hard_state.voted_for
+        {
             return Err(ChorusError::Protocol(
                 "vote is already recorded for the current term".into(),
             ));
@@ -1087,6 +1090,24 @@ mod tests {
                 Err(ChorusError::Protocol(_))
             ));
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_term_vote_can_be_granted_once_after_term_persistence() {
+        let (path, root) = temp_path("same-term-vote");
+        let log = open(&path);
+        log.set_term_and_vote(1, None).unwrap();
+        log.set_term_and_vote(1, Some(9)).unwrap();
+        assert_eq!(log.hard_state().unwrap().voted_for, Some(9));
+        assert!(matches!(
+            log.set_term_and_vote(1, Some(10)),
+            Err(ChorusError::Protocol(_))
+        ));
+        assert!(matches!(
+            log.set_term_and_vote(1, None),
+            Err(ChorusError::Protocol(_))
+        ));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -23,6 +23,10 @@ const MAX_STARTUP_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_WIRE_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PARAMETER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROTOCOL_ITEMS: usize = u16::MAX as usize;
+const MAX_STATEMENT_BYTES: usize = 1024 * 1024;
+const MAX_NAMED_PREPARED: usize = 256;
+const MAX_NAMED_PORTALS: usize = 256;
+const MAX_RETAINED_EXTENDED_QUERY_BYTES: usize = 16 * 1024 * 1024;
 const PROTOCOL_VERSION_3_0: u32 = 196_608;
 const PROTOCOL_VERSION_3_2: u32 = 196_610;
 const SSL_REQUEST_CODE: u32 = 80_877_103;
@@ -184,6 +188,8 @@ struct Connection {
     session: SqlSession,
     portals: HashMap<String, Portal>,
     prepared_types: HashMap<String, Vec<u32>>,
+    retained_extended_query_bytes: usize,
+    extended_query_state_limit: usize,
     backend_pid: u32,
     secret: u32,
     cancel_token: Arc<AtomicBool>,
@@ -345,6 +351,8 @@ impl Connection {
             session,
             portals: HashMap::new(),
             prepared_types: HashMap::new(),
+            retained_extended_query_bytes: 0,
+            extended_query_state_limit: MAX_RETAINED_EXTENDED_QUERY_BYTES,
             backend_pid: pid,
             secret,
             cancel_token,
@@ -554,6 +562,56 @@ impl Connection {
             }
         }
     }
+
+    fn prepared_entry_bytes(&self, name: &str) -> WireResult<usize> {
+        match (
+            self.session.prepared_sql(name),
+            self.prepared_types.get(name),
+        ) {
+            (Some(sql), Some(types)) => prepared_retained_bytes(name, sql, types),
+            (None, None) => Ok(0),
+            _ => Err(SqlError::new(
+                "XX000",
+                "prepared statement accounting is inconsistent",
+            )),
+        }
+    }
+
+    fn portal_entry_bytes(&self, name: &str) -> WireResult<usize> {
+        self.portals
+            .get(name)
+            .map_or(Ok(0), |portal| portal_retained_bytes(name, portal))
+    }
+
+    fn projected_extended_query_bytes(&self, removed: usize, added: usize) -> WireResult<usize> {
+        projected_retained_bytes(
+            self.retained_extended_query_bytes,
+            removed,
+            added,
+            self.extended_query_state_limit,
+        )
+    }
+
+    fn replace_portal_accounted(
+        &mut self,
+        name: &str,
+        portal: Portal,
+        old_bytes: usize,
+    ) -> WireResult<()> {
+        let added = portal_retained_bytes(name, &portal)?;
+        let projected = self.projected_extended_query_bytes(old_bytes, added)?;
+        self.portals.insert(name.to_string(), portal);
+        self.retained_extended_query_bytes = projected;
+        Ok(())
+    }
+
+    fn discard_portal_accounted(&mut self, name: &str, old_bytes: usize) -> WireResult<()> {
+        let projected = self.projected_extended_query_bytes(old_bytes, 0)?;
+        self.portals.remove(name);
+        self.retained_extended_query_bytes = projected;
+        Ok(())
+    }
+
     fn parse(&mut self, body: &[u8]) -> std::io::Result<()> {
         let mut decoder = Decoder::new(body);
         let parsed = (|| {
@@ -571,7 +629,55 @@ impl Connection {
             Ok(value) => value,
             Err(e) => return self.extended_failure(&e),
         };
-        let types = infer_parameter_types(&sql, &supplied);
+        if statement_exceeds_limit(&sql) {
+            return self.extended_failure(&SqlError::new(
+                "54000",
+                "prepared statement exceeds configured size limit",
+            ));
+        }
+        if !name.is_empty() && self.prepared_types.contains_key(&name) {
+            return self
+                .extended_failure(&SqlError::new("42P05", "prepared statement already exists"));
+        }
+        if named_resource_limit_reached(&self.prepared_types, &name, MAX_NAMED_PREPARED) {
+            return self.extended_failure(&SqlError::new(
+                "54000",
+                "too many named prepared statements",
+            ));
+        }
+        let types = match infer_parameter_types(&sql, &supplied) {
+            Ok(types) => types,
+            Err(e) => return self.extended_failure(&e),
+        };
+        let old_statement_bytes = match self.prepared_entry_bytes(&name) {
+            Ok(bytes) => bytes,
+            Err(e) => return self.extended_failure(&e),
+        };
+        let old_unnamed_portal_bytes = if name.is_empty() {
+            match self.portal_entry_bytes("") {
+                Ok(bytes) => bytes,
+                Err(e) => return self.extended_failure(&e),
+            }
+        } else {
+            0
+        };
+        let removed = match old_statement_bytes.checked_add(old_unnamed_portal_bytes) {
+            Some(bytes) => bytes,
+            None => {
+                return self.extended_failure(&SqlError::new(
+                    "XX000",
+                    "extended-query accounting overflow",
+                ));
+            }
+        };
+        let added = match prepared_retained_bytes(&name, &sql, &types) {
+            Ok(bytes) => bytes,
+            Err(e) => return self.extended_failure(&e),
+        };
+        let projected = match self.projected_extended_query_bytes(removed, added) {
+            Ok(bytes) => bytes,
+            Err(e) => return self.extended_failure(&e),
+        };
         match self.session.prepare(&name, &sql) {
             Ok(()) => {
                 if name.is_empty() {
@@ -580,6 +686,7 @@ impl Connection {
                     self.portals.remove("");
                 }
                 self.prepared_types.insert(name, types);
+                self.retained_extended_query_bytes = projected;
                 self.write_message(b'1', &[])
             }
             Err(e) => self.extended_failure(&e),
@@ -660,16 +767,33 @@ impl Connection {
             Ok(value) => value,
             Err(e) => return self.extended_failure(&e),
         };
-        // A successful Bind replaces an existing unnamed portal.
-        self.portals.insert(
-            portal,
-            Portal {
-                sql,
-                params,
-                result_formats,
-                pending: None,
-            },
-        );
+        if !portal.is_empty() && self.portals.contains_key(&portal) {
+            return self.extended_failure(&SqlError::new("42P03", "portal already exists"));
+        }
+        if named_resource_limit_reached(&self.portals, &portal, MAX_NAMED_PORTALS) {
+            return self.extended_failure(&SqlError::new("54000", "too many named portals"));
+        }
+        let candidate = Portal {
+            sql,
+            params,
+            result_formats,
+            pending: None,
+        };
+        let old_bytes = match self.portal_entry_bytes(&portal) {
+            Ok(bytes) => bytes,
+            Err(e) => return self.extended_failure(&e),
+        };
+        let added = match portal_retained_bytes(&portal, &candidate) {
+            Ok(bytes) => bytes,
+            Err(e) => return self.extended_failure(&e),
+        };
+        let projected = match self.projected_extended_query_bytes(old_bytes, added) {
+            Ok(bytes) => bytes,
+            Err(e) => return self.extended_failure(&e),
+        };
+        // The unnamed portal is the only portal implicitly replaced by Bind.
+        self.portals.insert(portal, candidate);
+        self.retained_extended_query_bytes = projected;
         self.write_message(b'2', &[])
     }
     fn session_sql(&self, name: &str) -> Option<String> {
@@ -734,8 +858,14 @@ impl Connection {
             Ok(value) => value,
             Err(e) => return self.extended_failure(&e),
         };
-        let Some(mut p) = self.portals.get(&portal).cloned() else {
-            return self.extended_failure(&SqlError::new("34000", "portal does not exist"));
+        let (mut p, old_portal_bytes) = match self.portals.get(&portal) {
+            Some(existing) => match portal_retained_bytes(&portal, existing) {
+                Ok(bytes) => (existing.clone(), bytes),
+                Err(e) => return self.extended_failure(&e),
+            },
+            None => {
+                return self.extended_failure(&SqlError::new("34000", "portal does not exist"));
+            }
         };
         self.begin_query();
         let result = if let Some(pending) = p.pending.take() {
@@ -758,12 +888,28 @@ impl Connection {
                 affected_rows: result.affected_rows,
                 notices: result.notices.clone(),
             });
-            self.portals.insert(portal, p);
+            if let Err(e) = self.replace_portal_accounted(&portal, p, old_portal_bytes) {
+                // The query has already executed.  Discard the portal rather
+                // than leave its old executable state available for an
+                // accidental retry after Sync.
+                if let Err(accounting_error) =
+                    self.discard_portal_accounted(&portal, old_portal_bytes)
+                {
+                    return self.extended_failure(&accounting_error);
+                }
+                return self.extended_failure(&e);
+            }
             self.result_rows_with_formats(&result, &formats)?;
             return self.write_message(b's', &[]);
         }
         let formats = p.result_formats.clone();
-        self.portals.insert(portal, p);
+        if let Err(e) = self.replace_portal_accounted(&portal, p, old_portal_bytes) {
+            if let Err(accounting_error) = self.discard_portal_accounted(&portal, old_portal_bytes)
+            {
+                return self.extended_failure(&accounting_error);
+            }
+            return self.extended_failure(&e);
+        }
         self.result_with_formats(&result, &formats)
     }
     fn close(&mut self, body: &[u8]) -> std::io::Result<()> {
@@ -780,11 +926,26 @@ impl Connection {
         };
         match kind {
             b'P' => {
-                self.portals.remove(&name);
+                let old_bytes = match self.portal_entry_bytes(&name) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return self.extended_failure(&e),
+                };
+                if let Err(e) = self.discard_portal_accounted(&name, old_bytes) {
+                    return self.extended_failure(&e);
+                }
             }
             b'S' => {
+                let old_bytes = match self.prepared_entry_bytes(&name) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return self.extended_failure(&e),
+                };
+                let projected = match self.projected_extended_query_bytes(old_bytes, 0) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return self.extended_failure(&e),
+                };
                 self.session.close_prepared(&name);
                 self.prepared_types.remove(&name);
+                self.retained_extended_query_bytes = projected;
             }
             _ => return self.extended_failure(&SqlError::new("08P01", "invalid Close target")),
         }
@@ -963,6 +1124,125 @@ fn format_at(formats: &[u16], index: usize) -> Option<u16> {
         [format] => Some(*format),
         formats => formats.get(index).copied(),
     }
+}
+
+fn retained_size_overflow() -> SqlError {
+    SqlError::new("54000", "extended-query retained state size overflow")
+}
+
+fn charge_retained(total: &mut usize, bytes: usize) -> WireResult<()> {
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(retained_size_overflow)?;
+    Ok(())
+}
+
+fn charge_retained_items<T>(total: &mut usize, count: usize) -> WireResult<()> {
+    let bytes = count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(retained_size_overflow)?;
+    charge_retained(total, bytes)
+}
+
+/// Charge the logical payload retained in both prepared-statement maps.  The
+/// separate object-count limit bounds allocator and HashMap bucket overhead.
+fn prepared_retained_bytes(name: &str, sql: &str, types: &[u32]) -> WireResult<usize> {
+    let mut total = 2usize
+        .checked_mul(std::mem::size_of::<String>())
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<u32>>()))
+        .ok_or_else(retained_size_overflow)?;
+    charge_retained(
+        &mut total,
+        name.len()
+            .checked_mul(2)
+            .ok_or_else(retained_size_overflow)?,
+    )?;
+    charge_retained(&mut total, sql.len())?;
+    charge_retained_items::<u32>(&mut total, types.len())?;
+    Ok(total)
+}
+
+fn datum_heap_bytes(value: &Datum) -> usize {
+    match value {
+        Datum::Text(value) | Datum::Jsonb(value) => value.capacity(),
+        Datum::Bytes(value) => value.capacity(),
+        _ => 0,
+    }
+}
+
+/// Heap storage owned by a suspended result.  The inline QueryResult itself
+/// is already part of `Portal`; this charges its nested vectors and strings.
+fn pending_result_heap_bytes(result: &QueryResult) -> WireResult<usize> {
+    let mut total = 0usize;
+    charge_retained_items::<ResultColumn>(&mut total, result.columns.capacity())?;
+    for column in &result.columns {
+        charge_retained(&mut total, column.name.capacity())?;
+    }
+    charge_retained_items::<Vec<Datum>>(&mut total, result.rows.capacity())?;
+    for row in &result.rows {
+        charge_retained_items::<Datum>(&mut total, row.capacity())?;
+        for value in row {
+            charge_retained(&mut total, datum_heap_bytes(value))?;
+        }
+    }
+    charge_retained(&mut total, result.command_tag.capacity())?;
+    charge_retained_items::<String>(&mut total, result.notices.capacity())?;
+    for notice in &result.notices {
+        charge_retained(&mut total, notice.capacity())?;
+    }
+    Ok(total)
+}
+
+/// Charge all variable state retained by a portal, including decoded Bind
+/// values and any result remainder held for portal suspension.
+fn portal_retained_bytes(name: &str, portal: &Portal) -> WireResult<usize> {
+    let mut total = std::mem::size_of::<Portal>();
+    charge_retained(&mut total, name.len())?;
+    charge_retained(&mut total, portal.sql.capacity())?;
+    charge_retained_items::<Datum>(&mut total, portal.params.capacity())?;
+    for value in &portal.params {
+        charge_retained(&mut total, datum_heap_bytes(value))?;
+    }
+    charge_retained_items::<u16>(&mut total, portal.result_formats.capacity())?;
+    if let Some(result) = &portal.pending {
+        charge_retained(&mut total, pending_result_heap_bytes(result)?)?;
+    }
+    Ok(total)
+}
+
+fn projected_retained_bytes(
+    current: usize,
+    removed: usize,
+    added: usize,
+    limit: usize,
+) -> WireResult<usize> {
+    let projected = current
+        .checked_sub(removed)
+        .ok_or_else(|| SqlError::new("XX000", "extended-query accounting underflow"))?
+        .checked_add(added)
+        .ok_or_else(retained_size_overflow)?;
+    if projected > limit {
+        return Err(SqlError::new(
+            "54000",
+            "extended-query retained state exceeds configured limit",
+        ));
+    }
+    Ok(projected)
+}
+
+fn named_resource_limit_reached<T>(
+    resources: &HashMap<String, T>,
+    name: &str,
+    limit: usize,
+) -> bool {
+    if name.is_empty() || resources.contains_key(name) {
+        return false;
+    }
+    resources.keys().filter(|key| !key.is_empty()).count() >= limit
+}
+
+fn statement_exceeds_limit(sql: &str) -> bool {
+    sql.len() > MAX_STATEMENT_BYTES
 }
 
 fn validate_result_formats(formats: &[u16], columns: usize) -> std::io::Result<()> {
@@ -1206,7 +1486,7 @@ fn sqlstate(error: &SqlError) -> &'static str {
     }
 }
 
-fn infer_parameter_types(sql: &str, supplied: &[u32]) -> Vec<u32> {
+fn infer_parameter_types(sql: &str, supplied: &[u32]) -> WireResult<Vec<u32>> {
     let mut max_param = supplied.len();
     let bytes = sql.as_bytes();
     let mut i = 0usize;
@@ -1234,9 +1514,16 @@ fn infer_parameter_types(sql: &str, supplied: &[u32]) -> Vec<u32> {
                 end += 1;
             }
             if end > start {
-                if let Ok(n) = sql[start..end].parse::<usize>() {
-                    max_param = max_param.max(n);
+                let n = sql[start..end].parse::<usize>().map_err(|_| {
+                    SqlError::new("54000", "parameter number exceeds protocol limit")
+                })?;
+                if n > MAX_PROTOCOL_ITEMS {
+                    return Err(SqlError::new(
+                        "54000",
+                        "parameter number exceeds protocol limit",
+                    ));
                 }
+                max_param = max_param.max(n);
                 i = end;
                 continue;
             }
@@ -1245,7 +1532,7 @@ fn infer_parameter_types(sql: &str, supplied: &[u32]) -> Vec<u32> {
     }
     let mut types = supplied.to_vec();
     types.resize(max_param, 0);
-    types
+    Ok(types)
 }
 
 // The SQL engine owns planning and catalog lookup.  Keeping Describe's
@@ -1311,6 +1598,74 @@ fn row_description_body(r: &QueryResult, result_formats: &[u16]) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chorus_common::{Limits, OriginId};
+    use chorus_storage::{MemoryStateStore, StateStore};
+    use chorus_txn::{Committer, LocalCommitter};
+    use std::io::Cursor;
+
+    fn test_connection() -> Connection {
+        let store = Arc::new(MemoryStateStore::new()) as Arc<dyn StateStore>;
+        let committer = Arc::new(
+            LocalCommitter::new(Arc::clone(&store), OriginId::new(1)).expect("test committer"),
+        ) as Arc<dyn Committer>;
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        Connection::new(engine, Box::new(Cursor::new(Vec::new())))
+    }
+
+    fn parse_body(name: &str, sql: &str, types: &[u32]) -> Vec<u8> {
+        let mut body = Vec::new();
+        cstr_put(&mut body, name);
+        cstr_put(&mut body, sql);
+        put_u16(&mut body, types.len() as u16);
+        for oid in types {
+            body.extend_from_slice(&oid.to_be_bytes());
+        }
+        body
+    }
+
+    fn bind_body(portal: &str, statement: &str, value: Option<&[u8]>) -> Vec<u8> {
+        let mut body = Vec::new();
+        cstr_put(&mut body, portal);
+        cstr_put(&mut body, statement);
+        put_u16(&mut body, 0);
+        put_u16(&mut body, usize::from(value.is_some()) as u16);
+        if let Some(value) = value {
+            body.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            body.extend_from_slice(value);
+        }
+        put_u16(&mut body, 0);
+        body
+    }
+
+    fn close_body(kind: u8, name: &str) -> Vec<u8> {
+        let mut body = vec![kind];
+        cstr_put(&mut body, name);
+        body
+    }
+
+    fn recomputed_retained_bytes(connection: &Connection) -> usize {
+        let prepared = connection
+            .prepared_types
+            .iter()
+            .map(|(name, types)| {
+                prepared_retained_bytes(
+                    name,
+                    connection
+                        .session
+                        .prepared_sql(name)
+                        .expect("matching prepared SQL"),
+                    types,
+                )
+                .expect("prepared accounting")
+            })
+            .sum::<usize>();
+        let portals = connection
+            .portals
+            .iter()
+            .map(|(name, portal)| portal_retained_bytes(name, portal).expect("portal accounting"))
+            .sum::<usize>();
+        prepared + portals
+    }
 
     #[test]
     fn row_description_has_exact_postgres_field_layout() {
@@ -1344,5 +1699,151 @@ mod tests {
         assert_eq!(i16::from_be_bytes(body[p..p + 2].try_into().unwrap()), 1);
         p += 2;
         assert_eq!(p, body.len());
+    }
+
+    #[test]
+    fn named_resource_count_excludes_existing_and_unnamed_keys() {
+        let mut resources = HashMap::new();
+        resources.insert("one".to_string(), 1usize);
+        resources.insert("two".to_string(), 2usize);
+        assert!(named_resource_limit_reached(&resources, "new", 2));
+        assert!(!named_resource_limit_reached(&resources, "one", 2));
+        assert!(!named_resource_limit_reached(&resources, "", 0));
+
+        // Duplicate protocol objects are rejected separately.  This helper
+        // only decides whether a new name would consume another count slot.
+        resources.insert("one".to_string(), 3);
+        resources.insert(String::new(), 4);
+        assert_eq!(resources.len(), 3);
+        assert_eq!(resources["one"], 3);
+        assert_eq!(resources[""], 4);
+    }
+
+    #[test]
+    fn named_resource_rejection_does_not_mutate_and_close_releases_slot() {
+        let mut resources = HashMap::new();
+        resources.insert("one".to_string(), 1usize);
+        resources.insert("two".to_string(), 2usize);
+        let before = resources.clone();
+        if !named_resource_limit_reached(&resources, "three", 2) {
+            resources.insert("three".to_string(), 3);
+        }
+        assert_eq!(resources, before);
+        resources.remove("one");
+        assert!(!named_resource_limit_reached(&resources, "three", 2));
+    }
+
+    #[test]
+    fn statement_size_limit_is_exact_and_uses_bytes() {
+        assert!(!statement_exceeds_limit(&"x".repeat(MAX_STATEMENT_BYTES)));
+        assert!(statement_exceeds_limit(
+            &"x".repeat(MAX_STATEMENT_BYTES + 1)
+        ));
+        assert!(statement_exceeds_limit(
+            &"é".repeat(MAX_STATEMENT_BYTES / 2 + 1)
+        ));
+    }
+
+    #[test]
+    fn parse_budget_and_named_duplicate_reject_before_mutation() {
+        let mut connection = test_connection();
+        connection.extended_query_state_limit = 0;
+        connection
+            .parse(&parse_body("limited", "SELECT 1", &[]))
+            .expect("wire error response");
+        assert!(connection.extended_error);
+        assert!(!connection.prepared_types.contains_key("limited"));
+        assert!(connection.session.prepared_sql("limited").is_none());
+        assert_eq!(connection.retained_extended_query_bytes, 0);
+
+        connection.extended_error = false;
+        connection.extended_query_state_limit = MAX_RETAINED_EXTENDED_QUERY_BYTES;
+        connection
+            .parse(&parse_body("named", "SELECT 1", &[]))
+            .expect("ParseComplete");
+        let before = connection.retained_extended_query_bytes;
+        connection
+            .parse(&parse_body("named", "SELECT 2", &[]))
+            .expect("duplicate error response");
+        assert!(connection.extended_error);
+        assert_eq!(connection.session.prepared_sql("named"), Some("SELECT 1"));
+        assert_eq!(connection.retained_extended_query_bytes, before);
+        assert_eq!(before, recomputed_retained_bytes(&connection));
+    }
+
+    #[test]
+    fn bind_budget_duplicate_and_close_preserve_exact_accounting() {
+        let mut connection = test_connection();
+        connection
+            .parse(&parse_body("statement", "SELECT $1", &[25]))
+            .expect("ParseComplete");
+        let prepared_bytes = connection.retained_extended_query_bytes;
+
+        connection.extended_query_state_limit = prepared_bytes;
+        connection
+            .bind(&bind_body("limited", "statement", Some(b"first")))
+            .expect("wire error response");
+        assert!(connection.extended_error);
+        assert!(!connection.portals.contains_key("limited"));
+        assert_eq!(connection.retained_extended_query_bytes, prepared_bytes);
+
+        connection.extended_error = false;
+        connection.extended_query_state_limit = MAX_RETAINED_EXTENDED_QUERY_BYTES;
+        connection
+            .bind(&bind_body("portal", "statement", Some(b"first")))
+            .expect("BindComplete");
+        let with_portal = connection.retained_extended_query_bytes;
+        connection
+            .bind(&bind_body("portal", "statement", Some(b"replacement")))
+            .expect("duplicate portal error response");
+        assert!(connection.extended_error);
+        assert_eq!(
+            connection.portals["portal"].params[0],
+            Datum::Text("first".into())
+        );
+        assert_eq!(connection.retained_extended_query_bytes, with_portal);
+
+        connection.extended_error = false;
+        connection
+            .close(&close_body(b'P', "portal"))
+            .expect("CloseComplete");
+        assert_eq!(connection.retained_extended_query_bytes, prepared_bytes);
+        connection
+            .close(&close_body(b'S', "statement"))
+            .expect("CloseComplete");
+        assert_eq!(connection.retained_extended_query_bytes, 0);
+        assert_eq!(0, recomputed_retained_bytes(&connection));
+    }
+
+    #[test]
+    fn unnamed_parse_replacement_releases_statement_and_portal_payload() {
+        let mut connection = test_connection();
+        connection
+            .parse(&parse_body("", "SELECT $1", &[25]))
+            .expect("ParseComplete");
+        connection
+            .bind(&bind_body("", "", Some(b"retained payload")))
+            .expect("BindComplete");
+        let before = connection.retained_extended_query_bytes;
+        assert!(connection.portals.contains_key(""));
+
+        connection
+            .parse(&parse_body("", "SELECT 2", &[]))
+            .expect("ParseComplete");
+        assert!(!connection.portals.contains_key(""));
+        assert_eq!(connection.session.prepared_sql(""), Some("SELECT 2"));
+        assert!(connection.retained_extended_query_bytes < before);
+        assert_eq!(
+            connection.retained_extended_query_bytes,
+            recomputed_retained_bytes(&connection)
+        );
+    }
+
+    #[test]
+    fn parameter_number_is_bounded_before_type_vector_resize() {
+        let error = infer_parameter_types("SELECT $65536", &[]).unwrap_err();
+        assert_eq!(error.code, "54000");
+        let types = infer_parameter_types("SELECT $65535", &[]).expect("protocol maximum");
+        assert_eq!(types.len(), MAX_PROTOCOL_ITEMS);
     }
 }

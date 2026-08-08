@@ -84,6 +84,7 @@ struct Connection {
     io: Box<dyn Io>,
     session: SqlSession,
     portals: HashMap<String, Portal>,
+    prepared_types: HashMap<String, Vec<u32>>,
     backend_pid: u32,
     secret: u32,
 }
@@ -103,6 +104,7 @@ impl Connection {
             io,
             session,
             portals: HashMap::new(),
+            prepared_types: HashMap::new(),
             backend_pid: pid,
             secret: pid.rotate_left(13),
         }
@@ -198,9 +200,24 @@ impl Connection {
     }
     fn parse(&mut self, body: &[u8]) -> std::io::Result<()> {
         let (name, n) = cstr(body);
-        let (sql, _) = cstr(&body[n..]);
+        let (sql, sql_n) = cstr(&body[n..]);
+        let mut p = n + sql_n;
+        let mut types = Vec::new();
+        if p + 2 <= body.len() {
+            let count = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+            p += 2;
+            if p + count.saturating_mul(4) <= body.len() {
+                for _ in 0..count {
+                    types.push(u32::from_be_bytes(body[p..p + 4].try_into().unwrap()));
+                    p += 4;
+                }
+            }
+        }
         match self.session.prepare(&name, &sql) {
-            Ok(()) => self.write_message(b'1', &[]),
+            Ok(()) => {
+                self.prepared_types.insert(name, types);
+                self.write_message(b'1', &[])
+            }
             Err(e) => self.error(&e),
         }
     }
@@ -229,17 +246,21 @@ impl Connection {
             } else {
                 let data = &body[p..p + len as usize];
                 p += len as usize;
-                params.push(
-                    if f.get(i)
-                        .copied()
-                        .unwrap_or_else(|| f.first().copied().unwrap_or(0))
-                        == 1
-                    {
-                        Datum::Bytes(data.to_vec())
-                    } else {
-                        Datum::Text(String::from_utf8_lossy(data).into())
-                    },
-                );
+                let format = f
+                    .get(i)
+                    .copied()
+                    .unwrap_or_else(|| f.first().copied().unwrap_or(0));
+                let oid = self
+                    .prepared_types
+                    .get(&statement)
+                    .and_then(|types| types.get(i))
+                    .copied()
+                    .unwrap_or(0);
+                params.push(if format == 1 {
+                    decode_binary_param(data, oid).unwrap_or_else(|| Datum::Bytes(data.to_vec()))
+                } else {
+                    Datum::Text(String::from_utf8_lossy(data).into())
+                });
             }
         }
         if p + 2 > body.len() {
@@ -248,6 +269,19 @@ impl Connection {
         let result_formats_count = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
         p += 2 + result_formats_count * 2;
         let sql = self.session_sql(&statement).unwrap_or_default();
+        let declared = self
+            .prepared_types
+            .get(&statement)
+            .cloned()
+            .unwrap_or_default();
+        for (i, value) in params.iter_mut().enumerate() {
+            if let Datum::Text(text) = value {
+                let oid = declared.get(i).copied().unwrap_or(0);
+                if let Some(v) = decode_text_param(text, oid) {
+                    *value = v;
+                }
+            }
+        }
         self.portals.insert(
             portal,
             Portal {
@@ -397,6 +431,63 @@ fn cstr(bytes: &[u8]) -> (String, usize) {
         String::from_utf8_lossy(&bytes[..n]).into(),
         (n + 1).min(bytes.len()),
     )
+}
+
+fn decode_text_param(text: &str, oid: u32) -> Option<Datum> {
+    match oid {
+        16 => text.parse::<bool>().ok().map(Datum::Boolean),
+        21 => text.parse::<i16>().ok().map(Datum::Int16),
+        23 => text.parse::<i32>().ok().map(Datum::Int32),
+        20 => text.parse::<i64>().ok().map(Datum::Int64),
+        701 => text.parse::<f64>().ok().map(Datum::Float64),
+        3802 => chorus_common::Datum::canonical_json(text)
+            .ok()
+            .map(Datum::Jsonb),
+        2950 => parse_uuid(text).map(Datum::Uuid),
+        0 => {
+            if let Ok(v) = text.parse::<i64>() {
+                Some(Datum::Int64(v))
+            } else if let Ok(v) = text.parse::<f64>() {
+                Some(Datum::Float64(v))
+            } else if let Ok(v) = text.parse::<bool>() {
+                Some(Datum::Boolean(v))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn decode_binary_param(bytes: &[u8], oid: u32) -> Option<Datum> {
+    match oid {
+        16 if bytes.len() == 1 => Some(Datum::Boolean(bytes[0] != 0)),
+        21 if bytes.len() == 2 => Some(Datum::Int16(i16::from_be_bytes(bytes.try_into().ok()?))),
+        23 if bytes.len() == 4 => Some(Datum::Int32(i32::from_be_bytes(bytes.try_into().ok()?))),
+        20 if bytes.len() == 8 => Some(Datum::Int64(i64::from_be_bytes(bytes.try_into().ok()?))),
+        701 if bytes.len() == 8 => Some(Datum::Float64(f64::from_bits(u64::from_be_bytes(
+            bytes.try_into().ok()?,
+        )))),
+        17 => Some(Datum::Bytes(bytes.to_vec())),
+        25 | 1043 => Some(Datum::Text(String::from_utf8(bytes.to_vec()).ok()?)),
+        2950 if bytes.len() == 16 => Some(Datum::Uuid(bytes.try_into().ok()?)),
+        3802 => chorus_common::Datum::canonical_json(&String::from_utf8(bytes.to_vec()).ok()?)
+            .ok()
+            .map(Datum::Jsonb),
+        _ => None,
+    }
+}
+
+fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+    let clean = text.trim().replace('-', "");
+    if clean.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 fn cstr_put(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());

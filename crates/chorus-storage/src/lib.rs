@@ -9,7 +9,8 @@
 
 use chorus_codec::{
     ApplyResult, CommitTransactionV1, EncodedRowV1, KvMutationV1, LogicalSnapshot, NodeOriginState,
-    PhysicalKey, ReplicatedCommandV1, SchemaOperationV1, encode_command, hash32, payload_hash,
+    PhysicalKey, ReplicatedCommandV1, SchemaOperationV1, encode_command, encode_composite, hash32,
+    payload_hash,
 };
 use chorus_common::{ChorusError, Datum, LogId, OriginId, RequestId, Result, SqlError, SqlType};
 use serde::{Deserialize, Serialize};
@@ -472,7 +473,7 @@ fn apply_commit(
     let origin = c.request_id.origin;
     let state = data
         .origins
-        .get_mut(&origin.node_id)
+        .get(&origin.node_id)
         .ok_or_else(|| ChorusError::Protocol("origin is not activated".into()))?;
     if state.active_origin != origin {
         return Ok(ApplyResult::StaleOrigin);
@@ -508,12 +509,9 @@ fn apply_commit(
     }
     let expected_hash = payload_hash(1, &c.request_id, c.base_epoch, &canonical);
     if expected_hash != c.payload_hash {
-        record_result(
-            state,
-            c,
-            ApplyResult::ProtocolError("payload hash mismatch".into()),
-        );
-        return Ok(ApplyResult::ProtocolError("payload hash mismatch".into()));
+        let result = ApplyResult::ProtocolError("payload hash mismatch".into());
+        record_data_result(data, origin, c, result.clone());
+        return Ok(result);
     }
     let mut previous_key: Option<&[u8]> = None;
     let mut bytes = 0usize;
@@ -523,7 +521,7 @@ fn apply_commit(
                 let result = ApplyResult::ProtocolError(
                     "mutations are not strictly sorted and unique".into(),
                 );
-                record_result(state, c, result.clone());
+                record_data_result(data, origin, c, result.clone());
                 return Ok(result);
             }
         }
@@ -531,13 +529,13 @@ fn apply_commit(
         bytes += m.encoded_len();
         if m.key().len() > 8 * 1024 {
             let result = ApplyResult::Rejected("physical key exceeds limit".into());
-            record_result(state, c, result.clone());
+            record_data_result(data, origin, c, result.clone());
             return Ok(result);
         }
     }
     if bytes > 4 * 1024 * 1024 || c.mutations.len() > 10_000 {
         let result = ApplyResult::Rejected("transaction mutation limit exceeded".into());
-        record_result(state, c, result.clone());
+        record_data_result(data, origin, c, result.clone());
         return Ok(result);
     }
     if c.base_epoch != data.db_epoch {
@@ -545,18 +543,27 @@ fn apply_commit(
             expected: c.base_epoch,
             actual: data.db_epoch,
         };
-        record_result(state, c, result.clone());
+        record_data_result(data, origin, c, result.clone());
         return Ok(result);
     }
     // Apply is atomic from the caller's perspective: all validation above is
     // complete before mutating the KV map, and the caller rolls the whole
-    // state back on an error.
+    // state back on an error.  Row-count metadata is maintained from the
+    // canonical row key namespace as part of the same state-machine apply.
     for m in &c.mutations {
         match m {
             KvMutationV1::Put { key, value } => {
+                validate_physical_mutation(data, key, Some(value))?;
+                if is_row_key(key) && !data.kv.contains_key(key) {
+                    adjust_row_count(data, key, 1)?;
+                }
                 data.kv.insert(key.clone(), value.clone());
             }
             KvMutationV1::Delete { key } => {
+                validate_physical_mutation(data, key, None)?;
+                if is_row_key(key) && data.kv.contains_key(key) {
+                    adjust_row_count(data, key, -1)?;
+                }
                 data.kv.remove(key);
             }
         }
@@ -569,8 +576,88 @@ fn apply_commit(
         epoch: data.db_epoch,
         log_id,
     };
-    record_result(state, c, result.clone());
+    record_data_result(data, origin, c, result.clone());
     Ok(result)
+}
+
+fn record_data_result(
+    data: &mut StateData,
+    origin: OriginId,
+    c: &CommitTransactionV1,
+    result: ApplyResult,
+) {
+    if let Some(state) = data.origins.get_mut(&origin.node_id) {
+        record_result(state, c, result);
+    }
+}
+
+fn is_row_key(key: &[u8]) -> bool {
+    key.len() >= 5 && key[0] == 0x20
+}
+
+fn table_id_from_row_key(key: &[u8]) -> u32 {
+    u32::from_be_bytes([key[1], key[2], key[3], key[4]])
+}
+
+fn adjust_row_count(data: &mut StateData, key: &[u8], delta: i64) -> Result<()> {
+    let table_id = table_id_from_row_key(key);
+    let table = data
+        .catalog
+        .table_mut(table_id)
+        .ok_or_else(|| ChorusError::Protocol("row mutation references unknown table".into()))?;
+    table.row_count = if delta > 0 {
+        table
+            .row_count
+            .checked_add(delta as u64)
+            .ok_or_else(|| ChorusError::Limit("table row count exhausted".into()))?
+    } else {
+        table
+            .row_count
+            .checked_sub((-delta) as u64)
+            .ok_or_else(|| ChorusError::Protocol("table row count underflow".into()))?
+    };
+    Ok(())
+}
+
+fn validate_physical_mutation(data: &StateData, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+    if key.len() < 5 {
+        // Metadata adapters may use short, private keys.  User table/index
+        // keys are always at least the five-byte prefix plus an object id and
+        // are validated below.
+        return Ok(());
+    }
+    match key[0] {
+        0x20 => {
+            if data.catalog.table(table_id_from_row_key(key)).is_none() {
+                return Err(ChorusError::Protocol(
+                    "row mutation references unknown table".into(),
+                ));
+            }
+            if let Some(bytes) = value {
+                EncodedRowV1::decode(bytes)
+                    .map_err(|e| ChorusError::Serialization(e.to_string()))?;
+            }
+        }
+        0x21 | 0x22 => {
+            let index_id = u32::from_be_bytes([key[1], key[2], key[3], key[4]]);
+            if !data
+                .catalog
+                .indexes
+                .get(&index_id)
+                .is_some_and(|i| i.state == ObjectState::Live)
+            {
+                return Err(ChorusError::Protocol(
+                    "index mutation references unknown index".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(ChorusError::Protocol(
+                "mutation uses an unknown physical key prefix".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn record_result(state: &mut NodeOriginState, c: &CommitTransactionV1, result: ApplyResult) {
@@ -619,12 +706,26 @@ fn apply_schema(
             });
         }
     }
+    let payload =
+        serde_json::to_vec(&c.operation).map_err(|e| ChorusError::Serialization(e.to_string()))?;
+    let expected_hash = payload_hash(1, &c.request_id, c.base_epoch, &payload);
     let fake = CommitTransactionV1 {
         request_id: c.request_id,
         payload_hash: c.payload_hash,
         base_epoch: c.base_epoch,
         mutations: Vec::new(),
     };
+    if expected_hash != c.payload_hash {
+        let result = ApplyResult::ProtocolError("schema payload hash mismatch".into());
+        record_result(
+            data.origins
+                .get_mut(&origin.node_id)
+                .expect("origin checked"),
+            &fake,
+            result.clone(),
+        );
+        return Ok(result);
+    }
     if c.base_epoch != data.db_epoch {
         let result = ApplyResult::SerializationFailure {
             expected: c.base_epoch,
@@ -841,6 +942,23 @@ fn apply_schema_op(
             if data.catalog.table(*table_id).is_none() {
                 return Err(SqlError::new("42P01", "table does not exist"));
             }
+            if columns.is_empty() || columns.len() > 16 {
+                return Err(SqlError::new("54000", "index must contain 1..16 columns"));
+            }
+            let table = data
+                .catalog
+                .table(*table_id)
+                .expect("table checked")
+                .clone();
+            for (column_id, _) in columns {
+                if !table
+                    .columns
+                    .iter()
+                    .any(|c| c.id == *column_id && c.state == ColumnState::Live)
+                {
+                    return Err(SqlError::new("42703", "index column does not exist"));
+                }
+            }
             let desc = IndexDescriptor {
                 oid: *index_id,
                 table_oid: *table_id,
@@ -855,6 +973,34 @@ fn apply_schema_op(
                 unique: *unique,
                 state: ObjectState::Live,
             };
+            // Build the index deterministically while the schema command is
+            // still atomic.  A unique index uses a key without the row suffix
+            // for non-NULL values, so a duplicate is detected on every
+            // replica in the same byte order.
+            let row_prefix = [0x20]
+                .into_iter()
+                .chain(table.oid.to_be_bytes())
+                .collect::<Vec<_>>();
+            let row_end = chorus_codec::successor(&row_prefix);
+            let rows: Vec<_> = data
+                .kv
+                .range(row_prefix.clone()..)
+                .take_while(|(k, _)| row_end.as_deref().map(|e| k.as_slice() < e).unwrap_or(true))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (row_key, bytes) in rows {
+                let row = EncodedRowV1::decode(&bytes)
+                    .map_err(|e| SqlError::new("XX000", e.to_string()))?;
+                let key = index_entry_key(&desc, &row, &row_key)
+                    .map_err(|e| SqlError::new("XX000", e.to_string()))?;
+                if desc.unique && !index_contains_null(&desc, &row) && data.kv.contains_key(&key) {
+                    return Err(SqlError::new(
+                        "23505",
+                        "duplicate key violates unique index",
+                    ));
+                }
+                data.kv.insert(key, Vec::new());
+            }
             data.catalog.indexes.insert(*index_id, desc);
             let t = data.catalog.table_mut(*table_id).expect("table checked");
             t.secondary_indexes.push(*index_id);
@@ -884,6 +1030,37 @@ fn apply_schema_op(
         }
     }
     Ok(ApplyResult::Noop)
+}
+
+fn index_contains_null(index: &IndexDescriptor, row: &EncodedRowV1) -> bool {
+    index
+        .columns
+        .iter()
+        .any(|c| row.get(c.column_id).is_none_or(Datum::is_null))
+}
+
+fn index_entry_key(
+    index: &IndexDescriptor,
+    row: &EncodedRowV1,
+    row_key: &[u8],
+) -> std::result::Result<Vec<u8>, chorus_codec::CodecError> {
+    let values = index
+        .columns
+        .iter()
+        .map(|c| row.get(c.column_id).cloned().unwrap_or(Datum::Null))
+        .collect::<Vec<_>>();
+    let descending = index
+        .columns
+        .iter()
+        .map(|c| c.descending)
+        .collect::<Vec<_>>();
+    let encoded = encode_composite(&values, &descending)?;
+    let unique_nonnull = index.unique && !index_contains_null(index, row);
+    Ok(
+        PhysicalKey::index(index.oid, &encoded, row_key, unique_nonnull)
+            .map_err(|e| chorus_codec::CodecError::Malformed(e.to_string()))?
+            .0,
+    )
 }
 
 fn canonical_state_hash(data: &StateData) -> [u8; 32] {

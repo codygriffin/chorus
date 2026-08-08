@@ -46,7 +46,12 @@ impl PhysicalKey {
         let mut out = vec![if unique { 0x22 } else { 0x21 }];
         out.extend_from_slice(&index_id.to_be_bytes());
         out.extend_from_slice(index_key);
-        out.extend_from_slice(row_key);
+        // A non-NULL unique key identifies the indexed value alone.  For a
+        // non-unique (or NULL-containing unique) entry the row suffix keeps
+        // duplicate values distinct and makes ordered scans possible.
+        if !unique {
+            out.extend_from_slice(row_key);
+        }
         Self::new(out)
     }
     pub fn table_desc(table_id: u32) -> Self {

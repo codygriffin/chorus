@@ -7,7 +7,8 @@
 use chorus_codec::{ApplyResult, SchemaOperationV1, encode_composite, hash32};
 use chorus_common::{ChorusError, Datum, Limits, OriginId, Result, SqlError, SqlType};
 use chorus_storage::{
-    Catalog, ColumnDescriptor, ColumnState, ObjectState, StateSnapshot, StateStore, TableDescriptor,
+    Catalog, ColumnDescriptor, ColumnState, IndexDescriptor, ObjectState, StateSnapshot,
+    StateStore, TableDescriptor,
 };
 use chorus_txn::{CommitSequencer, Committer, Transaction, TransactionStatus};
 use std::collections::HashMap;
@@ -99,6 +100,7 @@ impl SqlEngine {
             settings: SessionSettings::default(),
             prepared: HashMap::new(),
             sequencer: Arc::new(CommitSequencer::new(self.committer.origin())),
+            transaction_timestamp_us: None,
         }
     }
     pub fn store(&self) -> &Arc<dyn StateStore> {
@@ -172,11 +174,27 @@ enum AlterOp {
 struct Select {
     projection: Vec<Expr>,
     from: Option<String>,
+    from_alias: Option<String>,
+    joins: Vec<JoinSpec>,
     selection: Option<Expr>,
+    group_by: Vec<Expr>,
+    having: Option<Expr>,
     order: Vec<(Expr, bool)>,
     limit: Option<usize>,
     offset: usize,
     distinct: bool,
+}
+#[derive(Clone, Debug)]
+struct JoinSpec {
+    relation: String,
+    alias: Option<String>,
+    kind: JoinKind,
+    on: Expr,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinKind {
+    Inner,
+    Left,
 }
 #[derive(Clone, Debug)]
 struct Insert {
@@ -185,6 +203,7 @@ struct Insert {
     values: Vec<Vec<Expr>>,
     returning: Vec<Expr>,
     conflict_nothing: bool,
+    conflict_update: Vec<(String, Expr)>,
 }
 #[derive(Clone, Debug)]
 struct Update {
@@ -236,6 +255,8 @@ enum BinOp {
     Mul,
     Div,
     Concat,
+    JsonGet,
+    JsonText,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -319,7 +340,9 @@ impl Lexer {
                     self.p += 1;
                     out.push(Tok::Star)
                 }
-                '+' | '-' | '/' | '=' | '<' | '>' | '!' | '|' => out.push(Tok::Op(self.operator())),
+                '+' | '-' | '/' | '=' | '<' | '>' | '!' | '|' | ':' => {
+                    out.push(Tok::Op(self.operator()))
+                }
                 _ => {
                     return Err(SqlError::new(
                         "42601",
@@ -410,10 +433,22 @@ impl Lexer {
         if self.p < self.chars.len()
             && matches!(
                 (self.chars[s], self.chars[self.p]),
-                ('<', '=') | ('>', '=') | ('<', '>') | ('!', '=') | ('|', '|')
+                ('<', '=')
+                    | ('>', '=')
+                    | ('<', '>')
+                    | ('!', '=')
+                    | ('|', '|')
+                    | (':', ':')
+                    | ('-', '>')
             )
         {
             self.p += 1;
+            if self.chars[s] == '-'
+                && self.chars.get(self.p - 1) == Some(&'>')
+                && self.chars.get(self.p) == Some(&'>')
+            {
+                self.p += 1;
+            }
         }
         self.chars[s..self.p].iter().collect()
     }
@@ -457,6 +492,7 @@ impl Parser {
             "commit" | "end" => Ok(Statement::Commit),
             "rollback" | "abort" => Ok(Statement::Rollback),
             "set" => self.set_stmt(),
+            "reset" => Ok(Statement::Set(self.take_word()?, "default".into())),
             "show" => Ok(Statement::Show(self.take_word()?)),
             "create" => self.create_stmt(),
             "drop" => self.drop_stmt(),
@@ -467,7 +503,7 @@ impl Parser {
             "update" => self.update_stmt(),
             "delete" => self.delete_stmt(),
             "prepare" => {
-                let name = self.take_word()?;
+                let name = self.relation_name()?;
                 self.word("as")?;
                 Ok(Statement::Prepare {
                     name,
@@ -475,7 +511,7 @@ impl Parser {
                 })
             }
             "execute" => {
-                let name = self.take_word()?;
+                let name = self.relation_name()?;
                 let mut params = Vec::new();
                 if self.eat(Tok::L) && !self.eat(Tok::R) {
                     loop {
@@ -507,7 +543,7 @@ impl Parser {
         match kind.as_str() {
             "table" => {
                 let if_not_exists = self.words(&["if", "not", "exists"]);
-                let name = self.take_word()?;
+                let name = self.relation_name()?;
                 self.expect(Tok::L)?;
                 let mut cols = Vec::new();
                 let mut pk = Vec::new();
@@ -562,7 +598,7 @@ impl Parser {
                 let if_not_exists = self.words(&["if", "not", "exists"]);
                 let name = self.take_word()?;
                 self.word("on")?;
-                let table = self.take_word()?;
+                let table = self.relation_name()?;
                 self.expect(Tok::L)?;
                 let mut columns = Vec::new();
                 loop {
@@ -595,7 +631,7 @@ impl Parser {
     fn drop_stmt(&mut self) -> std::result::Result<Statement, SqlError> {
         let k = self.take_word()?;
         let if_exists = self.words(&["if", "exists"]);
-        let name = self.take_word()?;
+        let name = self.relation_name()?;
         Ok(match k.as_str() {
             "table" => Statement::DropTable { name, if_exists },
             "index" => Statement::DropIndex { name, if_exists },
@@ -604,7 +640,7 @@ impl Parser {
     }
     fn alter_stmt(&mut self) -> std::result::Result<Statement, SqlError> {
         self.word("table")?;
-        let table = self.take_word()?;
+        let table = self.relation_name()?;
         let op = self.take_word()?;
         let alter = match op.as_str() {
             "add" => {
@@ -649,29 +685,90 @@ impl Parser {
         let distinct = self.eat_word("distinct");
         let mut projection = Vec::new();
         loop {
-            projection.push(if self.eat(Tok::Star) {
+            let expression = if self.eat(Tok::Star) {
                 Expr::Star
             } else {
                 self.expr()?
-            });
+            };
+            // Column aliases affect presentation, not expression semantics.
+            // Keep the compact AST while accepting the form emitted by psql
+            // and most PostgreSQL drivers.
+            if self.eat_word("as") {
+                let _ = self.take_word()?;
+            }
+            projection.push(expression);
             if !self.eat(Tok::Comma) {
                 break;
             }
         }
+        let mut from_alias = None;
         let from = if values_only {
             None
         } else if self.eat_word("from") {
-            Some(self.take_word()?)
+            let relation = self.relation_name()?;
+            if self.eat_word("as") {
+                from_alias = Some(self.take_word()?);
+            } else if self.peek_word_not_clause() {
+                // A bare alias is unambiguous at this position.  JOIN is
+                // intentionally left for the unsupported-feature path.
+                from_alias = Some(self.take_word()?);
+            }
+            Some(relation)
         } else {
             None
         };
+        let mut joins = Vec::new();
+        if from.is_some() {
+            loop {
+                let save = self.p;
+                let kind = if self.eat_word("left") {
+                    self.eat_word("outer");
+                    if !self.eat_word("join") {
+                        self.p = save;
+                        break;
+                    }
+                    JoinKind::Left
+                } else if self.eat_word("inner") {
+                    if !self.eat_word("join") {
+                        self.p = save;
+                        break;
+                    }
+                    JoinKind::Inner
+                } else if self.eat_word("join") {
+                    JoinKind::Inner
+                } else {
+                    break;
+                };
+                let relation = self.relation_name()?;
+                let mut alias = None;
+                if self.eat_word("as") {
+                    alias = Some(self.take_word()?);
+                } else if self.peek_word_not_clause() {
+                    alias = Some(self.take_word()?);
+                }
+                self.word("on")?;
+                joins.push(JoinSpec {
+                    relation,
+                    alias,
+                    kind,
+                    on: self.expr()?,
+                });
+            }
+        }
         let mut selection = None;
+        let mut group_by = Vec::new();
+        let mut having = None;
         let mut order = Vec::new();
         let mut limit = None;
         let mut offset = 0;
         while self.p < self.t.len() {
             if self.eat_word("where") {
                 selection = Some(self.expr()?);
+            } else if self.eat_word("group") {
+                self.word("by")?;
+                group_by = self.expr_list()?;
+            } else if self.eat_word("having") {
+                having = Some(self.expr()?);
             } else if self.eat_word("order") {
                 self.word("by")?;
                 loop {
@@ -701,7 +798,11 @@ impl Parser {
         Ok(Statement::Select(Select {
             projection,
             from,
+            from_alias,
+            joins,
             selection,
+            group_by,
+            having,
             order,
             limit,
             offset,
@@ -710,7 +811,7 @@ impl Parser {
     }
     fn insert_stmt(&mut self) -> std::result::Result<Statement, SqlError> {
         self.word("into")?;
-        let table = self.take_word()?;
+        let table = self.relation_name()?;
         let mut columns = Vec::new();
         if self.eat(Tok::L) {
             columns = self.names_close()?;
@@ -732,16 +833,28 @@ impl Parser {
                 break;
             }
         }
-        let conflict_nothing = if self.words(&["on", "conflict"]) {
+        let mut conflict_nothing = false;
+        let mut conflict_update = Vec::new();
+        if self.words(&["on", "conflict"]) {
             if self.eat(Tok::L) {
                 self.names_close()?;
             }
             self.word("do")?;
-            self.word("nothing")?;
-            true
-        } else {
-            false
-        };
+            if self.eat_word("nothing") {
+                conflict_nothing = true;
+            } else {
+                self.word("update")?;
+                self.word("set")?;
+                loop {
+                    let name = self.take_word()?;
+                    self.expect_op("=")?;
+                    conflict_update.push((name, self.expr()?));
+                    if !self.eat(Tok::Comma) {
+                        break;
+                    }
+                }
+            }
+        }
         let returning = if self.eat_word("returning") {
             self.expr_list()?
         } else {
@@ -753,10 +866,11 @@ impl Parser {
             values,
             returning,
             conflict_nothing,
+            conflict_update,
         }))
     }
     fn update_stmt(&mut self) -> std::result::Result<Statement, SqlError> {
-        let table = self.take_word()?;
+        let table = self.relation_name()?;
         self.word("set")?;
         let mut assignments = Vec::new();
         loop {
@@ -786,7 +900,7 @@ impl Parser {
     }
     fn delete_stmt(&mut self) -> std::result::Result<Statement, SqlError> {
         self.word("from")?;
-        let table = self.take_word()?;
+        let table = self.relation_name()?;
         let selection = if self.eat_word("where") {
             Some(self.expr()?)
         } else {
@@ -932,12 +1046,20 @@ impl Parser {
             Some(Tok::Word(w)) if w == "case" => self.case_expr()?,
             Some(Tok::Word(w)) => {
                 if self.eat(Tok::L) {
-                    let mut args = Vec::new();
-                    if !self.eat(Tok::R) {
-                        args = self.expr_list()?;
+                    if w == "cast" {
+                        let value = self.expr()?;
+                        self.word("as")?;
+                        let ty = self.ty()?;
                         self.expect(Tok::R)?;
+                        Expr::Cast(Box::new(value), ty)
+                    } else {
+                        let mut args = Vec::new();
+                        if !self.eat(Tok::R) {
+                            args = self.expr_list()?;
+                            self.expect(Tok::R)?;
+                        }
+                        Expr::Func(w, args)
                     }
-                    Expr::Func(w, args)
                 } else if self.eat(Tok::Dot) {
                     Expr::Qualified(w, self.take_word()?)
                 } else {
@@ -954,14 +1076,26 @@ impl Parser {
             None => return Err(SqlError::new("42601", "unexpected end of input")),
         };
         loop {
-            if self.eat_word("is") { let not = self.eat_word("not"); self.word("null")?; e = Expr::IsNull(Box::new(e), not); } else if self.peek_word("in") || self.peek_word("between") || self.peek_word("like") || (self.peek_word("not") && self.t.get(self.p + 1).map(|t| matches!(t, Tok::Word(w) if w == "in" || w == "between" || w == "like")).unwrap_or(false)) { let not = self.eat_word("not"); if self.eat_word("in") { self.expect(Tok::L)?; let mut v = Vec::new(); loop { v.push(self.expr()?); if self.eat(Tok::R) { break; } self.expect(Tok::Comma)?; } e = Expr::In(Box::new(e), v, not); } else if self.eat_word("between") { let lo = self.expr()?; self.word("and")?; let hi = self.expr()?; e = Expr::Between(Box::new(e), Box::new(lo), Box::new(hi), not); } else { self.word("like")?; e = Expr::Like(Box::new(e), Box::new(self.primary()?), not); } } else { break; }
+            if self.eat_op("::") {
+                e = Expr::Cast(Box::new(e), self.ty()?);
+            } else if self.eat_word("is") { let not = self.eat_word("not"); self.word("null")?; e = Expr::IsNull(Box::new(e), not); } else if self.peek_word("in") || self.peek_word("between") || self.peek_word("like") || (self.peek_word("not") && self.t.get(self.p + 1).map(|t| matches!(t, Tok::Word(w) if w == "in" || w == "between" || w == "like")).unwrap_or(false)) { let not = self.eat_word("not"); if self.eat_word("in") { self.expect(Tok::L)?; let mut v = Vec::new(); loop { v.push(self.expr()?); if self.eat(Tok::R) { break; } self.expect(Tok::Comma)?; } e = Expr::In(Box::new(e), v, not); } else if self.eat_word("between") { let lo = self.expr()?; self.word("and")?; let hi = self.expr()?; e = Expr::Between(Box::new(e), Box::new(lo), Box::new(hi), not); } else { self.word("like")?; e = Expr::Like(Box::new(e), Box::new(self.primary()?), not); } } else { break; }
         }
         Ok(e)
     }
     fn case_expr(&mut self) -> std::result::Result<Expr, SqlError> {
         let mut b = Vec::new();
+        let base = if self.peek_word("when") {
+            None
+        } else {
+            Some(self.expr()?)
+        };
         while self.eat_word("when") {
-            let w = self.expr()?;
+            let condition = self.expr()?;
+            let w = if let Some(base) = &base {
+                Expr::Binary(Box::new(base.clone()), BinOp::Eq, Box::new(condition))
+            } else {
+                condition
+            };
             self.word("then")?;
             b.push((w, self.expr()?));
         }
@@ -987,6 +1121,8 @@ impl Parser {
                 "+" => (BinOp::Add, 4),
                 "-" => (BinOp::Sub, 4),
                 "||" => (BinOp::Concat, 4),
+                "->" => (BinOp::JsonGet, 4),
+                "->>" => (BinOp::JsonText, 4),
                 "*" => (BinOp::Mul, 5),
                 "/" => (BinOp::Div, 5),
                 _ => return None,
@@ -1025,6 +1161,14 @@ impl Parser {
             )),
         }
     }
+    fn relation_name(&mut self) -> std::result::Result<String, SqlError> {
+        let mut name = self.take_word()?;
+        while self.eat(Tok::Dot) {
+            name.push('.');
+            name.push_str(&self.take_word()?);
+        }
+        Ok(name)
+    }
     fn word(&mut self, w: &str) -> std::result::Result<(), SqlError> {
         if self.eat_word(w) {
             Ok(())
@@ -1052,6 +1196,9 @@ impl Parser {
     }
     fn peek_word(&self, w: &str) -> bool {
         matches!(self.peek(), Some(Tok::Word(x)) if x == w)
+    }
+    fn peek_word_not_clause(&self) -> bool {
+        matches!(self.peek(), Some(Tok::Word(x)) if !matches!(x.as_str(), "where" | "order" | "limit" | "offset" | "group" | "having" | "join" | "left" | "right" | "inner" | "on"))
     }
     fn expect_op(&mut self, op: &str) -> std::result::Result<(), SqlError> {
         if self.eat_op(op) {
@@ -1115,6 +1262,7 @@ pub struct SqlSession {
     settings: SessionSettings,
     prepared: HashMap<String, String>,
     sequencer: Arc<CommitSequencer>,
+    transaction_timestamp_us: Option<i64>,
 }
 impl SqlSession {
     pub fn settings(&self) -> &SessionSettings {
@@ -1258,7 +1406,9 @@ impl SqlSession {
     }
     fn start_txn(&mut self) -> std::result::Result<(), SqlError> {
         let snapshot = self.engine.committer.read_barrier().map_err(to_sql)?;
-        self.txn = Some(Transaction::begin(snapshot, self.engine.limits.clone()));
+        let transaction = Transaction::begin(snapshot, self.engine.limits.clone());
+        self.transaction_timestamp_us = Some(transaction.transaction_timestamp_us);
+        self.txn = Some(transaction);
         self.failed = false;
         Ok(())
     }
@@ -1274,6 +1424,7 @@ impl SqlSession {
             }
         }
         self.failed = false;
+        self.transaction_timestamp_us = None;
         Ok(())
     }
     fn rollback_internal(&mut self) {
@@ -1282,6 +1433,7 @@ impl SqlSession {
         }
         self.txn = None;
         self.failed = false;
+        self.transaction_timestamp_us = None;
     }
     fn tx(&mut self) -> std::result::Result<&mut Transaction, SqlError> {
         if self.failed {
@@ -1341,6 +1493,39 @@ impl SqlSession {
             ));
         }
         let snap = self.engine.committer.read_barrier().map_err(to_sql)?;
+        // IF [NOT] EXISTS branches are true no-ops.  They must not consume a
+        // catalog epoch or manufacture a fake schema command, because doing
+        // so would make two replicas disagree about whether a DDL statement
+        // changed logical state.
+        match &s {
+            Statement::CreateTable {
+                name,
+                if_not_exists: true,
+                ..
+            } if snap.catalog().table_by_name(relation_leaf(name)).is_some() => {
+                return Ok(QueryResult::command("CREATE TABLE", 0));
+            }
+            Statement::CreateIndex {
+                name,
+                if_not_exists: true,
+                ..
+            } if snap.catalog().index_by_name(relation_leaf(name)).is_some() => {
+                return Ok(QueryResult::command("CREATE INDEX", 0));
+            }
+            Statement::DropTable {
+                name,
+                if_exists: true,
+            } if snap.catalog().table_by_name(relation_leaf(name)).is_none() => {
+                return Ok(QueryResult::command("DROP TABLE", 0));
+            }
+            Statement::DropIndex {
+                name,
+                if_exists: true,
+            } if snap.catalog().index_by_name(relation_leaf(name)).is_none() => {
+                return Ok(QueryResult::command("DROP INDEX", 0));
+            }
+            _ => {}
+        }
         let (op, tag) = bind_ddl(s, &snap)?;
         let r = self
             .sequencer
@@ -1393,6 +1578,12 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.set_statement_time();
+        if q.from
+            .as_deref()
+            .is_some_and(|name| is_virtual_relation(name))
+        {
+            return self.select_virtual(tx, q, params);
+        }
         let table = q
             .from
             .as_ref()
@@ -1401,12 +1592,22 @@ impl SqlSession {
             .cloned();
         if let Some(table) = table {
             let mut rows = scan(tx, &table)?;
+            if !q.joins.is_empty() {
+                rows =
+                    self.join_rows(tx, &table, q.from_alias.as_deref(), rows, &q.joins, params)?;
+            }
             if let Some(w) = &q.selection {
                 rows.retain(|r| {
                     self.eval(w, &r.cells, params)
                         .map(|v| v.truthy() == Some(true))
                         .unwrap_or(false)
                 });
+            }
+            if !q.group_by.is_empty()
+                || q.projection.iter().any(has_aggregate)
+                || q.having.as_ref().is_some_and(has_aggregate)
+            {
+                return self.select_grouped(&table, rows, q, params);
             }
             for (e, desc) in q.order.iter().rev() {
                 rows.sort_by(|a, b| {
@@ -1482,6 +1683,278 @@ impl SqlSession {
             })
         }
     }
+
+    fn select_grouped(
+        &self,
+        table: &TableDescriptor,
+        rows: Vec<Row>,
+        q: Select,
+        params: &[Datum],
+    ) -> std::result::Result<QueryResult, SqlError> {
+        let mut groups: Vec<(Vec<Datum>, Vec<Row>)> = Vec::new();
+        for row in rows {
+            let key = q
+                .group_by
+                .iter()
+                .map(|expr| self.eval(expr, &row.cells, params))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if let Some((_, group)) = groups.iter_mut().find(|(old, _)| *old == key) {
+                group.push(row);
+            } else {
+                groups.push((key, vec![row]));
+            }
+        }
+        // An aggregate without GROUP BY still produces one row for an empty
+        // input (COUNT(*) = 0, other aggregates = NULL).
+        if groups.is_empty() && q.group_by.is_empty() {
+            groups.push((Vec::new(), Vec::new()));
+        }
+        let projection = if q.projection.len() == 1 && matches!(q.projection[0], Expr::Star) {
+            table
+                .columns
+                .iter()
+                .filter(|c| c.state == ColumnState::Live)
+                .map(|c| Expr::Column(c.name.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            q.projection
+        };
+        let columns = projection.iter().map(|e| result_column(e, table)).collect();
+        let mut out = Vec::new();
+        for (_, group) in groups {
+            if let Some(having) = &q.having {
+                if self.eval_group(having, &group, params)?.truthy() != Some(true) {
+                    continue;
+                }
+            }
+            let row = projection
+                .iter()
+                .map(|expr| self.eval_group(expr, &group, params))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if q.distinct && out.iter().any(|old: &Vec<Datum>| old == &row) {
+                continue;
+            }
+            out.push(row);
+        }
+        Ok(QueryResult {
+            affected_rows: out.len() as u64,
+            rows: out,
+            columns,
+            command_tag: "SELECT".into(),
+            notices: Vec::new(),
+        })
+    }
+
+    fn eval_group(
+        &self,
+        expr: &Expr,
+        group: &[Row],
+        params: &[Datum],
+    ) -> std::result::Result<Datum, SqlError> {
+        if let Expr::Func(name, args) = expr {
+            let n = name.to_ascii_lowercase();
+            if matches!(n.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+                return aggregate_value(self, &n, args, group, params);
+            }
+        }
+        match expr {
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("count") => {
+                aggregate_value(self, "count", args, group, params)
+            }
+            Expr::Func(_, _) if !has_aggregate(expr) => group
+                .first()
+                .map(|row| self.eval(expr, &row.cells, params))
+                .unwrap_or(Ok(Datum::Null)),
+            Expr::Column(_) | Expr::Qualified(_, _) | Expr::Param(_) | Expr::Literal(_) => group
+                .first()
+                .map(|row| self.eval(expr, &row.cells, params))
+                .unwrap_or(Ok(Datum::Null)),
+            Expr::Binary(a, op, b) => Ok(eval_binary(
+                &self.eval_group(a, group, params)?,
+                *op,
+                &self.eval_group(b, group, params)?,
+            )?),
+            Expr::Unary(op, x) => self.eval_group(x, group, params).map(|v| match op {
+                Unary::Not => v
+                    .as_bool()
+                    .map(|b| Datum::Boolean(!b))
+                    .unwrap_or(Datum::Null),
+                Unary::Neg => v
+                    .as_f64()
+                    .map(|x| Datum::Float64(-x))
+                    .unwrap_or(Datum::Null),
+            }),
+            Expr::IsNull(x, not) => Ok(Datum::Boolean(
+                self.eval_group(x, group, params)?.is_null() ^ *not,
+            )),
+            Expr::Case(branches, otherwise) => {
+                for (when, then) in branches {
+                    if self.eval_group(when, group, params)?.truthy() == Some(true) {
+                        return self.eval_group(then, group, params);
+                    }
+                }
+                self.eval_group(otherwise, group, params)
+            }
+            _ => Ok(Datum::Null),
+        }
+    }
+
+    fn join_rows(
+        &self,
+        tx: &Transaction,
+        base: &TableDescriptor,
+        base_alias: Option<&str>,
+        rows: Vec<Row>,
+        joins: &[JoinSpec],
+        params: &[Datum],
+    ) -> std::result::Result<Vec<Row>, SqlError> {
+        let mut current = rows;
+        for join in joins {
+            let right = find_table(tx.snapshot.catalog(), &join.relation)?.clone();
+            let right_rows = scan(tx, &right)?;
+            let mut next = Vec::new();
+            for left in current {
+                let mut matched = false;
+                for candidate in &right_rows {
+                    let mut cells = left.cells.clone();
+                    cells.extend(candidate.cells.iter().cloned().map(|mut cell| {
+                        cell.qualifier = Some(join.alias.as_deref().unwrap_or(&right.name).into());
+                        cell
+                    }));
+                    // Base rows carry their relation name for qualified ON
+                    // expressions; unqualified expressions still resolve as
+                    // PostgreSQL's binder would for this compact executor.
+                    for cell in &mut cells {
+                        if cell.qualifier.is_none() {
+                            cell.qualifier = Some(base_alias.unwrap_or(&base.name).to_string());
+                        }
+                    }
+                    if self.eval(&join.on, &cells, params)?.truthy() == Some(true) {
+                        matched = true;
+                        next.push(Row {
+                            key: left.key.clone(),
+                            row: left.row.clone(),
+                            cells,
+                        });
+                    }
+                }
+                if !matched && join.kind == JoinKind::Left {
+                    let mut cells = left.cells.clone();
+                    for column in right
+                        .columns
+                        .iter()
+                        .filter(|c| c.state == ColumnState::Live)
+                    {
+                        cells.push(Cell {
+                            name: column.name.clone(),
+                            qualifier: Some(join.alias.as_deref().unwrap_or(&right.name).into()),
+                            value: Datum::Null,
+                        });
+                    }
+                    for cell in &mut cells {
+                        if cell.qualifier.is_none() {
+                            cell.qualifier = Some(base_alias.unwrap_or(&base.name).to_string());
+                        }
+                    }
+                    next.push(Row {
+                        key: left.key,
+                        row: left.row,
+                        cells,
+                    });
+                }
+            }
+            current = next;
+        }
+        Ok(current)
+    }
+
+    fn select_virtual(
+        &self,
+        tx: &Transaction,
+        q: Select,
+        params: &[Datum],
+    ) -> std::result::Result<QueryResult, SqlError> {
+        let relation = q.from.as_deref().unwrap_or_default();
+        let (columns, values) =
+            virtual_relation(relation, tx.snapshot.catalog()).ok_or_else(|| {
+                SqlError::new("42P01", format!("relation \"{relation}\" does not exist"))
+            })?;
+        let table = virtual_table(relation, &columns);
+        let mut rows = values
+            .into_iter()
+            .map(|values| VirtualRow {
+                cells: columns
+                    .iter()
+                    .zip(values)
+                    .map(|((name, _), value)| Cell {
+                        name: name.clone(),
+                        qualifier: None,
+                        value,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        if let Some(w) = &q.selection {
+            rows.retain(|r| {
+                self.eval(w, &r.cells, params)
+                    .map(|v| v.truthy() == Some(true))
+                    .unwrap_or(false)
+            });
+        }
+        for (e, desc) in q.order.iter().rev() {
+            rows.sort_by(|a, b| {
+                let x = self.eval(e, &a.cells, params).unwrap_or(Datum::Null);
+                let y = self.eval(e, &b.cells, params).unwrap_or(Datum::Null);
+                let mut c = x.cmp(&y);
+                if x.is_null() || y.is_null() {
+                    c = if x.is_null() && y.is_null() {
+                        std::cmp::Ordering::Equal
+                    } else if x.is_null() {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    };
+                }
+                if *desc { c.reverse() } else { c }
+            });
+        }
+        let rows = rows
+            .into_iter()
+            .skip(q.offset)
+            .take(q.limit.unwrap_or(usize::MAX))
+            .collect::<Vec<_>>();
+        let projection = if q.projection.len() == 1 && matches!(q.projection[0], Expr::Star) {
+            table
+                .columns
+                .iter()
+                .map(|c| Expr::Column(c.name.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            q.projection
+        };
+        let result_columns = projection
+            .iter()
+            .map(|e| result_column(e, &table))
+            .collect();
+        let mut out = Vec::new();
+        for row in rows {
+            let projected = projection
+                .iter()
+                .map(|e| self.eval(e, &row.cells, params))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if q.distinct && out.iter().any(|old: &Vec<Datum>| old == &projected) {
+                continue;
+            }
+            out.push(projected);
+        }
+        Ok(QueryResult {
+            columns: result_columns,
+            affected_rows: out.len() as u64,
+            rows: out,
+            command_tag: "SELECT".into(),
+            notices: Vec::new(),
+        })
+    }
     fn insert(
         &mut self,
         q: Insert,
@@ -1555,8 +2028,119 @@ impl SqlSession {
             let row =
                 chorus_codec::EncodedRowV1::new(table.schema_version, fields).map_err(codec_sql)?;
             let key = key_for(tx, &table, &row, i as u32)?;
-            if tx.get(&key).is_some() {
+            let new_index_entries = index_entries(tx.snapshot.catalog(), &table, &row, &key)?;
+            let conflict_key = if tx.get(&key).is_some() {
+                Some(key.clone())
+            } else {
+                scan(tx, &table)?.into_iter().find_map(|candidate| {
+                    let candidate_indexes = index_entries(
+                        tx.snapshot.catalog(),
+                        &table,
+                        &candidate.row,
+                        &candidate.key,
+                    )
+                    .ok()?;
+                    if new_index_entries.iter().any(|(entry, unique)| {
+                        *unique
+                            && candidate_indexes
+                                .iter()
+                                .any(|(other, other_unique)| *other_unique && other == entry)
+                    }) {
+                        Some(candidate.key)
+                    } else {
+                        None
+                    }
+                })
+            };
+            if conflict_key.is_some()
+                || new_index_entries
+                    .iter()
+                    .any(|(entry, unique)| *unique && tx.get(entry).is_some())
+            {
                 if q.conflict_nothing {
+                    continue;
+                }
+                if !q.conflict_update.is_empty() {
+                    let existing_key = conflict_key
+                        .or_else(|| {
+                            new_index_entries.iter().find_map(|(entry, unique)| {
+                                (*unique && tx.get(entry).is_some()).then(|| key.clone())
+                            })
+                        })
+                        .ok_or_else(|| SqlError::new("23505", "conflict row disappeared"))?;
+                    let old_bytes = tx
+                        .get(&existing_key)
+                        .ok_or_else(|| SqlError::new("23505", "conflict row disappeared"))?;
+                    let old_row =
+                        chorus_codec::EncodedRowV1::decode(&old_bytes).map_err(codec_sql)?;
+                    let old_cells = cells(&table, &old_row);
+                    let mut eval_cells = old_cells.clone();
+                    eval_cells.extend(cells(&table, &row).into_iter().map(|mut cell| {
+                        cell.qualifier = Some("excluded".into());
+                        cell
+                    }));
+                    let mut replacement = old_row.clone();
+                    for (name, expression) in &q.conflict_update {
+                        let column = table
+                            .columns
+                            .iter()
+                            .find(|column| {
+                                column.name == *name && column.state == ColumnState::Live
+                            })
+                            .ok_or_else(|| {
+                                SqlError::new("42703", format!("column {name} does not exist"))
+                            })?;
+                        let value = coerce(
+                            self.eval(expression, &eval_cells, params)?,
+                            column.data_type,
+                        )?;
+                        if let Some(field) = replacement
+                            .fields
+                            .iter_mut()
+                            .find(|(id, _)| *id == column.id)
+                        {
+                            field.1 = value;
+                        } else {
+                            replacement.fields.push((column.id, value));
+                        }
+                    }
+                    replacement.fields.sort_by_key(|(id, _)| *id);
+                    tx.delete(existing_key.clone()).map_err(to_sql)?;
+                    for (entry, _) in
+                        index_entries(tx.snapshot.catalog(), &table, &old_row, &existing_key)?
+                    {
+                        tx.delete(entry).map_err(to_sql)?;
+                    }
+                    let replacement_key = if table.primary_key.is_none() {
+                        existing_key
+                    } else {
+                        key_for(tx, &table, &replacement, i as u32)?
+                    };
+                    let replacement_indexes = index_entries(
+                        tx.snapshot.catalog(),
+                        &table,
+                        &replacement,
+                        &replacement_key,
+                    )?;
+                    if tx.get(&replacement_key).is_some()
+                        || replacement_indexes
+                            .iter()
+                            .any(|(entry, unique)| *unique && tx.get(entry).is_some())
+                    {
+                        return Err(SqlError::new(
+                            "23505",
+                            "duplicate key value violates unique constraint",
+                        ));
+                    }
+                    tx.put(replacement_key, replacement.encode().map_err(codec_sql)?)
+                        .map_err(to_sql)?;
+                    for (entry, _) in replacement_indexes {
+                        tx.put(entry, Vec::new()).map_err(to_sql)?;
+                    }
+                    count += 1;
+                    if !q.returning.is_empty() {
+                        ret.push(self.returning(&q.returning, &table, &replacement, params)?);
+                    }
                     continue;
                 }
                 return Err(SqlError::new(
@@ -1564,8 +2148,11 @@ impl SqlSession {
                     "duplicate key value violates unique constraint",
                 ));
             }
-            tx.put(key, row.encode().map_err(codec_sql)?)
+            tx.put(key.clone(), row.encode().map_err(codec_sql)?)
                 .map_err(to_sql)?;
+            for (entry, _) in new_index_entries {
+                tx.put(entry, Vec::new()).map_err(to_sql)?;
+            }
             count += 1;
             if !q.returning.is_empty() {
                 ret.push(self.returning(&q.returning, &table, &row, params)?);
@@ -1628,10 +2215,41 @@ impl SqlSession {
                 }
             }
             row.fields.sort_by_key(|(id, _)| *id);
-            tx.delete(target.key).map_err(to_sql)?;
-            let new_key = key_for(tx, &table, &row, count as u32)?;
+            // Remove the old row and all of its index entries before checking
+            // the replacement.  This makes UPDATE of a unique key behave as
+            // PostgreSQL does when the value is unchanged.
+            tx.delete(target.key.clone()).map_err(to_sql)?;
+            for (entry, _) in
+                index_entries(tx.snapshot.catalog(), &table, &target.row, &target.key)?
+            {
+                tx.delete(entry).map_err(to_sql)?;
+            }
+            let new_key = if table.primary_key.is_none() {
+                target.key.clone()
+            } else {
+                key_for(tx, &table, &row, count as u32)?
+            };
+            if tx.get(&new_key).is_some() {
+                return Err(SqlError::new(
+                    "23505",
+                    "duplicate key value violates unique constraint",
+                ));
+            }
+            let new_indexes = index_entries(tx.snapshot.catalog(), &table, &row, &new_key)?;
+            if new_indexes
+                .iter()
+                .any(|(entry, unique)| *unique && tx.get(entry).is_some())
+            {
+                return Err(SqlError::new(
+                    "23505",
+                    "duplicate key value violates unique constraint",
+                ));
+            }
             tx.put(new_key, row.encode().map_err(codec_sql)?)
                 .map_err(to_sql)?;
+            for (entry, _) in new_indexes {
+                tx.put(entry, Vec::new()).map_err(to_sql)?;
+            }
             if !q.returning.is_empty() {
                 ret.push(self.returning(&q.returning, &table, &row, params)?);
             }
@@ -1682,7 +2300,12 @@ impl SqlSession {
             if !q.returning.is_empty() {
                 ret.push(self.returning(&q.returning, &table, &target.row, params)?);
             }
-            tx.delete(target.key).map_err(to_sql)?;
+            tx.delete(target.key.clone()).map_err(to_sql)?;
+            for (entry, _) in
+                index_entries(tx.snapshot.catalog(), &table, &target.row, &target.key)?
+            {
+                tx.delete(entry).map_err(to_sql)?;
+            }
             count += 1;
         }
         Ok(QueryResult {
@@ -1725,7 +2348,12 @@ impl SqlSession {
                 .find(|c| c.name == *n)
                 .map(|c| c.value.clone())
                 .ok_or_else(|| SqlError::new("42703", format!("column {n} does not exist"))),
-            Expr::Qualified(_, n) => self.eval(&Expr::Column(n.clone()), row, params),
+            Expr::Qualified(q, n) => row
+                .iter()
+                .find(|c| c.qualifier.as_deref() == Some(q.as_str()) && c.name == *n)
+                .or_else(|| row.iter().find(|c| c.name == *n))
+                .map(|c| c.value.clone())
+                .ok_or_else(|| SqlError::new("42703", format!("column {q}.{n} does not exist"))),
             Expr::Star => Err(SqlError::new("42601", "* is only valid in a SELECT list")),
             Expr::Unary(op, x) => {
                 let v = self.eval(x, row, params)?;
@@ -1804,7 +2432,7 @@ impl SqlSession {
                     like(&a, &b)
                 }))
             }
-            Expr::Cast(x, ty) => coerce(self.eval(x, row, params)?, *ty),
+            Expr::Cast(x, ty) => cast_value(self.eval(x, row, params)?, *ty),
             Expr::Case(bs, el) => {
                 for (w, t) in bs {
                     if self.eval(w, row, params)?.truthy() == Some(true) {
@@ -1825,7 +2453,10 @@ impl SqlSession {
     ) -> std::result::Result<Datum, SqlError> {
         let n = name.to_ascii_lowercase();
         if n == "now" || n == "transaction_timestamp" || n == "statement_timestamp" {
-            return Ok(Datum::Timestamp(chorus_common::unix_now_us()));
+            return Ok(Datum::Timestamp(
+                self.transaction_timestamp_us
+                    .unwrap_or_else(chorus_common::unix_now_us),
+            ));
         }
         if n == "version" {
             return Ok(Datum::Text(
@@ -1843,6 +2474,43 @@ impl SqlSession {
         }
         if n == "pg_backend_pid" {
             return Ok(Datum::Int32(std::process::id() as i32));
+        }
+        if n == "coalesce" {
+            for arg in args {
+                let value = self.eval(arg, row, params)?;
+                if !value.is_null() {
+                    return Ok(value);
+                }
+            }
+            return Ok(Datum::Null);
+        }
+        if n == "format_type" {
+            let value = args
+                .first()
+                .map(|arg| self.eval(arg, row, params))
+                .transpose()?
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default();
+            let name = match value as u32 {
+                16 => "boolean",
+                17 => "bytea",
+                20 => "bigint",
+                21 => "smallint",
+                23 => "integer",
+                25 => "text",
+                701 => "double precision",
+                1043 => "character varying",
+                1082 => "date",
+                1114 => "timestamp without time zone",
+                1184 => "timestamp with time zone",
+                2950 => "uuid",
+                3802 => "jsonb",
+                _ => "unknown",
+            };
+            return Ok(Datum::Text(name.into()));
+        }
+        if n == "pg_get_userbyid" {
+            return Ok(Datum::Text("app".into()));
         }
         if args.len() == 1 {
             let v = self.eval(&args[0], row, params)?;
@@ -1920,6 +2588,7 @@ impl Statement {
 #[derive(Clone)]
 struct Cell {
     name: String,
+    qualifier: Option<String>,
     value: Datum,
 }
 struct Row {
@@ -1927,9 +2596,441 @@ struct Row {
     row: chorus_codec::EncodedRowV1,
     cells: Vec<Cell>,
 }
+struct VirtualRow {
+    cells: Vec<Cell>,
+}
+
+fn is_virtual_relation(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pg_catalog.pg_namespace"
+            | "pg_catalog.pg_class"
+            | "pg_catalog.pg_attribute"
+            | "pg_catalog.pg_type"
+            | "pg_catalog.pg_index"
+            | "pg_catalog.pg_constraint"
+            | "pg_catalog.pg_database"
+            | "pg_catalog.pg_roles"
+            | "information_schema.tables"
+            | "information_schema.columns"
+    )
+}
+
+fn has_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Func(name, args) => {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "count" | "sum" | "avg" | "min" | "max"
+            ) || args.iter().any(has_aggregate)
+        }
+        Expr::Unary(_, x) | Expr::IsNull(x, _) | Expr::Cast(x, _) => has_aggregate(x),
+        Expr::Binary(a, _, b) => has_aggregate(a) || has_aggregate(b),
+        Expr::In(x, xs, _) => has_aggregate(x) || xs.iter().any(has_aggregate),
+        Expr::Between(x, lo, hi, _) => has_aggregate(x) || has_aggregate(lo) || has_aggregate(hi),
+        Expr::Like(x, p, _) => has_aggregate(x) || has_aggregate(p),
+        Expr::Case(branches, otherwise) => {
+            branches
+                .iter()
+                .any(|(when, then)| has_aggregate(when) || has_aggregate(then))
+                || has_aggregate(otherwise)
+        }
+        _ => false,
+    }
+}
+
+fn aggregate_value(
+    engine: &SqlSession,
+    name: &str,
+    args: &[Expr],
+    group: &[Row],
+    params: &[Datum],
+) -> std::result::Result<Datum, SqlError> {
+    if name == "count" {
+        if args.is_empty() || matches!(args.first(), Some(Expr::Star)) {
+            return Ok(Datum::Int64(group.len() as i64));
+        }
+        let mut count = 0i64;
+        for row in group {
+            if !engine.eval(&args[0], &row.cells, params)?.is_null() {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| SqlError::new("22003", "count out of range"))?;
+            }
+        }
+        return Ok(Datum::Int64(count));
+    }
+    let arg = args
+        .first()
+        .ok_or_else(|| SqlError::new("42803", "aggregate requires an argument"))?;
+    let mut values = Vec::new();
+    for row in group {
+        let value = engine.eval(arg, &row.cells, params)?;
+        if !value.is_null() {
+            values.push(value);
+        }
+    }
+    if values.is_empty() {
+        return Ok(Datum::Null);
+    }
+    match name {
+        "sum" => {
+            if values.iter().any(|v| matches!(v, Datum::Float64(_))) {
+                let mut total = 0.0;
+                for value in values {
+                    total += value
+                        .as_f64()
+                        .ok_or_else(|| SqlError::new("42803", "SUM argument is not numeric"))?;
+                }
+                Ok(Datum::Float64(total))
+            } else {
+                let mut total = 0i64;
+                for value in values {
+                    total =
+                        total
+                            .checked_add(value.as_i64().ok_or_else(|| {
+                                SqlError::new("42803", "SUM argument is not numeric")
+                            })?)
+                            .ok_or_else(|| SqlError::new("22003", "sum out of range"))?;
+                }
+                Ok(Datum::Int64(total))
+            }
+        }
+        "avg" => {
+            let total = values
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(f64::NAN))
+                .sum::<f64>();
+            Ok(Datum::Float64(total / values.len() as f64))
+        }
+        "min" => Ok(values.into_iter().min().unwrap_or(Datum::Null)),
+        "max" => Ok(values.into_iter().max().unwrap_or(Datum::Null)),
+        _ => Err(SqlError::unsupported("aggregate is not supported")),
+    }
+}
+
+fn virtual_table(name: &str, columns: &[(String, SqlType)]) -> TableDescriptor {
+    TableDescriptor {
+        oid: 0,
+        schema_oid: 0,
+        name: name.to_string(),
+        schema_version: 1,
+        columns: columns
+            .iter()
+            .enumerate()
+            .map(|(i, (name, data_type))| ColumnDescriptor {
+                id: i as u32 + 1,
+                name: name.clone(),
+                data_type: *data_type,
+                nullable: true,
+                default: None,
+                state: ColumnState::Live,
+            })
+            .collect(),
+        primary_key: None,
+        secondary_indexes: Vec::new(),
+        row_count: 0,
+        state: ObjectState::Live,
+    }
+}
+
+fn virtual_relation(
+    name: &str,
+    catalog: &Catalog,
+) -> Option<(Vec<(String, SqlType)>, Vec<Vec<Datum>>)> {
+    let name = name.to_ascii_lowercase();
+    let i32t = SqlType::Integer;
+    let text = SqlType::Text;
+    let boolt = SqlType::Boolean;
+    let f64t = SqlType::Double;
+    let i16t = SqlType::SmallInt;
+    match name.as_str() {
+        "pg_catalog.pg_namespace" => Some((
+            vec![
+                ("oid".into(), i32t),
+                ("nspname".into(), text),
+                ("nspowner".into(), i32t),
+            ],
+            vec![
+                vec![
+                    Datum::Int32(11),
+                    Datum::Text("pg_catalog".into()),
+                    Datum::Int32(10),
+                ],
+                vec![
+                    Datum::Int32(2200),
+                    Datum::Text("public".into()),
+                    Datum::Int32(10),
+                ],
+            ],
+        )),
+        "pg_catalog.pg_class" => {
+            let mut rows = Vec::new();
+            for table in catalog
+                .tables
+                .values()
+                .filter(|t| t.state == ObjectState::Live)
+            {
+                rows.push(vec![
+                    Datum::Int32(table.oid as i32),
+                    Datum::Text(table.name.clone()),
+                    Datum::Int32(table.schema_oid as i32),
+                    Datum::Text("r".into()),
+                    Datum::Int16(
+                        table
+                            .columns
+                            .iter()
+                            .filter(|c| c.state == ColumnState::Live)
+                            .count() as i16,
+                    ),
+                    Datum::Boolean(!table.secondary_indexes.is_empty()),
+                    Datum::Float64(table.row_count as f64),
+                    Datum::Int32(10),
+                    Datum::Text("p".into()),
+                ]);
+            }
+            for index in catalog
+                .indexes
+                .values()
+                .filter(|i| i.state == ObjectState::Live)
+            {
+                rows.push(vec![
+                    Datum::Int32(index.oid as i32),
+                    Datum::Text(index.name.clone()),
+                    Datum::Int32(2200),
+                    Datum::Text("i".into()),
+                    Datum::Int16(0),
+                    Datum::Boolean(false),
+                    Datum::Float64(0.0),
+                    Datum::Int32(10),
+                    Datum::Text("p".into()),
+                ]);
+            }
+            Some((
+                vec![
+                    ("oid".into(), i32t),
+                    ("relname".into(), text),
+                    ("relnamespace".into(), i32t),
+                    ("relkind".into(), text),
+                    ("relnatts".into(), i16t),
+                    ("relhasindex".into(), boolt),
+                    ("reltuples".into(), f64t),
+                    ("relowner".into(), i32t),
+                    ("relpersistence".into(), text),
+                ],
+                rows,
+            ))
+        }
+        "pg_catalog.pg_attribute" => {
+            let mut rows = Vec::new();
+            for table in catalog
+                .tables
+                .values()
+                .filter(|t| t.state == ObjectState::Live)
+            {
+                for (n, column) in table
+                    .columns
+                    .iter()
+                    .filter(|c| c.state == ColumnState::Live)
+                    .enumerate()
+                {
+                    rows.push(vec![
+                        Datum::Int32(table.oid as i32),
+                        Datum::Text(column.name.clone()),
+                        Datum::Int32(column.data_type.oid() as i32),
+                        Datum::Int16((n + 1) as i16),
+                        Datum::Boolean(!column.nullable),
+                        Datum::Boolean(false),
+                    ]);
+                }
+            }
+            Some((
+                vec![
+                    ("attrelid".into(), i32t),
+                    ("attname".into(), text),
+                    ("atttypid".into(), i32t),
+                    ("attnum".into(), i16t),
+                    ("attnotnull".into(), boolt),
+                    ("attisdropped".into(), boolt),
+                ],
+                rows,
+            ))
+        }
+        "pg_catalog.pg_type" => {
+            let types = [
+                ("bool", 16),
+                ("bytea", 17),
+                ("int8", 20),
+                ("int2", 21),
+                ("int4", 23),
+                ("text", 25),
+                ("float8", 701),
+                ("varchar", 1043),
+                ("date", 1082),
+                ("timestamp", 1114),
+                ("timestamptz", 1184),
+                ("uuid", 2950),
+                ("jsonb", 3802),
+            ];
+            Some((
+                vec![
+                    ("oid".into(), i32t),
+                    ("typname".into(), text),
+                    ("typnamespace".into(), i32t),
+                    ("typtype".into(), text),
+                    ("typrelid".into(), i32t),
+                ],
+                types
+                    .into_iter()
+                    .map(|(n, oid)| {
+                        vec![
+                            Datum::Int32(oid),
+                            Datum::Text(n.into()),
+                            Datum::Int32(11),
+                            Datum::Text("b".into()),
+                            Datum::Int32(0),
+                        ]
+                    })
+                    .collect(),
+            ))
+        }
+        "pg_catalog.pg_index" => Some((
+            vec![
+                ("indexrelid".into(), i32t),
+                ("indrelid".into(), i32t),
+                ("indisunique".into(), boolt),
+                ("indkey".into(), text),
+            ],
+            catalog
+                .indexes
+                .values()
+                .filter(|i| i.state == ObjectState::Live)
+                .map(|i| {
+                    vec![
+                        Datum::Int32(i.oid as i32),
+                        Datum::Int32(i.table_oid as i32),
+                        Datum::Boolean(i.unique),
+                        Datum::Text(
+                            i.columns
+                                .iter()
+                                .map(|c| c.column_id.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
+                    ]
+                })
+                .collect(),
+        )),
+        "pg_catalog.pg_constraint" => Some((
+            vec![
+                ("oid".into(), i32t),
+                ("conname".into(), text),
+                ("conrelid".into(), i32t),
+                ("contype".into(), text),
+            ],
+            catalog
+                .tables
+                .values()
+                .filter(|t| t.state == ObjectState::Live && t.primary_key.is_some())
+                .map(|t| {
+                    vec![
+                        Datum::Int32((t.oid + 1_000_000) as i32),
+                        Datum::Text(format!("{}_pkey", t.name)),
+                        Datum::Int32(t.oid as i32),
+                        Datum::Text("p".into()),
+                    ]
+                })
+                .collect(),
+        )),
+        "pg_catalog.pg_database" => Some((
+            vec![
+                ("oid".into(), i32t),
+                ("datname".into(), text),
+                ("datallowconn".into(), boolt),
+            ],
+            vec![vec![
+                Datum::Int32(1),
+                Datum::Text("app".into()),
+                Datum::Boolean(true),
+            ]],
+        )),
+        "pg_catalog.pg_roles" => Some((
+            vec![
+                ("oid".into(), i32t),
+                ("rolname".into(), text),
+                ("rolsuper".into(), boolt),
+            ],
+            vec![vec![
+                Datum::Int32(10),
+                Datum::Text("app".into()),
+                Datum::Boolean(true),
+            ]],
+        )),
+        "information_schema.tables" => Some((
+            vec![
+                ("table_schema".into(), text),
+                ("table_name".into(), text),
+                ("table_type".into(), text),
+            ],
+            catalog
+                .tables
+                .values()
+                .filter(|t| t.state == ObjectState::Live)
+                .map(|t| {
+                    vec![
+                        Datum::Text("public".into()),
+                        Datum::Text(t.name.clone()),
+                        Datum::Text("BASE TABLE".into()),
+                    ]
+                })
+                .collect(),
+        )),
+        "information_schema.columns" => {
+            let mut rows = Vec::new();
+            for table in catalog
+                .tables
+                .values()
+                .filter(|t| t.state == ObjectState::Live)
+            {
+                for (n, column) in table
+                    .columns
+                    .iter()
+                    .filter(|c| c.state == ColumnState::Live)
+                    .enumerate()
+                {
+                    rows.push(vec![
+                        Datum::Text("public".into()),
+                        Datum::Text(table.name.clone()),
+                        Datum::Text(column.name.clone()),
+                        Datum::Int32((n + 1) as i32),
+                        Datum::Text(if column.nullable { "YES" } else { "NO" }.into()),
+                        Datum::Text(column.data_type.name().into()),
+                    ]);
+                }
+            }
+            Some((
+                vec![
+                    ("table_schema".into(), text),
+                    ("table_name".into(), text),
+                    ("column_name".into(), text),
+                    ("ordinal_position".into(), i32t),
+                    ("is_nullable".into(), text),
+                    ("data_type".into(), text),
+                ],
+                rows,
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn find_table<'a>(c: &'a Catalog, n: &str) -> std::result::Result<&'a TableDescriptor, SqlError> {
-    c.table_by_name(n)
+    let name = relation_leaf(n);
+    c.table_by_name(name)
         .ok_or_else(|| SqlError::new("42P01", format!("relation \"{n}\" does not exist")))
+}
+fn relation_leaf(n: &str) -> &str {
+    n.rsplit_once('.').map(|(_, leaf)| leaf).unwrap_or(n)
 }
 fn dummy_table() -> &'static TableDescriptor {
     Box::leak(Box::new(TableDescriptor {
@@ -1950,6 +3051,7 @@ fn cells(t: &TableDescriptor, r: &chorus_codec::EncodedRowV1) -> Vec<Cell> {
         .filter(|c| c.state == ColumnState::Live)
         .map(|c| Cell {
             name: c.name.clone(),
+            qualifier: None,
             value: r
                 .get(c.id)
                 .cloned()
@@ -2001,6 +3103,46 @@ fn key_for(
     }
     Ok(out)
 }
+
+/// Return physical secondary-index mutations for a row.  The boolean marks a
+/// key that must be unique; NULL-containing unique keys deliberately retain a
+/// row suffix so PostgreSQL's ordinary "NULLs are distinct" behavior is
+/// preserved.
+fn index_entries(
+    catalog: &Catalog,
+    table: &TableDescriptor,
+    row: &chorus_codec::EncodedRowV1,
+    row_key: &[u8],
+) -> std::result::Result<Vec<(Vec<u8>, bool)>, SqlError> {
+    let mut out = Vec::new();
+    for index_id in &table.secondary_indexes {
+        let Some(index) = catalog.indexes.get(index_id) else {
+            continue;
+        };
+        if index.state != ObjectState::Live {
+            continue;
+        }
+        let values = index
+            .columns
+            .iter()
+            .map(|c| row.get(c.column_id).cloned().unwrap_or(Datum::Null))
+            .collect::<Vec<_>>();
+        let directions = index
+            .columns
+            .iter()
+            .map(|c| c.descending)
+            .collect::<Vec<_>>();
+        let encoded = encode_composite(&values, &directions).map_err(codec_sql)?;
+        let has_null = values.iter().any(Datum::is_null);
+        let unique = index.unique && !has_null;
+        let key = chorus_codec::PhysicalKey::index(index.oid, &encoded, row_key, unique)
+            .map_err(codec_sql)?
+            .0;
+        out.push((key, unique));
+    }
+    Ok(out)
+}
+
 fn result_column(e: &Expr, t: &TableDescriptor) -> ResultColumn {
     match e {
         Expr::Column(n) | Expr::Qualified(_, n) => t
@@ -2092,6 +3234,72 @@ fn coerce(v: Datum, ty: SqlType) -> std::result::Result<Datum, SqlError> {
         )),
     }
 }
+
+fn cast_value(v: Datum, ty: SqlType) -> std::result::Result<Datum, SqlError> {
+    if v.is_null() {
+        return Ok(v);
+    }
+    if let Ok(value) = coerce(v.clone(), ty) {
+        return Ok(value);
+    }
+    match (v, ty) {
+        (Datum::Text(text), SqlType::SmallInt) => text
+            .trim()
+            .parse::<i16>()
+            .map(Datum::Int16)
+            .map_err(|_| SqlError::new("22P02", "invalid input syntax for smallint")),
+        (Datum::Text(text), SqlType::Integer) => text
+            .trim()
+            .parse::<i32>()
+            .map(Datum::Int32)
+            .map_err(|_| SqlError::new("22P02", "invalid input syntax for integer")),
+        (Datum::Text(text), SqlType::BigInt) => text
+            .trim()
+            .parse::<i64>()
+            .map(Datum::Int64)
+            .map_err(|_| SqlError::new("22P02", "invalid input syntax for bigint")),
+        (Datum::Text(text), SqlType::Double) => text
+            .trim()
+            .parse::<f64>()
+            .map(Datum::Float64)
+            .map_err(|_| SqlError::new("22P02", "invalid input syntax for double precision")),
+        (Datum::Text(text), SqlType::Boolean) => text
+            .trim()
+            .parse::<bool>()
+            .map(Datum::Boolean)
+            .map_err(|_| SqlError::new("22P02", "invalid input syntax for boolean")),
+        (Datum::Text(text), SqlType::Jsonb) => chorus_common::Datum::canonical_json(&text)
+            .map(Datum::Jsonb)
+            .map_err(|e| SqlError::new("22P02", e.message)),
+        (Datum::Text(text), SqlType::Uuid) => parse_uuid_text(&text)
+            .map(Datum::Uuid)
+            .ok_or_else(|| SqlError::new("22P02", "invalid input syntax for uuid")),
+        (Datum::Jsonb(json), SqlType::Text) => Ok(Datum::Text(json)),
+        (Datum::Bytes(bytes), SqlType::Text) => String::from_utf8(bytes)
+            .map(Datum::Text)
+            .map_err(|_| SqlError::new("22021", "invalid byte sequence for UTF-8")),
+        (value, ty) => Err(SqlError::new(
+            "42846",
+            format!(
+                "cannot cast {} to {}",
+                value.sql_type().map(SqlType::name).unwrap_or("unknown"),
+                ty.name()
+            ),
+        )),
+    }
+}
+
+fn parse_uuid_text(text: &str) -> Option<[u8; 16]> {
+    let clean = text.trim().replace('-', "");
+    if clean.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
 fn eval_binary(a: &Datum, op: BinOp, b: &Datum) -> std::result::Result<Datum, SqlError> {
     use BinOp::*;
     if matches!(op, And | Or) {
@@ -2134,6 +3342,34 @@ fn eval_binary(a: &Datum, op: BinOp, b: &Datum) -> std::result::Result<Datum, Sq
             a.display_text(),
             b.display_text()
         ))),
+        JsonGet | JsonText => {
+            let Datum::Jsonb(json) = a else {
+                return Err(SqlError::new("42883", "json operator requires jsonb"));
+            };
+            let value: serde_json::Value = serde_json::from_str(json)
+                .map_err(|_| SqlError::new("22P02", "invalid jsonb value"))?;
+            let selected = match b {
+                Datum::Text(key) => value.get(key),
+                Datum::Int16(index) => value.get((*index).max(0) as usize),
+                Datum::Int32(index) => value.get((*index).max(0) as usize),
+                Datum::Int64(index) => value.get((*index).max(0) as usize),
+                _ => None,
+            };
+            let Some(selected) = selected else {
+                return Ok(Datum::Null);
+            };
+            if matches!(op, JsonText) {
+                Ok(Datum::Text(match selected {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => selected.to_string(),
+                }))
+            } else {
+                Ok(Datum::Jsonb(
+                    chorus_common::Datum::canonical_json(&selected.to_string())
+                        .map_err(|e| SqlError::new("22P02", e.message))?,
+                ))
+            }
+        }
         Add | Sub | Mul | Div => {
             if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
                 let z = match op {
@@ -2192,7 +3428,13 @@ fn set_setting(s: &mut SessionSettings, n: &str, raw: &str) -> std::result::Resu
     let n = n.to_ascii_lowercase();
     let v = raw.trim().trim_matches('\'').trim_matches('"');
     match n.as_str() {
-        "application_name" => s.application_name = v.into(),
+        "application_name" => {
+            if v.eq_ignore_ascii_case("default") {
+                s.application_name.clear();
+            } else {
+                s.application_name = v.into();
+            }
+        }
         "search_path" if v == "public" || v == "public, pg_catalog" => s.search_path = v.into(),
         "client_encoding" if v.eq_ignore_ascii_case("utf8") || v.eq_ignore_ascii_case("utf-8") => {
             s.client_encoding = "UTF8".into()
@@ -2200,6 +3442,12 @@ fn set_setting(s: &mut SessionSettings, n: &str, raw: &str) -> std::result::Resu
         "timezone" if v.eq_ignore_ascii_case("utc") => s.timezone = "UTC".into(),
         "datestyle" if v.to_ascii_uppercase().starts_with("ISO") => s.datestyle = v.into(),
         "transaction_isolation" => s.transaction_isolation = "serializable".into(),
+        "transaction" => {
+            s.transaction_isolation = "serializable".into();
+            if v.to_ascii_lowercase().contains("read only") {
+                s.transaction_read_only = true;
+            }
+        }
         "transaction_read_only" => {
             s.transaction_read_only = v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true")
         }
@@ -2245,6 +3493,7 @@ fn bind_ddl(
             columns,
             primary_key,
         } => {
+            let name = relation_leaf(&name).to_string();
             if let Some(t) = c.table_by_name(&name) {
                 if if_not_exists {
                     return Ok((
@@ -2285,26 +3534,30 @@ fn bind_ddl(
                 "CREATE TABLE".into(),
             ))
         }
-        Statement::DropTable { name, if_exists } => match c.table_by_name(&name) {
-            Some(t) => Ok((
-                SchemaOperationV1::DropTable {
-                    table_id: t.oid,
-                    expected_version: t.schema_version,
-                },
-                "DROP TABLE".into(),
-            )),
-            None if if_exists => Ok((
-                SchemaOperationV1::DropTable {
-                    table_id: 0,
-                    expected_version: 0,
-                },
-                "DROP TABLE".into(),
-            )),
-            None => Err(SqlError::new("42P01", "table does not exist")),
-        },
+        Statement::DropTable { name, if_exists } => {
+            let name = relation_leaf(&name);
+            match c.table_by_name(name) {
+                Some(t) => Ok((
+                    SchemaOperationV1::DropTable {
+                        table_id: t.oid,
+                        expected_version: t.schema_version,
+                    },
+                    "DROP TABLE".into(),
+                )),
+                None if if_exists => Ok((
+                    SchemaOperationV1::DropTable {
+                        table_id: 0,
+                        expected_version: 0,
+                    },
+                    "DROP TABLE".into(),
+                )),
+                None => Err(SqlError::new("42P01", "table does not exist")),
+            }
+        }
         Statement::AlterTable { table, op } => {
+            let table = relation_leaf(&table);
             let t = c
-                .table_by_name(&table)
+                .table_by_name(table)
                 .ok_or_else(|| SqlError::new("42P01", "table does not exist"))?;
             let operation = match op {
                 AlterOp::Add(x) => SchemaOperationV1::AddColumn {
@@ -2356,6 +3609,8 @@ fn bind_ddl(
             if_not_exists,
             columns,
         } => {
+            let name = relation_leaf(&name).to_string();
+            let table = relation_leaf(&table).to_string();
             if let Some(i) = c.index_by_name(&name) {
                 if if_not_exists {
                     return Ok((
@@ -2398,28 +3653,31 @@ fn bind_ddl(
                 .into(),
             ))
         }
-        Statement::DropIndex { name, if_exists } => match c.index_by_name(&name) {
-            Some(i) => {
-                let t = c
-                    .table(i.table_oid)
-                    .ok_or_else(|| SqlError::new("42P01", "table does not exist"))?;
-                Ok((
+        Statement::DropIndex { name, if_exists } => {
+            let name = relation_leaf(&name);
+            match c.index_by_name(name) {
+                Some(i) => {
+                    let t = c
+                        .table(i.table_oid)
+                        .ok_or_else(|| SqlError::new("42P01", "table does not exist"))?;
+                    Ok((
+                        SchemaOperationV1::DropIndex {
+                            index_id: i.oid,
+                            expected_table_version: t.schema_version,
+                        },
+                        "DROP INDEX".into(),
+                    ))
+                }
+                None if if_exists => Ok((
                     SchemaOperationV1::DropIndex {
-                        index_id: i.oid,
-                        expected_table_version: t.schema_version,
+                        index_id: 0,
+                        expected_table_version: 0,
                     },
                     "DROP INDEX".into(),
-                ))
+                )),
+                None => Err(SqlError::new("42704", "index does not exist")),
             }
-            None if if_exists => Ok((
-                SchemaOperationV1::DropIndex {
-                    index_id: 0,
-                    expected_table_version: 0,
-                },
-                "DROP INDEX".into(),
-            )),
-            None => Err(SqlError::new("42704", "index does not exist")),
-        },
+        }
         _ => Err(SqlError::unsupported("not a schema statement")),
     }
 }
@@ -2452,5 +3710,168 @@ mod tests {
     fn parser_values() {
         let x = Parser::batch("SELECT 1 + 2").unwrap();
         assert_eq!(x.len(), 1);
+    }
+
+    #[test]
+    fn secondary_unique_index_and_virtual_catalog() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(7);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
+        let engine = SqlEngine::new(store.clone(), committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE accounts (id integer primary key, email text);",
+                &[],
+            )
+            .unwrap();
+        session
+            .execute(
+                "CREATE UNIQUE INDEX accounts_email_idx ON accounts (email);",
+                &[],
+            )
+            .unwrap();
+        session
+            .execute("INSERT INTO accounts VALUES (1, 'a@example.com');", &[])
+            .unwrap();
+        let duplicate = session.execute("INSERT INTO accounts VALUES (2, 'a@example.com');", &[]);
+        assert_eq!(duplicate.unwrap_err().code, "23505");
+        session
+            .execute("INSERT INTO accounts VALUES (2, NULL);", &[])
+            .unwrap();
+        session
+            .execute("DELETE FROM accounts WHERE id = 1;", &[])
+            .unwrap();
+        let catalog = session
+            .execute(
+                "SELECT relname FROM pg_catalog.pg_class WHERE relname = 'accounts';",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(catalog.rows, vec![vec![Datum::Text("accounts".into())]]);
+        let columns = session
+            .execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'accounts' ORDER BY ordinal_position;",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(columns.rows.len(), 2);
+    }
+
+    #[test]
+    fn grouped_aggregates() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(8);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE events (id integer primary key, kind text, value integer);",
+                &[],
+            )
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO events VALUES (1,'a',2),(2,'a',4),(3,'b',8);",
+                &[],
+            )
+            .unwrap();
+        let grouped = session
+            .execute(
+                "SELECT kind, count(*), sum(value), avg(value) FROM events GROUP BY kind ORDER BY kind;",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(grouped.rows.len(), 2);
+        assert_eq!(grouped.rows[0][1], Datum::Int64(2));
+        assert_eq!(grouped.rows[0][2], Datum::Int64(6));
+    }
+
+    #[test]
+    fn inner_and_left_join() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(9);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE parents (id integer primary key, name text);",
+                &[],
+            )
+            .unwrap();
+        session
+            .execute(
+                "CREATE TABLE children (id integer primary key, parent_id integer);",
+                &[],
+            )
+            .unwrap();
+        session
+            .execute("INSERT INTO parents VALUES (1,'one'),(2,'two');", &[])
+            .unwrap();
+        session
+            .execute("INSERT INTO children VALUES (10,1);", &[])
+            .unwrap();
+        let result = session
+            .execute(
+                "SELECT p.id, c.id FROM parents AS p LEFT JOIN children AS c ON p.id = c.parent_id ORDER BY p.id;",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][1], Datum::Int32(10));
+        assert!(result.rows[1][1].is_null());
+    }
+
+    #[test]
+    fn on_conflict_update_uses_excluded_row() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(10);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE counters (id integer primary key, value integer);",
+                &[],
+            )
+            .unwrap();
+        session
+            .execute("INSERT INTO counters VALUES (1, 2);", &[])
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO counters VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET value = excluded.value;",
+                &[],
+            )
+            .unwrap();
+        let result = session
+            .execute("SELECT value FROM counters WHERE id = 1;", &[])
+            .unwrap();
+        assert_eq!(result.rows, vec![vec![Datum::Int32(7)]]);
+    }
+
+    #[test]
+    fn casts_json_and_coalesce() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(11);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        let result = session
+            .execute(
+                "SELECT ('7'::integer) + 1, '{\"answer\":42}'::jsonb ->> 'answer', coalesce(NULL, 'ok');",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(result.rows[0][0], Datum::Int64(8));
+        assert_eq!(result.rows[0][1], Datum::Text("42".into()));
+        assert_eq!(result.rows[0][2], Datum::Text("ok".into()));
     }
 }

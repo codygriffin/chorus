@@ -71,6 +71,12 @@ pub struct Config {
     /// signature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_manifest: Option<BootstrapManifestSignature>,
+    /// In-memory proof that `bootstrap_manifest` was verified against an
+    /// external trust key and its immutable installation binding. This is
+    /// deliberately never serialized: parsing a configuration must not be
+    /// able to manufacture authorization to open durable state.
+    #[serde(skip)]
+    verified_bootstrap_manifest: Option<VerifiedOpenRaftManifest>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -273,6 +279,7 @@ impl Config {
                 tls_leaf_sha256: None,
             }],
             bootstrap_manifest: None,
+            verified_bootstrap_manifest: None,
         }
     }
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -285,7 +292,9 @@ impl Config {
             )));
         }
         let text = fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
-        parse_config_text(&text)
+        let config = parse_config_text(&text)?;
+        ensure_ordinary_config_is_unbound(&config)?;
+        Ok(config)
     }
 
     /// Load, verify, and immutably bind the authenticated OpenRaft bootstrap
@@ -303,9 +312,10 @@ impl Config {
         let text = std::str::from_utf8(&bytes).map_err(|error| {
             ConfigError::Parse(format!("signed configuration is not UTF-8: {error}"))
         })?;
-        let config = parse_config_text(text)?;
+        let mut config = parse_config_text(text)?;
         let verified = config.verify_openraft_manifest(trust_key_path)?;
         ensure_manifest_binding(&config, &verified)?;
+        config.verified_bootstrap_manifest = Some(verified);
         Ok(config)
     }
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
@@ -829,6 +839,7 @@ pub fn status(
 }
 pub fn open_store(config: &Config) -> Result<FileStateStore, ConfigError> {
     config.validate()?;
+    ensure_manifest_authorizes_state_access(config)?;
     ensure_private_dir(&config.data_dir)?;
     ensure_installation_identity(config)?;
     let state_path = config.state_path();
@@ -1180,6 +1191,42 @@ fn validate_bounded_file_metadata(
         }
     }
     Ok(())
+}
+
+fn ensure_ordinary_config_is_unbound(config: &Config) -> Result<(), ConfigError> {
+    if config.bootstrap_manifest.is_some() {
+        return Err(ConfigError::Invalid(
+            "signed OpenRaft configuration requires Config::load_openraft_signed and an external trust key"
+                .into(),
+        ));
+    }
+    let binding_path = config.data_dir.join(MANIFEST_BINDING_FILE_NAME);
+    match fs::symlink_metadata(&binding_path) {
+        Ok(_) => Err(ConfigError::Invalid(
+            "unsigned configuration cannot open an installation with a bootstrap manifest binding"
+                .into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ConfigError::Io(format!(
+            "could not inspect bootstrap manifest binding: {error}"
+        ))),
+    }
+}
+
+fn ensure_manifest_authorizes_state_access(config: &Config) -> Result<(), ConfigError> {
+    match (
+        config.bootstrap_manifest.as_ref(),
+        config.verified_bootstrap_manifest.as_ref(),
+    ) {
+        (Some(_), Some(verified)) => ensure_manifest_binding(config, verified),
+        (Some(_), None) => Err(ConfigError::Invalid(
+            "signed OpenRaft configuration was not verified with an external trust key".into(),
+        )),
+        (None, Some(_)) => Err(ConfigError::Invalid(
+            "verified bootstrap manifest capability does not match the configuration".into(),
+        )),
+        (None, None) => ensure_ordinary_config_is_unbound(config),
+    }
 }
 
 fn ensure_manifest_binding(
@@ -2071,6 +2118,58 @@ mod tests {
         assert!(!config.identity_path().exists());
         assert!(!config.data_dir.join("raft.redb").exists());
         assert!(!config.state_path().exists());
+    }
+
+    #[test]
+    fn signed_manifest_cannot_downgrade_to_ordinary_load_or_state_access() {
+        let directory = TestDirectory::new("signed-manifest-downgrade");
+        let (config, config_path, trust_key_path, _) = signed_config(&directory, 18);
+
+        let error = Config::load(&config_path).unwrap_err();
+        assert!(error.to_string().contains("load_openraft_signed"));
+        let error = match open_store(&config) {
+            Ok(_) => panic!("unverified signed configuration opened durable state"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("was not verified"));
+        assert!(!config.data_dir.exists());
+
+        let verified = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap();
+        let binding_path = verified.data_dir.join(MANIFEST_BINDING_FILE_NAME);
+        let binding_before = fs::read(&binding_path).unwrap();
+        drop(open_store(&verified).unwrap());
+        let identity_before = fs::read(verified.identity_path()).unwrap();
+        let state_before = fs::read(verified.state_path()).unwrap();
+
+        let mut stripped = verified;
+        stripped.bootstrap_manifest = None;
+        stripped.verified_bootstrap_manifest = None;
+        stripped.save(&config_path).unwrap();
+
+        let error = Config::load(&config_path).unwrap_err();
+        assert!(error.to_string().contains("manifest binding"));
+        let error = match open_store(&stripped) {
+            Ok(_) => panic!("unsigned configuration opened manifest-bound state"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("manifest binding"));
+        assert_eq!(binding_before, fs::read(binding_path).unwrap());
+        assert_eq!(identity_before, fs::read(stripped.identity_path()).unwrap());
+        assert_eq!(state_before, fs::read(stripped.state_path()).unwrap());
+    }
+
+    #[test]
+    fn ordinary_unbound_configuration_still_loads_and_opens_state() {
+        let directory = TestDirectory::new("ordinary-config-unbound");
+        let config_path = directory.path().join("chorus.toml");
+        let config = Config::defaults(directory.path().join("data"), 1);
+        config.save(&config_path).unwrap();
+
+        let loaded = Config::load(&config_path).unwrap();
+        drop(open_store(&loaded).unwrap());
+        assert!(loaded.identity_path().exists());
+        assert!(loaded.state_path().exists());
+        assert!(!loaded.data_dir.join(MANIFEST_BINDING_FILE_NAME).exists());
     }
 
     #[test]

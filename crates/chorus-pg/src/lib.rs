@@ -9,11 +9,12 @@ use chorus_common::{Datum, POSTGRES_EPOCH_UNIX_SECS, SqlError, SqlType};
 use chorus_sql::{QueryResult, ResultColumn, SqlEngine, SqlSession};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener};
-use std::os::unix::net::UnixListener;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 // Keep wire limits deliberately conservative.  PostgreSQL's protocol uses a
 // signed 32-bit length, but accepting multi-gigabyte frames is an easy denial
@@ -76,60 +77,225 @@ pub struct PgServer {
     engine: Arc<SqlEngine>,
     config: PgConfig,
 }
+
+const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// A server-owned handle for PostgreSQL listeners and their connection
+/// workers. It lets an embedding process bind/report readiness first, then
+/// request a bounded drain and deterministic listener cleanup.
+pub struct PgServerHandle {
+    shutdown: Arc<AtomicBool>,
+    active: Arc<AtomicUsize>,
+    manager: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
+    tcp_addr: Option<SocketAddr>,
+    unix_socket: Option<std::path::PathBuf>,
+}
+
+impl PgServerHandle {
+    /// Request listener shutdown. Existing sessions are allowed to drain until
+    /// the configured deadline; the manager then closes their sockets.
+    pub fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Number of sessions which currently hold a connection permit.
+    pub fn active_connections(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Return the actual bound TCP address (useful when the configured port is
+    /// zero in tests or an embedding application).
+    pub fn tcp_addr(&self) -> Option<SocketAddr> {
+        self.tcp_addr
+    }
+
+    pub fn unix_socket(&self) -> Option<&std::path::Path> {
+        self.unix_socket.as_deref()
+    }
+
+    /// Signal shutdown and wait for listener/session workers to finish.
+    pub fn shutdown(self) -> std::io::Result<()> {
+        self.signal_shutdown();
+        self.wait()
+    }
+
+    /// Wait for the server manager. This blocks until `signal_shutdown` is
+    /// called (or the server was created with an already-set token).
+    pub fn wait(self) -> std::io::Result<()> {
+        let manager = self
+            .manager
+            .lock()
+            .map_err(|_| std::io::Error::other("PostgreSQL server manager lock poisoned"))?
+            .take();
+        let Some(manager) = manager else {
+            return Ok(());
+        };
+        manager
+            .join()
+            .map_err(|_| std::io::Error::other("PostgreSQL server manager panicked"))?
+    }
+}
+
+impl Drop for PgServerHandle {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        let manager = self
+            .manager
+            .lock()
+            .ok()
+            .and_then(|mut manager| manager.take());
+        if let Some(manager) = manager {
+            let _ = manager.join();
+        }
+    }
+}
+
 impl PgServer {
     pub fn new(engine: Arc<SqlEngine>, config: PgConfig) -> Self {
         Self { engine, config }
     }
+
+    /// Start listeners and return after both sockets are bound. The returned
+    /// handle owns listener and connection-worker shutdown. This is the
+    /// lifecycle API used by graceful shutdown callers.
+    pub fn start(&self) -> std::io::Result<PgServerHandle> {
+        self.start_with_token(Arc::new(AtomicBool::new(false)), DEFAULT_SHUTDOWN_DRAIN)
+    }
+
+    /// Start listeners with the default shutdown token and a caller-selected
+    /// drain deadline. Primarily useful to embedders and deterministic tests.
+    pub fn start_with_drain_timeout(
+        &self,
+        drain_timeout: Duration,
+    ) -> std::io::Result<PgServerHandle> {
+        self.start_with_token(Arc::new(AtomicBool::new(false)), drain_timeout)
+    }
+
+    /// Start listeners with a caller-owned shutdown token and drain deadline.
+    /// The token is sampled by the accept loops and may be shared with a
+    /// signal handler or a higher-level node lifecycle.
+    pub fn start_with_shutdown(
+        &self,
+        shutdown: Arc<AtomicBool>,
+        drain_timeout: Duration,
+    ) -> std::io::Result<PgServerHandle> {
+        self.start_with_token(shutdown, drain_timeout)
+    }
+
+    /// Bind, serve, and wait for a caller-owned shutdown token. Existing
+    /// `serve` users retain the indefinitely-running behavior below.
+    pub fn serve_with_shutdown(
+        &self,
+        shutdown: Arc<AtomicBool>,
+        drain_timeout: Duration,
+    ) -> std::io::Result<()> {
+        self.start_with_shutdown(shutdown, drain_timeout)?.wait()
+    }
+
     pub fn serve(&self) -> std::io::Result<()> {
+        self.start()?.wait()
+    }
+
+    fn start_with_token(
+        &self,
+        shutdown: Arc<AtomicBool>,
+        drain_timeout: Duration,
+    ) -> std::io::Result<PgServerHandle> {
         let active = Arc::new(AtomicUsize::new(0));
-        if let Some(addr) = &self.config.tcp_listen {
+        let registry = Arc::new(ConnectionRegistry::default());
+        let mut tcp_addr = None;
+        let tcp_listener = if let Some(addr) = &self.config.tcp_listen {
             let listener = TcpListener::bind(addr)?;
-            let engine = self.engine.clone();
-            let active_connections = Arc::clone(&active);
-            let max_connections = self.config.max_connections;
-            thread::spawn(move || {
-                for stream in listener.incoming().flatten() {
-                    let Ok(permit) = ConnectionPermit::try_acquire(
-                        Arc::clone(&active_connections),
-                        max_connections,
-                    ) else {
-                        let _ = stream.shutdown(Shutdown::Both);
-                        continue;
-                    };
-                    let e = engine.clone();
-                    thread::spawn(move || {
-                        let _permit = permit;
-                        let _ = Connection::new(e, Box::new(stream)).run();
-                    });
-                }
-            });
-        }
-        if let Some(path) = &self.config.unix_socket {
-            let _ = std::fs::remove_file(path);
+            listener.set_nonblocking(true)?;
+            tcp_addr = Some(listener.local_addr()?);
+            Some(listener)
+        } else {
+            None
+        };
+
+        let mut unix_socket = None;
+        let mut unix_identity = None;
+        let unix_listener = if let Some(path) = &self.config.unix_socket {
+            prepare_unix_socket_path(path)?;
             let listener = UnixListener::bind(path)?;
-            let engine = self.engine.clone();
-            let active_connections = Arc::clone(&active);
-            let max_connections = self.config.max_connections;
-            thread::spawn(move || {
-                for stream in listener.incoming().flatten() {
-                    let Ok(permit) = ConnectionPermit::try_acquire(
-                        Arc::clone(&active_connections),
-                        max_connections,
-                    ) else {
-                        let _ = stream.shutdown(Shutdown::Both);
-                        continue;
-                    };
-                    let e = engine.clone();
-                    thread::spawn(move || {
-                        let _permit = permit;
-                        let _ = Connection::new(e, Box::new(stream)).run();
-                    });
+            listener.set_nonblocking(true)?;
+            unix_identity = Some(unix_socket_identity(path)?);
+            unix_socket = Some(std::path::PathBuf::from(path));
+            Some(listener)
+        } else {
+            None
+        };
+
+        // All binds complete before any accept thread is spawned. A later
+        // Unix bind failure therefore cannot leak an already-live TCP server.
+        let mut listener_threads = Vec::new();
+        if let Some(listener) = tcp_listener {
+            listener_threads.push(spawn_tcp_accept_loop(
+                listener,
+                Arc::clone(&shutdown),
+                Arc::clone(&self.engine),
+                Arc::clone(&active),
+                self.config.max_connections,
+                Arc::clone(&registry),
+            ));
+        }
+        if let Some(listener) = unix_listener {
+            listener_threads.push(spawn_unix_accept_loop(
+                listener,
+                Arc::clone(&shutdown),
+                Arc::clone(&self.engine),
+                Arc::clone(&active),
+                self.config.max_connections,
+                Arc::clone(&registry),
+            ));
+        }
+
+        let manager_shutdown = Arc::clone(&shutdown);
+        let manager_active = Arc::clone(&active);
+        let manager_registry = Arc::clone(&registry);
+        let manager_unix_socket = unix_socket.clone();
+        let manager_unix_identity = unix_identity;
+        let manager = thread::spawn(move || {
+            while !manager_shutdown.load(Ordering::Acquire) {
+                thread::park_timeout(ACCEPT_POLL_INTERVAL);
+            }
+            for listener in listener_threads {
+                let _ = listener.join();
+            }
+
+            let deadline = Instant::now() + drain_timeout;
+            while manager_active.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+                thread::park_timeout(Duration::from_millis(5));
+            }
+            if manager_active.load(Ordering::Acquire) != 0 {
+                manager_registry.close_all();
+            }
+            for worker in manager_registry.take_workers() {
+                let _ = worker.join();
+            }
+            // A worker may have been between its final read and permit drop
+            // when the first close pass ran. Close once more before reporting
+            // completion and make the permit invariant observable.
+            if manager_active.load(Ordering::Acquire) != 0 {
+                manager_registry.close_all();
+                for worker in manager_registry.take_workers() {
+                    let _ = worker.join();
                 }
-            });
-        }
-        loop {
-            thread::park();
-        }
+            }
+            if let Some(path) = manager_unix_socket {
+                remove_owned_unix_socket(&path, manager_unix_identity)?;
+            }
+            Ok(())
+        });
+
+        Ok(PgServerHandle {
+            shutdown,
+            active,
+            manager: Mutex::new(Some(manager)),
+            tcp_addr,
+            unix_socket,
+        })
     }
     pub fn serve_tcp_once(&self, addr: &str) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr)?;
@@ -145,6 +311,258 @@ impl PgServer {
             Connection::new(self.engine.clone(), Box::new(stream)).run()?;
         }
         Ok(())
+    }
+}
+
+trait ShutdownSocket: Send + Sync {
+    fn close(&self);
+}
+
+impl ShutdownSocket for TcpStream {
+    fn close(&self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
+}
+
+impl ShutdownSocket for UnixStream {
+    fn close(&self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
+}
+
+#[derive(Default)]
+struct ConnectionRegistry {
+    next_id: AtomicUsize,
+    sockets: Mutex<HashMap<usize, Arc<dyn ShutdownSocket>>>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl ConnectionRegistry {
+    fn register(&self, socket: Arc<dyn ShutdownSocket>) -> usize {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut sockets) = self.sockets.lock() {
+            sockets.insert(id, socket);
+        }
+        id
+    }
+
+    fn unregister(&self, id: usize) {
+        if let Ok(mut sockets) = self.sockets.lock() {
+            sockets.remove(&id);
+        }
+    }
+
+    fn close_all(&self) {
+        if let Ok(sockets) = self.sockets.lock() {
+            for socket in sockets.values() {
+                socket.close();
+            }
+        }
+    }
+
+    fn add_worker(&self, worker: JoinHandle<()>) {
+        if let Ok(mut workers) = self.workers.lock() {
+            workers.push(worker);
+        }
+    }
+
+    fn take_workers(&self) -> Vec<JoinHandle<()>> {
+        self.workers
+            .lock()
+            .map(|mut workers| std::mem::take(&mut *workers))
+            .unwrap_or_default()
+    }
+}
+
+fn spawn_tcp_accept_loop(
+    listener: TcpListener,
+    shutdown: Arc<AtomicBool>,
+    engine: Arc<SqlEngine>,
+    active: Arc<AtomicUsize>,
+    max_connections: usize,
+    registry: Arc<ConnectionRegistry>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if shutdown.load(Ordering::Acquire) {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        return;
+                    }
+                    let Ok(control) = stream.try_clone() else {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    };
+                    let Ok(permit) =
+                        ConnectionPermit::try_acquire(Arc::clone(&active), max_connections)
+                    else {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    };
+                    spawn_connection_worker(
+                        stream,
+                        Arc::new(control),
+                        engine.clone(),
+                        permit,
+                        Arc::clone(&registry),
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::park_timeout(ACCEPT_POLL_INTERVAL);
+                }
+                Err(_) => return,
+            }
+        }
+    })
+}
+
+fn spawn_unix_accept_loop(
+    listener: UnixListener,
+    shutdown: Arc<AtomicBool>,
+    engine: Arc<SqlEngine>,
+    active: Arc<AtomicUsize>,
+    max_connections: usize,
+    registry: Arc<ConnectionRegistry>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if shutdown.load(Ordering::Acquire) {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        return;
+                    }
+                    let Ok(control) = stream.try_clone() else {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    };
+                    let Ok(permit) =
+                        ConnectionPermit::try_acquire(Arc::clone(&active), max_connections)
+                    else {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    };
+                    spawn_connection_worker(
+                        stream,
+                        Arc::new(control),
+                        engine.clone(),
+                        permit,
+                        Arc::clone(&registry),
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::park_timeout(ACCEPT_POLL_INTERVAL);
+                }
+                Err(_) => return,
+            }
+        }
+    })
+}
+
+fn spawn_connection_worker<S>(
+    stream: S,
+    control: Arc<dyn ShutdownSocket>,
+    engine: Arc<SqlEngine>,
+    permit: ConnectionPermit,
+    registry: Arc<ConnectionRegistry>,
+) where
+    S: Read + Write + Send + 'static,
+{
+    let socket_id = registry.register(control);
+    let worker_registry = Arc::clone(&registry);
+    let worker = thread::spawn(move || {
+        let _permit = permit;
+        let _ = Connection::new(engine, Box::new(stream)).run();
+        worker_registry.unregister(socket_id);
+    });
+    registry.add_worker(worker);
+}
+
+#[derive(Clone, Copy)]
+struct UnixSocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+fn unix_socket_identity(path: &str) -> std::io::Result<UnixSocketIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok(UnixSocketIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+fn prepare_unix_socket_path(path: &str) -> std::io::Result<()> {
+    let path = std::path::Path::new(path);
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "refusing to replace a non-socket Unix path",
+                    ));
+                }
+                // Do not unlink a live listener owned by another process. A
+                // failed connect identifies a stale socket pathname that can
+                // safely be replaced during restart.
+                if UnixStream::connect(path).is_ok() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "Unix socket is already serving",
+                    ));
+                }
+            }
+            std::fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn remove_owned_unix_socket(
+    path: &std::path::Path,
+    identity: Option<UnixSocketIdentity>,
+) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+                    return Ok(());
+                }
+                use std::os::unix::fs::MetadataExt;
+                let Some(identity) = identity else {
+                    return Ok(());
+                };
+                if metadata.dev() != identity.dev || metadata.ino() != identity.ino {
+                    return Ok(());
+                }
+                // A replacement socket can legally reuse the same inode on
+                // some filesystems. A successful connect proves that the
+                // pathname is serving again, so never unlink it during old
+                // server cleanup even in that reuse case.
+                if UnixStream::connect(path).is_ok() {
+                    return Ok(());
+                }
+            }
+            std::fs::remove_file(path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1610,6 +2028,153 @@ mod tests {
         ) as Arc<dyn Committer>;
         let engine = SqlEngine::new(store, committer, Limits::default());
         Connection::new(engine, Box::new(Cursor::new(Vec::new())))
+    }
+
+    fn test_server(tcp_listen: Option<String>, unix_socket: Option<String>) -> PgServer {
+        let store = Arc::new(MemoryStateStore::new()) as Arc<dyn StateStore>;
+        let committer = Arc::new(
+            LocalCommitter::new(Arc::clone(&store), OriginId::new(1)).expect("test committer"),
+        ) as Arc<dyn Committer>;
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        PgServer::new(
+            engine,
+            PgConfig {
+                tcp_listen,
+                unix_socket,
+                max_connections: 2,
+            },
+        )
+    }
+
+    fn unique_socket_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "chorus-pg-{label}-{}-{}",
+            std::process::id(),
+            NEXT_BACKEND_PID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn wait_for_active(handle: &PgServerHandle, expected: usize) {
+        for _ in 0..100 {
+            if handle.active_connections() >= expected {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!(
+            "expected at least {expected} active PostgreSQL sessions, observed {}",
+            handle.active_connections()
+        );
+    }
+
+    #[test]
+    fn server_shutdown_drains_sessions_rejects_new_connections_and_removes_owned_unix_socket() {
+        let unix_path = unique_socket_path("drain");
+        let server = test_server(
+            Some("127.0.0.1:0".into()),
+            Some(unix_path.display().to_string()),
+        );
+        let handle = server
+            .start_with_drain_timeout(Duration::from_secs(1))
+            .expect("bind listeners");
+        let address = handle.tcp_addr().expect("TCP listener address");
+        let active = Arc::clone(&handle.active);
+        assert!(unix_path.exists());
+        let client = TcpStream::connect(address).expect("connect before shutdown");
+        wait_for_active(&handle, 1);
+
+        handle.signal_shutdown();
+        drop(client);
+        handle.wait().expect("graceful shutdown");
+
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(!unix_path.exists(), "only the owned socket is removed");
+        assert!(
+            TcpStream::connect(address).is_err(),
+            "listener still accepts after shutdown"
+        );
+    }
+
+    #[test]
+    fn server_shutdown_force_closes_stuck_sessions_at_deadline() {
+        let server = test_server(Some("127.0.0.1:0".into()), None);
+        let handle = server
+            .start_with_drain_timeout(Duration::from_millis(35))
+            .expect("bind listener");
+        let address = handle.tcp_addr().expect("TCP listener address");
+        let active = Arc::clone(&handle.active);
+        let mut client = TcpStream::connect(address).expect("connect before shutdown");
+        client
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("set read timeout");
+        wait_for_active(&handle, 1);
+
+        let started = Instant::now();
+        handle.shutdown().expect("bounded forced shutdown");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown exceeded its bounded drain deadline"
+        );
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        let mut byte = [0u8; 1];
+        assert!(
+            matches!(client.read(&mut byte), Ok(0) | Err(_)),
+            "stuck session remained readable after forced close"
+        );
+        assert!(
+            TcpStream::connect(address).is_err(),
+            "listener still accepts after shutdown"
+        );
+    }
+
+    #[test]
+    fn server_shutdown_does_not_remove_a_replacement_unix_socket() {
+        let unix_path = unique_socket_path("replacement");
+        let server = test_server(
+            Some("127.0.0.1:0".into()),
+            Some(unix_path.display().to_string()),
+        );
+        let handle = server
+            .start_with_drain_timeout(Duration::from_millis(250))
+            .expect("bind listeners");
+        let client = TcpStream::connect(handle.tcp_addr().unwrap()).expect("connect session");
+        wait_for_active(&handle, 1);
+        handle.signal_shutdown();
+
+        // The old accept loop has stopped, but its manager is still draining
+        // the active TCP session. Replace the pathname with another socket in
+        // that window; shutdown must compare inode identity before unlinking.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::remove_file(&unix_path).expect("remove old socket pathname");
+        let replacement = UnixListener::bind(&unix_path).expect("bind replacement socket");
+        handle.wait().expect("shutdown old server");
+        assert!(unix_path.exists(), "replacement socket was removed");
+        drop(replacement);
+        let _ = std::fs::remove_file(&unix_path);
+        drop(client);
+    }
+
+    #[test]
+    fn failed_unix_bind_releases_a_previously_bound_tcp_listener() {
+        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+        let address = probe.local_addr().expect("reserved address");
+        drop(probe);
+
+        let unix_path = unique_socket_path("invalid");
+        std::fs::write(&unix_path, b"not a socket").expect("create invalid Unix path");
+        let server = test_server(
+            Some(address.to_string()),
+            Some(unix_path.display().to_string()),
+        );
+        assert!(
+            server
+                .start_with_drain_timeout(Duration::from_millis(20))
+                .is_err(),
+            "regular Unix path was unexpectedly replaced"
+        );
+        let rebound = TcpListener::bind(address).expect("TCP listener leaked after failed bind");
+        drop(rebound);
+        std::fs::remove_file(unix_path).expect("remove invalid Unix path");
     }
 
     fn parse_body(name: &str, sql: &str, types: &[u32]) -> Vec<u8> {

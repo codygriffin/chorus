@@ -767,29 +767,17 @@ fn load_command_config(
     require_signed_manifest: bool,
 ) -> Result<Config, String> {
     let trust_key = arg_value(args, "--manifest-key");
-    if require_signed_manifest {
-        let trust_key = trust_key.ok_or_else(|| {
-            "authenticated OpenRaft requires --manifest-key PATH before state or listeners are opened"
-                .to_string()
-        })?;
+    if let Some(trust_key) = trust_key {
         return Config::load_openraft_signed(path, trust_key).map_err(|error| error.to_string());
     }
-
-    let config = Config::load(path).map_err(|error| error.to_string())?;
-    if config.bootstrap_manifest.is_some() {
-        let trust_key = trust_key.ok_or_else(|| {
-            "signed OpenRaft configuration requires --manifest-key PATH before state access"
-                .to_string()
-        })?;
-        Config::load_openraft_signed(path, trust_key).map_err(|error| error.to_string())
-    } else if trust_key.is_some() {
-        Err(
-            "--manifest-key was supplied but the configuration has no signed bootstrap_manifest"
-                .into(),
-        )
-    } else {
-        Ok(config)
+    if require_signed_manifest {
+        return Err(
+            "authenticated OpenRaft requires --manifest-key PATH before state or listeners are opened"
+                .to_string(),
+        );
     }
+
+    Config::load(path).map_err(|error| error.to_string())
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -1056,6 +1044,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("--manifest-key"));
+        assert!(!config.data_dir.exists());
+        assert!(!config.identity_path().exists());
+        assert!(!config.data_dir.join("raft.redb").exists());
+        assert!(!config.data_dir.join("state").join("active.redb").exists());
+    }
+
+    #[test]
+    fn maintenance_command_cannot_downgrade_signed_config_without_manifest_key() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = authenticated_test_config(root.path());
+        config.bootstrap_manifest = Some(chorus_admin::BootstrapManifestSignature {
+            format_version: 1,
+            algorithm: "ed25519".into(),
+            generation: 1,
+            key_id: "00".repeat(32),
+            ca_sha256: "00".repeat(32),
+            signature: "00".repeat(64),
+        });
+        let config_path = root.path().join("chorus.toml");
+        config.save(&config_path).unwrap();
+
+        let error = load_command_config(
+            &["status".into()],
+            &config_path.display().to_string(),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("load_openraft_signed"));
         assert!(!config.data_dir.exists());
         assert!(!config.identity_path().exists());
         assert!(!config.data_dir.join("raft.redb").exists());

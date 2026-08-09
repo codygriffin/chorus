@@ -20,3 +20,6 @@ chorus-consensus = { path = "../chorus-consensus" }
 serde_json = "1.0.151"
 toml = "1.1.2"
 thiserror = "2.0.19"
+
+[dev-dependencies]
+tempfile = "3.23.0"

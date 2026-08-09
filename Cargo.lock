@@ -260,11 +260,15 @@ version = "0.1.0"
 dependencies = [
  "chorus-codec",
  "chorus-common",
+ "chorus-redb",
  "chorus-storage",
  "chorus-txn",
+ "openraft",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
@@ -280,6 +284,7 @@ dependencies = [
  "chorus-storage",
  "chorus-txn",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "toml",
 ]

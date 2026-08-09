@@ -4,6 +4,9 @@
 //! and exposes a synchronous adapter that can be backed by OpenRaft or the
 //! deterministic in-process cluster used by tests and local development.
 
+pub mod openraft_adapter;
+pub use openraft_adapter::OpenRaftConsensus;
+
 use chorus_codec::{
     ApplyResult, CommitTransactionV1, LogicalSnapshot, ReplicatedCommandV1, SchemaCommandV1,
 };

@@ -6,10 +6,12 @@ use chorus_admin::{
 };
 use chorus_codec::{LogicalSnapshot, ReplicatedCommandV1};
 use chorus_common::{LogId, OriginId};
-use chorus_consensus::{ConsensusCommitter, NetworkConsensus, StandaloneConsensus};
+use chorus_consensus::{
+    Consensus, ConsensusCommitter, NetworkConsensus, OpenRaftConsensus, StandaloneConsensus,
+};
 use chorus_pg::{PgConfig, PgServer};
 use chorus_sql::SqlEngine;
-use chorus_storage::{FileStateStore, StateStore};
+use chorus_storage::{Catalog, FileStateStore, StateStore};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -51,6 +53,32 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
                 || !snapshot.kv().is_empty()
             {
                 return Err("bootstrap requires an empty durable state directory".into());
+            }
+            if has_flag(&args, "--openraft-single-node") {
+                validate_openraft_single_node(&cfg)?;
+                ensure_openraft_legacy_state_empty(&store)?;
+                drop(store);
+                let (raft_path, state_path) = openraft_paths(&cfg);
+                validate_redb_target(&raft_path, "raft.redb")?;
+                validate_redb_target(&state_path, "state/active.redb")?;
+                let consensus = OpenRaftConsensus::open(
+                    cfg.node_id,
+                    &raft_path,
+                    &state_path,
+                    cfg.cluster_id().0,
+                    cfg.cluster_incarnation,
+                    true,
+                )
+                .map_err(|error| error.to_string())?;
+                harden_file(&raft_path, false)?;
+                harden_file(&state_path, false)?;
+                drop(consensus);
+                log_event(
+                    "openraft_single_node_bootstrapped",
+                    serde_json::json!({ "config": path, "node_id": cfg.node_id }),
+                );
+                println!("bootstrapped OpenRaft single-node {}", path);
+                return Ok(());
             }
             let voters = cfg
                 .initial_nodes
@@ -124,6 +152,10 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
     }
     let cfg = Config::load(path).map_err(|e| e.to_string())?;
     cfg.validate().map_err(|e| e.to_string())?;
+    let openraft_single_node = has_flag(args, "--openraft-single-node");
+    if openraft_single_node {
+        validate_openraft_single_node(&cfg)?;
+    }
     if cfg.initial_nodes.len() > 1
         && !cfg.allow_insecure_dev
         && !has_flag(args, "--allow-insecure-dev")
@@ -149,51 +181,81 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
             "cluster_incarnation": cfg.cluster_incarnation,
         }),
     );
-    let store = Arc::new(open_store(&cfg).map_err(|e| e.to_string())?);
-    if store
-        .snapshot()
-        .map_err(|e| e.to_string())?
-        .membership()
-        .log_id
-        == LogId::ZERO
-    {
-        return Err(
-            "cluster is not bootstrapped; run chorus bootstrap (or an explicit admin bootstrap) before run".into(),
-        );
-    }
     let origin = OriginId::new(cfg.node_id);
-    let committer = if cfg.initial_nodes.len() > 1 {
-        let endpoints = cfg
-            .initial_nodes
-            .iter()
-            .map(|node| (node.node_id, node.endpoint.clone()))
-            .collect();
-        let voters = cfg
-            .initial_nodes
-            .iter()
-            .filter(|node| node.voter)
-            .map(|node| node.node_id)
-            .collect();
-        let learners = cfg
-            .initial_nodes
-            .iter()
-            .filter(|node| !node.voter)
-            .map(|node| node.node_id)
-            .collect();
-        let consensus = NetworkConsensus::new_with_identity(
+    let (store, committer): (Arc<dyn StateStore>, Arc<ConsensusCommitter>) = if openraft_single_node
+    {
+        // `open_store` is deliberately opened first: it owns the hardened,
+        // immutable installation identity checks. The compatibility state
+        // must remain empty, so this mode can never reinterpret a legacy
+        // standalone/custom-consensus installation as OpenRaft state.
+        let legacy_store = open_store(&cfg).map_err(|error| error.to_string())?;
+        ensure_openraft_legacy_state_empty(&legacy_store)?;
+        drop(legacy_store);
+        let (raft_path, state_path) = openraft_paths(&cfg);
+        validate_redb_target(&raft_path, "raft.redb")?;
+        validate_redb_target(&state_path, "state/active.redb")?;
+        let consensus = OpenRaftConsensus::open(
             cfg.node_id,
-            voters,
-            learners,
-            endpoints,
+            &raft_path,
+            &state_path,
             cfg.cluster_id().0,
             cfg.cluster_incarnation,
-            store.clone(),
-        );
-        consensus.start().map_err(|e| e.to_string())?;
-        ConsensusCommitter::new_activated(consensus, origin).map_err(|e| e.to_string())?
+            false,
+        )
+        .map_err(|error| error.to_string())?;
+        harden_file(&raft_path, false)?;
+        harden_file(&state_path, false)?;
+        let store = consensus.store();
+        let committer =
+            ConsensusCommitter::new_activated(consensus, origin).map_err(|e| e.to_string())?;
+        (store, committer)
     } else {
-        let consensus = Arc::new(StandaloneConsensus::new(cfg.node_id, store.clone()));
-        ConsensusCommitter::new_activated(consensus, origin).map_err(|e| e.to_string())?
+        let store = Arc::new(open_store(&cfg).map_err(|e| e.to_string())?);
+        if store
+            .snapshot()
+            .map_err(|e| e.to_string())?
+            .membership()
+            .log_id
+            == LogId::ZERO
+        {
+            return Err(
+                "cluster is not bootstrapped; run chorus bootstrap (or an explicit admin bootstrap) before run".into(),
+            );
+        }
+        let committer = if cfg.initial_nodes.len() > 1 {
+            let endpoints = cfg
+                .initial_nodes
+                .iter()
+                .map(|node| (node.node_id, node.endpoint.clone()))
+                .collect();
+            let voters = cfg
+                .initial_nodes
+                .iter()
+                .filter(|node| node.voter)
+                .map(|node| node.node_id)
+                .collect();
+            let learners = cfg
+                .initial_nodes
+                .iter()
+                .filter(|node| !node.voter)
+                .map(|node| node.node_id)
+                .collect();
+            let consensus = NetworkConsensus::new_with_identity(
+                cfg.node_id,
+                voters,
+                learners,
+                endpoints,
+                cfg.cluster_id().0,
+                cfg.cluster_incarnation,
+                store.clone(),
+            );
+            consensus.start().map_err(|e| e.to_string())?;
+            ConsensusCommitter::new_activated(consensus, origin).map_err(|e| e.to_string())?
+        } else {
+            let consensus = Arc::new(StandaloneConsensus::new(cfg.node_id, store.clone()));
+            ConsensusCommitter::new_activated(consensus, origin).map_err(|e| e.to_string())?
+        };
+        (store, committer)
     };
     let engine = SqlEngine::new(store.clone(), committer, cfg.limits.clone());
     let socket = cfg.postgres.unix_socket_dir.as_ref().map(|dir| {
@@ -462,6 +524,61 @@ fn member_command(args: &[String], config_path: &str) -> Result<(), String> {
         _ => Err("usage: chorus member list|add-learner|promote|demote|remove".into()),
     }
 }
+
+fn validate_openraft_single_node(cfg: &Config) -> Result<(), String> {
+    if cfg.initial_nodes.len() != 1 {
+        return Err(
+            "OpenRaft multi-node serving requires the authenticated Tonic/Rustls transport; --openraft-single-node accepts exactly one configured voter"
+                .into(),
+        );
+    }
+    let member = &cfg.initial_nodes[0];
+    if !member.voter || member.node_id != cfg.node_id {
+        return Err(
+            "--openraft-single-node requires the sole configured member to be the local voter"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_openraft_legacy_state_empty(store: &dyn StateStore) -> Result<(), String> {
+    let snapshot = store.snapshot().map_err(|error| error.to_string())?;
+    if snapshot.last_applied() != LogId::ZERO
+        || snapshot.membership().log_id != LogId::ZERO
+        || snapshot.db_epoch() != 0
+        || snapshot.catalog_epoch() != 0
+        || snapshot.catalog() != &Catalog::default()
+        || !snapshot.kv().is_empty()
+        || !snapshot.origins().is_empty()
+    {
+        return Err(
+            "OpenRaft mode refuses nonempty legacy state; migrate or use a fresh data directory"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn openraft_paths(cfg: &Config) -> (std::path::PathBuf, std::path::PathBuf) {
+    (
+        cfg.data_dir.join("raft.redb"),
+        cfg.data_dir.join("state").join("active.redb"),
+    )
+}
+
+fn validate_redb_target(path: &Path, label: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(format!("{label} path must not be a symbolic link"))
+        }
+        Ok(metadata) if !metadata.is_file() => Err(format!("{label} path is not a regular file")),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not inspect {label} path: {error}")),
+    }
+}
+
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
 }
@@ -530,6 +647,93 @@ fn hex(bytes: &[u8]) -> String {
 }
 fn print_help() {
     println!(
-        "Chorus MVP\n\nUSAGE:\n  chorus run --config PATH [--allow-insecure-dev]\n  chorus bootstrap [--config PATH] [--data-dir PATH] [--node-id N] [--confirm]\n  chorus status|check|metrics|state-hash --config PATH\n  chorus member list [--config PATH]\n  chorus member add-learner|promote|demote|remove --node-id N --config PATH --cluster-id ID --confirm --offline\n  chorus snapshot create|export --config PATH --output PATH --offline\n  chorus snapshot inspect --input PATH\n  chorus restore --input PATH --config PATH --cluster-id ID --confirm --force-new-cluster"
+        "Chorus MVP\n\nUSAGE:\n  chorus run --config PATH [--allow-insecure-dev | --openraft-single-node]\n  chorus bootstrap [--config PATH] [--data-dir PATH] [--node-id N] [--confirm] [--openraft-single-node]\n  chorus status|check|metrics|state-hash --config PATH\n  chorus member list [--config PATH]\n  chorus member add-learner|promote|demote|remove --node-id N --config PATH --cluster-id ID --confirm --offline\n  chorus snapshot create|export --config PATH --output PATH --offline\n  chorus snapshot inspect --input PATH\n  chorus restore --input PATH --config PATH --cluster-id ID --confirm --force-new-cluster"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chorus_admin::InitialNode;
+
+    #[test]
+    fn openraft_bootstrap_is_explicit_reopenable_and_keeps_legacy_state_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("chorus.toml");
+        let data_dir = root.path().join("data");
+        dispatch(vec![
+            "bootstrap".into(),
+            "--config".into(),
+            config_path.display().to_string(),
+            "--data-dir".into(),
+            data_dir.display().to_string(),
+            "--node-id".into(),
+            "1".into(),
+            "--openraft-single-node".into(),
+        ])
+        .unwrap();
+
+        let cfg = Config::load(&config_path).unwrap();
+        let legacy = open_store(&cfg).unwrap();
+        ensure_openraft_legacy_state_empty(&legacy).unwrap();
+        drop(legacy);
+        let (raft_path, state_path) = openraft_paths(&cfg);
+        let reopened = OpenRaftConsensus::open(
+            cfg.node_id,
+            raft_path,
+            state_path,
+            cfg.cluster_id().0,
+            cfg.cluster_incarnation,
+            false,
+        )
+        .unwrap();
+        assert_eq!(Some(cfg.node_id), reopened.status().leader_id);
+        assert!(reopened.status().quorum);
+    }
+
+    #[test]
+    fn openraft_mode_rejects_multi_node_without_authenticated_transport() {
+        let mut cfg = Config::defaults("unused", 1);
+        cfg.initial_nodes.push(InitialNode {
+            node_id: 2,
+            endpoint: "127.0.0.1:7002".into(),
+            voter: true,
+        });
+        let error = validate_openraft_single_node(&cfg).unwrap_err();
+        assert!(error.contains("authenticated Tonic/Rustls transport"));
+
+        cfg.initial_nodes.truncate(1);
+        cfg.initial_nodes[0].voter = false;
+        let error = validate_openraft_single_node(&cfg).unwrap_err();
+        assert!(error.contains("sole configured member"));
+    }
+
+    #[test]
+    fn openraft_run_refuses_legacy_bootstrap_before_creating_redb_files() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("chorus.toml");
+        let cfg = Config::defaults(root.path().join("data"), 1);
+        cfg.save(&config_path).unwrap();
+        let legacy = open_store(&cfg).unwrap();
+        legacy
+            .apply(
+                LogId { term: 1, index: 1 },
+                &ReplicatedCommandV1::Membership {
+                    voters: vec![1],
+                    learners: Vec::new(),
+                },
+            )
+            .unwrap();
+        drop(legacy);
+
+        let error = run_command(
+            &["run".into(), "--openraft-single-node".into()],
+            &config_path.display().to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("refuses nonempty legacy state"));
+        let (raft_path, state_path) = openraft_paths(&cfg);
+        assert!(!raft_path.exists());
+        assert!(!state_path.exists());
+    }
 }

@@ -1576,7 +1576,11 @@ impl SqlSession {
                 Err(e) => {
                     if implicit {
                         self.rollback_internal();
-                    } else if self.txn.is_some() && e.code != "25P02" && e.code != "08006" {
+                    } else if self.txn.is_some()
+                        && e.code != "25P02"
+                        && e.code != "08006"
+                        && e.code != "08007"
+                    {
                         self.failed = true;
                         if let Some(t) = self.txn.as_mut() {
                             t.fail();
@@ -1745,11 +1749,13 @@ impl SqlSession {
         if let Some(mut txn) = self.txn.take() {
             let r = match txn.commit(self.engine.committer.as_ref(), &self.sequencer) {
                 Ok(result) => result,
-                Err(error @ ChorusError::Consensus(_)) => {
-                    // The transport outcome may be ambiguous. Preserve the
-                    // transaction overlay and exact sequencer request so a
-                    // client can retry COMMIT without rebuilding a different
-                    // mutation batch or reusing a sequence number.
+                Err(error @ ChorusError::OutcomeUnknown(_)) => {
+                    // The command was installed as the sequencer's exact
+                    // pending request before submission, but no terminal
+                    // response arrived. Preserve the transaction overlay so
+                    // this session can retry COMMIT byte-for-byte; the outer
+                    // execute path also keeps 08007 out of failed-transaction
+                    // handling.
                     self.txn = Some(txn);
                     return Err(to_sql(error));
                 }
@@ -3961,6 +3967,7 @@ fn to_sql(e: ChorusError) -> SqlError {
         ChorusError::Sql(s) => s,
         ChorusError::Limit(s) => SqlError::new("54000", s),
         ChorusError::Consensus(s) => SqlError::cluster_unavailable(s),
+        ChorusError::OutcomeUnknown(s) => SqlError::transaction_outcome_unknown(s),
         ChorusError::Storage(s)
         | ChorusError::Protocol(s)
         | ChorusError::Serialization(s)
@@ -4675,15 +4682,24 @@ mod tests {
     struct RetryOnceCommitter {
         inner: LocalCommitter,
         fail_once: AtomicBool,
+        ambiguous_error: ChorusError,
         transactions: Mutex<Vec<chorus_codec::CommitTransactionV1>>,
         encoded_requests: Mutex<Vec<Vec<u8>>>,
     }
 
     impl RetryOnceCommitter {
         fn new(inner: LocalCommitter) -> Self {
+            Self::with_error(
+                inner,
+                ChorusError::Consensus("simulated ambiguous response".into()),
+            )
+        }
+
+        fn with_error(inner: LocalCommitter, ambiguous_error: ChorusError) -> Self {
             Self {
                 inner,
                 fail_once: AtomicBool::new(true),
+                ambiguous_error,
                 transactions: Mutex::new(Vec::new()),
                 encoded_requests: Mutex::new(Vec::new()),
             }
@@ -4716,9 +4732,7 @@ mod tests {
                 // recovery must deduplicate the exact request rather than
                 // manufacture a second mutation.
                 self.inner.submit(command.clone())?;
-                return Err(ChorusError::Consensus(
-                    "simulated ambiguous response".into(),
-                ));
+                return Err(self.ambiguous_error.clone());
             }
             self.inner.submit(command)
         }
@@ -4961,7 +4975,9 @@ mod tests {
         session
             .execute("INSERT INTO pending_retry VALUES (1, 'exact');", &[])
             .unwrap();
-        assert!(session.execute("COMMIT", &[]).is_err());
+        let error = session.execute("COMMIT", &[]).unwrap_err();
+        assert_eq!(error.code, "08007");
+        assert_eq!(session.transaction_status(), TransactionStatus::Active);
         drop(session);
 
         let resolved = engine
@@ -4979,6 +4995,110 @@ mod tests {
             .expect("encoded request capture lock");
         assert_eq!(encoded.len(), 2);
         assert_eq!(encoded[0], encoded[1]);
+        assert_eq!(store.snapshot().unwrap().db_epoch(), 2);
+    }
+
+    #[test]
+    fn outcome_unknown_preserves_explicit_and_implicit_commit_for_exact_retry() {
+        for (origin_id, ambiguous_error, explicit) in [
+            (
+                104,
+                ChorusError::Consensus("response lost after quorum apply".into()),
+                true,
+            ),
+            (
+                105,
+                ChorusError::Storage("local catch-up read failed after leader apply".into()),
+                false,
+            ),
+        ] {
+            let origin = OriginId::new(origin_id);
+            let store = store_for_origin(origin);
+            let retry = Arc::new(RetryOnceCommitter::with_error(
+                LocalCommitter::new(store.clone(), origin).unwrap(),
+                ambiguous_error,
+            ));
+            let committer: Arc<dyn Committer> = retry.clone();
+            let engine = SqlEngine::new(store.clone(), committer, Limits::default());
+            let mut session = engine.session();
+            session
+                .execute(
+                    &format!(
+                        "CREATE TABLE outcome_{origin_id} (id integer primary key, value text);"
+                    ),
+                    &[],
+                )
+                .unwrap();
+            if explicit {
+                session.execute("BEGIN", &[]).unwrap();
+            }
+            let error = session
+                .execute(
+                    &format!("INSERT INTO outcome_{origin_id} VALUES (1, 'once');"),
+                    &[],
+                )
+                .and_then(|result| {
+                    if explicit {
+                        session.execute("COMMIT", &[])
+                    } else {
+                        Ok(result)
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(error.code, "08007");
+            assert_eq!(session.transaction_status(), TransactionStatus::Active);
+
+            session.execute("COMMIT", &[]).unwrap();
+            assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+            assert_eq!(store.snapshot().unwrap().db_epoch(), 2);
+
+            let requests = retry.transactions.lock().expect("transaction capture lock");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0], requests[1]);
+            let encoded = retry
+                .encoded_requests
+                .lock()
+                .expect("encoded request capture lock");
+            assert_eq!(encoded.len(), 2);
+            assert_eq!(encoded[0], encoded[1]);
+        }
+    }
+
+    #[test]
+    fn identical_concurrent_transaction_cannot_steal_pending_retry() {
+        let origin = OriginId::new(106);
+        let store = store_for_origin(origin);
+        let retry = Arc::new(RetryOnceCommitter::new(
+            LocalCommitter::new(store.clone(), origin).unwrap(),
+        ));
+        let committer: Arc<dyn Committer> = retry.clone();
+        let engine = SqlEngine::new(store.clone(), committer, Limits::default());
+        let mut owner = engine.session();
+        owner
+            .execute(
+                "CREATE TABLE retry_owner (id integer primary key, value text);",
+                &[],
+            )
+            .unwrap();
+        let mut other = engine.session();
+        owner.execute("BEGIN", &[]).unwrap();
+        other.execute("BEGIN", &[]).unwrap();
+        for session in [&mut owner, &mut other] {
+            session
+                .execute("INSERT INTO retry_owner VALUES (1, 'same');", &[])
+                .unwrap();
+        }
+
+        assert_eq!(owner.execute("COMMIT", &[]).unwrap_err().code, "08007");
+        let other_error = other.execute("COMMIT", &[]).unwrap_err();
+        assert_eq!(other_error.code, "XX000");
+        assert!(other_error.message.contains("another transaction"));
+        assert_eq!(1, retry.transactions.lock().unwrap().len());
+
+        owner.execute("COMMIT", &[]).unwrap();
+        let requests = retry.transactions.lock().unwrap();
+        assert_eq!(2, requests.len());
+        assert_eq!(requests[0], requests[1]);
         assert_eq!(store.snapshot().unwrap().db_epoch(), 2);
     }
 

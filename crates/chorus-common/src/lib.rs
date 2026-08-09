@@ -415,6 +415,9 @@ impl SqlError {
     pub fn cluster_unavailable(message: impl Into<String>) -> Self {
         Self::new("57P03", message)
     }
+    pub fn transaction_outcome_unknown(message: impl Into<String>) -> Self {
+        Self::new("08007", message)
+    }
     pub fn failed_transaction() -> Self {
         Self::new(
             "25P02",
@@ -431,6 +434,8 @@ pub enum ChorusError {
     Storage(String),
     #[error("consensus unavailable: {0}")]
     Consensus(String),
+    #[error("transaction outcome unknown: {0}")]
+    OutcomeUnknown(String),
     #[error("protocol error: {0}")]
     Protocol(String),
     #[error("resource limit: {0}")]

@@ -392,7 +392,7 @@ impl Transaction {
             base_epoch: self.base_epoch,
             mutations,
         };
-        let result = match sequencer.submit(committer, command) {
+        let result = match sequencer.submit(committer, self.transaction_id, command) {
             Ok(result) => result,
             Err(error) => {
                 // A committer/transport error is retryable and leaves this
@@ -466,6 +466,7 @@ pub struct CommitSequencer {
 #[derive(Clone)]
 enum PendingCommand {
     Transaction {
+        owner: [u8; 16],
         command: CommitTransactionV1,
         encoded: Vec<u8>,
     },
@@ -532,6 +533,7 @@ impl CommitSequencer {
     fn submit(
         &self,
         committer: &dyn Committer,
+        owner: [u8; 16],
         command: CommitTransactionV1,
     ) -> Result<ApplyResult> {
         let encoded = match encode_command(&ReplicatedCommandV1::CommitTransaction(command.clone()))
@@ -549,8 +551,17 @@ impl CommitSequencer {
                 .map_err(|_| ChorusError::Internal("commit sequencer lock poisoned".into()))?;
             match s.pending.as_ref() {
                 Some(PendingCommand::Transaction {
+                    owner: pending_owner,
+                    ..
+                }) if pending_owner != &owner => {
+                    return Err(ChorusError::Protocol(
+                        "the unresolved transaction command belongs to another transaction".into(),
+                    ));
+                }
+                Some(PendingCommand::Transaction {
                     command: pending,
                     encoded: pending_encoded,
+                    ..
                 }) if pending_encoded == &encoded => pending.clone(),
                 Some(PendingCommand::Transaction { .. }) => {
                     return Err(ChorusError::Protocol(
@@ -572,6 +583,7 @@ impl CommitSequencer {
                         ));
                     }
                     s.pending = Some(PendingCommand::Transaction {
+                        owner,
                         command: command.clone(),
                         encoded,
                     });
@@ -579,9 +591,13 @@ impl CommitSequencer {
                 }
             }
         };
-        let result = committer.submit(command);
-        self.finish(result.is_ok())?;
-        result
+        match committer.submit(command) {
+            Ok(result) => {
+                self.finish_apply_result(&result)?;
+                Ok(result)
+            }
+            Err(error) => Err(outcome_unknown(error)),
+        }
     }
 
     fn release_reservation(&self, sequence: u64) -> Result<()> {
@@ -595,26 +611,42 @@ impl CommitSequencer {
         Ok(())
     }
 
-    fn finish(&self, result_ok: bool) -> Result<()> {
+    fn finish_apply_result(&self, result: &ApplyResult) -> Result<()> {
+        // Only results which the deterministic state machine records consume
+        // this origin sequence. Stale origins, evicted/unknown requests,
+        // sequence-gap protocol errors and impossible command variants leave
+        // the exact command pending and fail closed instead of skipping a
+        // sequence that Raft still expects.
+        let consumes_sequence = matches!(
+            result,
+            ApplyResult::Committed { .. }
+                | ApplyResult::Duplicate(_)
+                | ApplyResult::SerializationFailure { .. }
+                | ApplyResult::Rejected(_)
+        );
+        if !consumes_sequence {
+            return Ok(());
+        }
         let mut s = self
             .state
             .lock()
             .map_err(|_| ChorusError::Internal("commit sequencer lock poisoned".into()))?;
-        if result_ok {
-            s.pending = None;
-            s.reserved = false;
-            // Keep MAX as a permanent exhausted sentinel.  The command at
-            // MAX is already terminal and must not be replayed with a reused
-            // sequence, while no subsequent sequence may be allocated.
-            if s.next != u64::MAX {
-                s.next = s
-                    .next
-                    .checked_add(1)
-                    .ok_or_else(|| ChorusError::Limit("request sequence exhausted".into()))?;
-            }
+        if s.pending.is_none() || !s.reserved {
+            return Err(ChorusError::Protocol(
+                "terminal command result has no matching pending sequence".into(),
+            ));
         }
-        // An Err is deliberately left pending: the command may have reached
-        // a quorum even though the caller observed a transport error.
+        s.pending = None;
+        s.reserved = false;
+        // Keep MAX as a permanent exhausted sentinel.  The command at MAX is
+        // already terminal and must not be replayed with a reused sequence,
+        // while no subsequent sequence may be allocated.
+        if s.next != u64::MAX {
+            s.next = s
+                .next
+                .checked_add(1)
+                .ok_or_else(|| ChorusError::Limit("request sequence exhausted".into()))?;
+        }
         Ok(())
     }
 
@@ -684,9 +716,13 @@ impl CommitSequencer {
                 }
             }
         };
-        let result = committer.submit_schema(command);
-        self.finish(result.is_ok())?;
-        result
+        match committer.submit_schema(command) {
+            Ok(result) => {
+                self.finish_apply_result(&result)?;
+                Ok(result)
+            }
+            Err(error) => Err(outcome_unknown(error)),
+        }
     }
 
     /// Resolve the command left by an ambiguous transport response.  The
@@ -704,8 +740,13 @@ impl CommitSequencer {
             PendingCommand::Transaction { command, .. } => committer.submit(command),
             PendingCommand::Schema { command, .. } => committer.submit_schema(command),
         };
-        self.finish(result.is_ok())?;
-        result
+        match result {
+            Ok(result) => {
+                self.finish_apply_result(&result)?;
+                Ok(result)
+            }
+            Err(error) => Err(outcome_unknown(error)),
+        }
     }
 
     /// Retry the retained command if one exists, preserving a poisoned-state
@@ -725,12 +766,24 @@ impl CommitSequencer {
             PendingCommand::Transaction { command, .. } => committer.submit(command),
             PendingCommand::Schema { command, .. } => committer.submit_schema(command),
         };
-        self.finish(result.is_ok())?;
-        result.map(Some)
+        match result {
+            Ok(result) => {
+                self.finish_apply_result(&result)?;
+                Ok(Some(result))
+            }
+            Err(error) => Err(outcome_unknown(error)),
+        }
     }
 
     pub fn next_sequence_hint(&self) -> u64 {
         self.state.lock().map(|s| s.next).unwrap_or(0)
+    }
+}
+
+fn outcome_unknown(error: ChorusError) -> ChorusError {
+    match error {
+        ChorusError::OutcomeUnknown(message) => ChorusError::OutcomeUnknown(message),
+        other => ChorusError::OutcomeUnknown(other.to_string()),
     }
 }
 
@@ -810,7 +863,10 @@ mod tests {
                 value: vec![u8::MAX; 1_100_000],
             }],
         };
-        assert!(sequencer.submit(c.as_ref(), command).is_err());
+        assert!(matches!(
+            sequencer.submit(c.as_ref(), [7; 16], command),
+            Err(ChorusError::Serialization(_))
+        ));
         assert_eq!(sequencer.next_sequence().unwrap(), sequence);
     }
 }

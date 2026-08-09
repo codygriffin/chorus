@@ -10,6 +10,7 @@ chorus-codec = { path = "../chorus-codec" }
 chorus-storage = { path = "../chorus-storage" }
 chorus-consensus = { path = "../chorus-consensus" }
 base64 = "=0.22.1"
+fs2 = "=0.4.3"
 ring = "=0.17.14"
 rustls-pemfile = "=2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }

@@ -8,6 +8,7 @@ use chorus_codec::LogicalSnapshot;
 use chorus_common::{ClusterId, Limits};
 use chorus_consensus::ConsensusStatus;
 use chorus_storage::{FileStateStore, StateStore, StoreStatus};
+use fs2::{available_space, total_space};
 use ring::digest::{SHA256, digest};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
@@ -868,7 +869,10 @@ pub fn status(
         warnings.push("strict readiness is false: quorum/leader barrier is unavailable".into());
     }
     if !disk_write_admission {
-        warnings.push("data-directory budget is below the write-admission watermark".into());
+        warnings.push(
+            "data-directory budget or filesystem free space is below the write-admission watermark"
+                .into(),
+        );
     }
     NodeStatus {
         config_node_id: config.node_id,
@@ -890,19 +894,33 @@ pub fn status(
 
 /// Return whether the configured data-directory budget still admits writes.
 /// This is deliberately local-only: it sums the owned data directory without
-/// following symlinks and reserves the larger configured byte/percentage
-/// watermark.  Any metadata/read failure fails closed.
+/// following symlinks, checks the filesystem's available space, and reserves
+/// the larger configured byte/percentage watermark. Any metadata/read
+/// failure fails closed.
 pub fn disk_write_admission(config: &Config) -> bool {
     let Some(observed) = directory_bytes(&config.data_dir) else {
         return false;
     };
-    let percentage = config
-        .storage
-        .data_dir_budget_bytes
-        .saturating_mul(config.storage.low_space_watermark_percent as u64)
-        / 100;
+    let Ok(free_bytes) = available_space(&config.data_dir) else {
+        return false;
+    };
+    let Ok(total_bytes) = total_space(&config.data_dir) else {
+        return false;
+    };
+    disk_write_admission_with_space(config, observed, free_bytes, total_bytes)
+}
+
+fn disk_write_admission_with_space(
+    config: &Config,
+    observed: u64,
+    free_bytes: u64,
+    total_bytes: u64,
+) -> bool {
+    let percentage = config.storage.low_space_watermark_percent as u64;
+    let percentage = total_bytes.saturating_mul(percentage) / 100;
     let watermark = config.storage.low_space_watermark_bytes.max(percentage);
-    observed.saturating_add(watermark) <= config.storage.data_dir_budget_bytes
+    free_bytes >= watermark
+        && observed.saturating_add(watermark) <= config.storage.data_dir_budget_bytes
 }
 
 fn directory_bytes(path: &Path) -> Option<u64> {
@@ -2434,12 +2452,19 @@ mod tests {
         let mut config = Config::defaults(&data_dir, 1);
         config.storage.data_dir_budget_bytes = 100;
         config.storage.low_space_watermark_bytes = 20;
-        config.storage.low_space_watermark_percent = 1;
+        config.storage.low_space_watermark_percent = 0;
 
         fs::write(data_dir.join("state.redb"), vec![0u8; 80]).unwrap();
         assert!(disk_write_admission(&config));
         fs::write(data_dir.join("raft.redb"), vec![0u8; 1]).unwrap();
         assert!(!disk_write_admission(&config));
+
+        // The filesystem watermark is evaluated against total/available
+        // space, not the configured directory budget. Keep the fixture
+        // deterministic instead of depending on the host's free space.
+        config.storage.low_space_watermark_percent = 1;
+        assert!(disk_write_admission_with_space(&config, 80, 21, 100));
+        assert!(!disk_write_admission_with_space(&config, 80, 19, 100));
     }
 
     #[test]

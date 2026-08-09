@@ -153,6 +153,14 @@ impl SqlEngine {
     pub fn store(&self) -> &Arc<dyn StateStore> {
         &self.store
     }
+
+    /// Retry the one process-wide command retained after an ambiguous
+    /// committer response.  The exact encoded request is owned by the shared
+    /// sequencer, so shutdown recovery never reconstructs a different
+    /// payload or sequence.  `None` means there was no unresolved command.
+    pub fn resolve_pending_command(&self) -> chorus_common::Result<Option<ApplyResult>> {
+        self.sequencer.retry_pending_if_any(self.committer.as_ref())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4353,6 +4361,7 @@ mod tests {
     use chorus_storage::MemoryStateStore;
     use chorus_txn::{Committer, LocalCommitter};
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
     struct CountingCommitter {
@@ -4400,6 +4409,69 @@ mod tests {
             command: chorus_codec::SchemaCommandV1,
         ) -> chorus_common::Result<ApplyResult> {
             self.schema.fetch_add(1, Ordering::AcqRel);
+            self.inner.submit_schema(command)
+        }
+
+        fn origin(&self) -> OriginId {
+            self.inner.origin()
+        }
+    }
+
+    struct RetryOnceCommitter {
+        inner: LocalCommitter,
+        fail_once: AtomicBool,
+        transactions: Mutex<Vec<chorus_codec::CommitTransactionV1>>,
+        encoded_requests: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl RetryOnceCommitter {
+        fn new(inner: LocalCommitter) -> Self {
+            Self {
+                inner,
+                fail_once: AtomicBool::new(true),
+                transactions: Mutex::new(Vec::new()),
+                encoded_requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Committer for RetryOnceCommitter {
+        fn read_barrier(&self) -> chorus_common::Result<StateSnapshot> {
+            self.inner.read_barrier()
+        }
+
+        fn submit(
+            &self,
+            command: chorus_codec::CommitTransactionV1,
+        ) -> chorus_common::Result<ApplyResult> {
+            let encoded = chorus_codec::encode_command(
+                &chorus_codec::ReplicatedCommandV1::CommitTransaction(command.clone()),
+            )
+            .expect("test command encodes");
+            self.transactions
+                .lock()
+                .expect("transaction capture lock")
+                .push(command.clone());
+            self.encoded_requests
+                .lock()
+                .expect("encoded request capture lock")
+                .push(encoded);
+            if self.fail_once.swap(false, Ordering::AcqRel) {
+                // The command commits, but the response is lost. Shutdown
+                // recovery must deduplicate the exact request rather than
+                // manufacture a second mutation.
+                self.inner.submit(command.clone())?;
+                return Err(ChorusError::Consensus(
+                    "simulated ambiguous response".into(),
+                ));
+            }
+            self.inner.submit(command)
+        }
+
+        fn submit_schema(
+            &self,
+            command: chorus_codec::SchemaCommandV1,
+        ) -> chorus_common::Result<ApplyResult> {
             self.inner.submit_schema(command)
         }
 
@@ -4490,6 +4562,47 @@ mod tests {
         first.execute("COMMIT", &[]).unwrap();
         second.execute("ROLLBACK", &[]).unwrap();
         assert_eq!(counting.calls().1, before_rejected.1 + 1);
+    }
+
+    #[test]
+    fn resolve_pending_command_retries_the_exact_request_once() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(103);
+        let retry = Arc::new(RetryOnceCommitter::new(
+            LocalCommitter::new(store.clone(), origin).unwrap(),
+        ));
+        let committer: Arc<dyn Committer> = retry.clone();
+        let engine = SqlEngine::new(store.clone(), committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE pending_retry (id integer primary key, value text);",
+                &[],
+            )
+            .unwrap();
+        session.execute("BEGIN", &[]).unwrap();
+        session
+            .execute("INSERT INTO pending_retry VALUES (1, 'exact');", &[])
+            .unwrap();
+        assert!(session.execute("COMMIT", &[]).is_err());
+        drop(session);
+
+        let resolved = engine
+            .resolve_pending_command()
+            .unwrap()
+            .expect("ambiguous command should be retried");
+        assert!(matches!(resolved, ApplyResult::Duplicate(_)));
+        assert!(engine.resolve_pending_command().unwrap().is_none());
+        let requests = retry.transactions.lock().expect("transaction capture lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        let encoded = retry
+            .encoded_requests
+            .lock()
+            .expect("encoded request capture lock");
+        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded[0], encoded[1]);
+        assert_eq!(store.snapshot().unwrap().db_epoch(), 2);
     }
 
     #[test]

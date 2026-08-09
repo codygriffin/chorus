@@ -330,7 +330,7 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
         dir.join(".s.PGSQL.5432").display().to_string()
     });
     let server = PgServer::new(
-        engine,
+        Arc::clone(&engine),
         PgConfig {
             tcp_listen: cfg.postgres.listen.clone(),
             unix_socket: socket.clone(),
@@ -372,17 +372,43 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
         }),
     );
     let result = server_handle.wait().map_err(|error| error.to_string());
+    // All connection workers have drained (or reached the PG deadline) at
+    // this point.  Resolve the one exact command retained by the shared SQL
+    // sequencer before dropping the OpenRaft committer/runtime.
+    shutdown.store(true, Ordering::Release);
+    let pending = engine
+        .resolve_pending_command()
+        .map_err(|error| format!("pending command could not be resolved during shutdown: {error}"));
     // If the manager stopped for an internal error rather than a signal, let
     // the watcher observe the token and exit instead of joining forever.
-    shutdown.store(true, Ordering::Release);
     let _ = signal_thread.join();
-    result
+    match (result, pending) {
+        (Err(error), Err(pending_error)) => Err(format!("{error}; {pending_error}")),
+        (Err(error), Ok(Some(outcome))) => {
+            log_event(
+                "pending_command_resolved",
+                serde_json::json!({ "outcome": outcome }),
+            );
+            Err(error)
+        }
+        (Err(error), Ok(None)) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(Some(outcome))) => {
+            log_event(
+                "pending_command_resolved",
+                serde_json::json!({ "outcome": outcome }),
+            );
+            Ok(())
+        }
+        (Ok(()), Ok(None)) => Ok(()),
+    }
 }
 
 /// Wait for process termination signals without introducing unsafe signal
 /// handlers into the node crate. The PostgreSQL server owns listener/session
-/// drain; this thread only flips its shutdown token. OpenRaft shutdown and
-/// checkpoint ordering remain explicit follow-up lifecycle work.
+/// drain; this thread only flips its shutdown token. The node resolves the
+/// shared pending command before OpenRaft's bounded checkpoint-on-drop path;
+/// leader transfer remains unavailable in OpenRaft 0.9.25.
 fn wait_for_shutdown_signal(shutdown: Arc<AtomicBool>, ready: mpsc::SyncSender<bool>) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

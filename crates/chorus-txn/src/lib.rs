@@ -708,6 +708,27 @@ impl CommitSequencer {
         result
     }
 
+    /// Retry the retained command if one exists, preserving a poisoned-state
+    /// error instead of treating it as an empty sequencer.  Shutdown callers
+    /// use this single check-and-retry operation after all sessions drain.
+    pub fn retry_pending_if_any(&self, committer: &dyn Committer) -> Result<Option<ApplyResult>> {
+        let pending = self
+            .state
+            .lock()
+            .map_err(|_| ChorusError::Internal("commit sequencer lock poisoned".into()))?
+            .pending
+            .clone();
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        let result = match pending {
+            PendingCommand::Transaction { command, .. } => committer.submit(command),
+            PendingCommand::Schema { command, .. } => committer.submit_schema(command),
+        };
+        self.finish(result.is_ok())?;
+        result.map(Some)
+    }
+
     pub fn next_sequence_hint(&self) -> u64 {
         self.state.lock().map(|s| s.next).unwrap_or(0)
     }

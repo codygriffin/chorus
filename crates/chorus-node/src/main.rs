@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use chorus_admin::{
-    Config, is_logical_backup, logical_backup_from_store, open_store, render_status,
-    snapshot_file_within_limit, status as node_status,
+    Config, is_logical_backup, logical_backup_from_store, open_store, render_metrics,
+    render_status, snapshot_file_within_limit, status as node_status,
 };
 use chorus_codec::{LogicalSnapshot, ReplicatedCommandV1};
 use chorus_common::{LogId, OriginId};
@@ -161,7 +161,7 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
                 }
                 "metrics" => {
                     let status = node_status(&cfg, &store, None);
-                    println!("{}", render_status(&status));
+                    println!("{}", render_metrics(&status));
                 }
                 _ => println!("{}", render_status(&node_status(&cfg, &store, None))),
             }

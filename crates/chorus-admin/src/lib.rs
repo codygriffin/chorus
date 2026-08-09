@@ -875,6 +875,125 @@ pub fn render_status(status: &NodeStatus) -> String {
     serde_json::to_string_pretty(status).unwrap_or_else(|_| "{}".into())
 }
 
+/// Render the bounded health/replication view as Prometheus text exposition.
+///
+/// This intentionally exposes only values already present in `NodeStatus`.
+/// Request latency histograms, query fingerprints and queue saturation need
+/// instrumentation at their respective owners; emitting fabricated zeros here
+/// would make the admin surface less trustworthy.
+pub fn render_metrics(status: &NodeStatus) -> String {
+    fn gauge(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} gauge");
+        let _ = writeln!(out, "{name} {value}");
+    }
+
+    let mut out = String::new();
+    gauge(
+        &mut out,
+        "chorus_storage_healthy",
+        "Whether the local state store is healthy",
+        u8::from(status.storage.healthy),
+    );
+    gauge(
+        &mut out,
+        "chorus_local_ready",
+        "Whether local state is opened and identity-bound",
+        u8::from(status.local_ready),
+    );
+    gauge(
+        &mut out,
+        "chorus_strict_ready",
+        "Whether a quorum-confirmed strict read is available",
+        u8::from(status.strict_ready),
+    );
+    gauge(
+        &mut out,
+        "chorus_storage_db_epoch",
+        "Replicated logical database epoch",
+        status.storage.db_epoch,
+    );
+    gauge(
+        &mut out,
+        "chorus_storage_catalog_epoch",
+        "Replicated catalog epoch",
+        status.storage.catalog_epoch,
+    );
+    gauge(
+        &mut out,
+        "chorus_replication_lag_entries",
+        "Consensus commit index minus applied index",
+        status.replication_lag,
+    );
+    gauge(
+        &mut out,
+        "chorus_disk_write_admission",
+        "Whether local disk watermarks admit writes",
+        u8::from(status.disk_write_admission),
+    );
+    gauge(
+        &mut out,
+        "chorus_data_dir_budget_bytes",
+        "Configured data-directory budget in bytes",
+        status.data_dir_budget_bytes,
+    );
+    if let Some(bytes) = status.state_file_bytes {
+        gauge(
+            &mut out,
+            "chorus_state_file_bytes",
+            "Observed state file size in bytes",
+            bytes,
+        );
+    }
+
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        out,
+        "# HELP chorus_node_info Static node identity and role\n# TYPE chorus_node_info gauge\nchorus_node_info{{node_id=\"{}\",role=\"{}\"}} 1",
+        status.config_node_id, status.role
+    );
+    if let Some(consensus) = &status.consensus {
+        gauge(
+            &mut out,
+            "chorus_consensus_quorum",
+            "Whether a consensus quorum is currently available",
+            u8::from(consensus.quorum),
+        );
+        gauge(
+            &mut out,
+            "chorus_consensus_term",
+            "Current consensus term",
+            consensus.term,
+        );
+        gauge(
+            &mut out,
+            "chorus_consensus_commit_index",
+            "Current consensus commit index",
+            consensus.commit_index,
+        );
+        gauge(
+            &mut out,
+            "chorus_consensus_applied_index",
+            "Current state-machine applied index",
+            consensus.applied_index,
+        );
+        gauge(
+            &mut out,
+            "chorus_consensus_voters",
+            "Number of configured voters",
+            consensus.voters.len(),
+        );
+        gauge(
+            &mut out,
+            "chorus_consensus_learners",
+            "Number of configured learners",
+            consensus.learners.len(),
+        );
+    }
+    out
+}
+
 /// Build a cluster-independent logical backup. Unlike an OpenRaft recovery
 /// snapshot, this excludes source identity, membership, and request-origin
 /// deduplication state. Restore binds it to the target cluster.
@@ -1911,7 +2030,7 @@ mod tests {
         canonical_mutations, payload_hash,
     };
     use chorus_common::{LogId, OriginId, RequestId};
-    use chorus_storage::StateStore;
+    use chorus_storage::{MemoryStateStore, StateStore};
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair as RcgenKeyPair};
     use ring::signature::{Ed25519KeyPair, KeyPair as RingKeyPair};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2086,6 +2205,20 @@ mod tests {
         let mut partial_identity = config;
         partial_identity.initial_nodes[2].tls_dns_name = None;
         assert!(partial_identity.validate().is_err());
+    }
+
+    #[test]
+    fn metrics_render_low_cardinality_health_and_replication_gauges() {
+        let directory = TestDirectory::new("metrics");
+        let config = Config::defaults(directory.path().join("data"), 7);
+        let store = MemoryStateStore::new();
+        let rendered = render_metrics(&status(&config, &store, None));
+        assert!(rendered.contains("# TYPE chorus_storage_healthy gauge"));
+        assert!(rendered.contains("chorus_local_ready "));
+        assert!(rendered.contains("chorus_strict_ready "));
+        assert!(rendered.contains("chorus_node_info{node_id=\"7\",role=\"unknown\"} 1"));
+        assert!(!rendered.contains("cluster_id"));
+        assert!(!rendered.contains("SELECT"));
     }
 
     #[test]

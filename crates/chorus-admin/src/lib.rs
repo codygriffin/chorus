@@ -29,6 +29,7 @@ const MAX_SNAPSHOT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const IDENTITY_FILE_NAME: &str = "identity.toml";
 const IDENTITY_VERSION: u32 = 1;
 const MAX_IDENTITY_BYTES: u64 = 4096;
+const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
 static NEXT_IDENTITY_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -153,8 +154,43 @@ impl TlsConfig {
 #[serde(default)]
 pub struct InitialNode {
     pub node_id: u64,
+    /// Legacy mode accepts a bare socket address. Authenticated OpenRaft
+    /// requires an `https://IP:PORT` seed from the operator-provisioned
+    /// manifest.
     pub endpoint: String,
     pub voter: bool,
+    /// DNS SAN expected in this node's cluster-issued leaf certificate.
+    pub tls_dns_name: Option<String>,
+    /// Lower- or upper-case hexadecimal SHA-256 of the leaf DER certificate.
+    pub tls_leaf_sha256: Option<String>,
+}
+
+impl InitialNode {
+    pub fn endpoint_socket_addr(&self) -> Result<SocketAddr, ConfigError> {
+        parse_initial_endpoint(&self.endpoint).map(|(address, _)| address)
+    }
+
+    pub fn tls_leaf_fingerprint(&self) -> Result<[u8; 32], ConfigError> {
+        let value = self.tls_leaf_sha256.as_deref().ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "initial node {} is missing tls_leaf_sha256",
+                self.node_id
+            ))
+        })?;
+        decode_sha256(value).map_err(|message| {
+            ConfigError::Invalid(format!(
+                "initial node {} tls_leaf_sha256 {message}",
+                self.node_id
+            ))
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransportTlsMaterial {
+    pub ca_pem: Vec<u8>,
+    pub certificate_pem: Vec<u8>,
+    pub private_key_pem: Vec<u8>,
 }
 
 #[derive(Debug, Error)]
@@ -183,6 +219,8 @@ impl Config {
                 node_id,
                 endpoint: "127.0.0.1:7001".into(),
                 voter: true,
+                tls_dns_name: None,
+                tls_leaf_sha256: None,
             }],
         }
     }
@@ -281,12 +319,7 @@ impl Config {
                     node.node_id
                 )));
             }
-            let endpoint: SocketAddr = node.endpoint.parse().map_err(|_| {
-                ConfigError::Invalid(format!(
-                    "initial node {} endpoint is not a socket address",
-                    node.node_id
-                ))
-            })?;
+            let (endpoint, _) = parse_initial_endpoint(&node.endpoint)?;
             if !endpoints.insert(endpoint) {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate initial node endpoint {}",
@@ -295,6 +328,24 @@ impl Config {
             }
             if node.voter {
                 voters += 1;
+            }
+            match (&node.tls_dns_name, &node.tls_leaf_sha256) {
+                (None, None) => {}
+                (Some(dns_name), Some(_)) => {
+                    validate_dns_name(dns_name).map_err(|message| {
+                        ConfigError::Invalid(format!(
+                            "initial node {} tls_dns_name {message}",
+                            node.node_id
+                        ))
+                    })?;
+                    node.tls_leaf_fingerprint()?;
+                }
+                _ => {
+                    return Err(ConfigError::Invalid(format!(
+                        "initial node {} tls_dns_name and tls_leaf_sha256 must be configured together",
+                        node.node_id
+                    )));
+                }
             }
         }
         if !ids.contains(&self.node_id) {
@@ -465,6 +516,110 @@ impl Config {
     }
     pub fn identity_path(&self) -> PathBuf {
         self.data_dir.join(IDENTITY_FILE_NAME)
+    }
+
+    /// Validate the operator-provisioned static peer manifest used by the
+    /// authenticated OpenRaft mode. This does not claim that the TOML file is
+    /// cryptographically signed; signature verification remains a release
+    /// gate until a manifest signature format and trust key are configured.
+    pub fn validate_openraft_mtls(&self) -> Result<(), ConfigError> {
+        self.validate()?;
+        if !self.tls.complete() {
+            return Err(ConfigError::Invalid(
+                "authenticated OpenRaft requires tls.ca, tls.certificate, and tls.private_key"
+                    .into(),
+            ));
+        }
+        let listen: SocketAddr = self
+            .raft
+            .listen
+            .parse()
+            .map_err(|_| ConfigError::Invalid("raft.listen is not a socket address".into()))?;
+        let mut dns_names = std::collections::BTreeSet::new();
+        let mut fingerprints = std::collections::BTreeSet::new();
+        let mut local_endpoint = None;
+        for node in &self.initial_nodes {
+            let (endpoint, https) = parse_initial_endpoint(&node.endpoint)?;
+            if !https {
+                return Err(ConfigError::Invalid(format!(
+                    "authenticated OpenRaft node {} endpoint must use https://",
+                    node.node_id
+                )));
+            }
+            let dns_name = node.tls_dns_name.as_deref().ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "authenticated OpenRaft node {} is missing tls_dns_name",
+                    node.node_id
+                ))
+            })?;
+            validate_dns_name(dns_name).map_err(|message| {
+                ConfigError::Invalid(format!(
+                    "initial node {} tls_dns_name {message}",
+                    node.node_id
+                ))
+            })?;
+            let fingerprint = node.tls_leaf_fingerprint()?;
+            if !dns_names.insert(dns_name.to_ascii_lowercase()) {
+                return Err(ConfigError::Invalid(
+                    "authenticated OpenRaft DNS names must be unique".into(),
+                ));
+            }
+            if !fingerprints.insert(fingerprint) {
+                return Err(ConfigError::Invalid(
+                    "authenticated OpenRaft leaf fingerprints must be unique".into(),
+                ));
+            }
+            if node.node_id == self.node_id {
+                local_endpoint = Some(endpoint);
+            }
+        }
+        let local_endpoint = local_endpoint.ok_or_else(|| {
+            ConfigError::Invalid("local node is missing from the OpenRaft manifest".into())
+        })?;
+        if listen.port() != local_endpoint.port()
+            || (!listen.ip().is_unspecified() && listen.ip() != local_endpoint.ip())
+        {
+            return Err(ConfigError::Invalid(
+                "raft.listen does not match the local OpenRaft manifest endpoint".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn openraft_bootstrap_node_id(&self) -> Result<u64, ConfigError> {
+        self.initial_nodes
+            .iter()
+            .filter(|node| node.voter)
+            .map(|node| node.node_id)
+            .min()
+            .ok_or_else(|| ConfigError::Invalid("OpenRaft voter set is empty".into()))
+    }
+
+    pub fn transport_tls_material(&self) -> Result<TransportTlsMaterial, ConfigError> {
+        self.validate_openraft_mtls()?;
+        Ok(TransportTlsMaterial {
+            ca_pem: read_bounded_regular_file(
+                self.tls.ca.as_deref().expect("validated CA path"),
+                "tls.ca",
+                false,
+            )?,
+            certificate_pem: read_bounded_regular_file(
+                self.tls
+                    .certificate
+                    .as_deref()
+                    .expect("validated certificate path"),
+                "tls.certificate",
+                false,
+            )?,
+            private_key_pem: read_bounded_regular_file(
+                self.tls
+                    .private_key
+                    .as_deref()
+                    .expect("validated private key path"),
+                "tls.private_key",
+                true,
+            )?,
+        })
     }
 }
 
@@ -991,10 +1146,127 @@ fn sync_parent(path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn parse_initial_endpoint(endpoint: &str) -> Result<(SocketAddr, bool), ConfigError> {
+    let (authority, https) = match endpoint.strip_prefix("https://") {
+        Some(authority) => (authority, true),
+        None => (endpoint, false),
+    };
+    if authority.is_empty()
+        || authority.contains('/')
+        || authority.contains('?')
+        || authority.contains('#')
+        || authority.contains('@')
+    {
+        return Err(ConfigError::Invalid(format!(
+            "initial node endpoint {endpoint:?} is not a bare socket address or HTTPS socket seed"
+        )));
+    }
+    let address: SocketAddr = authority.parse().map_err(|_| {
+        ConfigError::Invalid(format!(
+            "initial node endpoint {endpoint:?} is not a socket address"
+        ))
+    })?;
+    if address.port() == 0 {
+        return Err(ConfigError::Invalid(
+            "initial node endpoint port must be nonzero".into(),
+        ));
+    }
+    Ok((address, https))
+}
+
+fn validate_dns_name(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() || value.len() > 253 || !value.is_ascii() {
+        return Err("must be a nonempty ASCII name no longer than 253 bytes");
+    }
+    for label in value.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+        {
+            return Err("contains an invalid DNS label");
+        }
+    }
+    Ok(())
+}
+
+fn decode_sha256(value: &str) -> Result<[u8; 32], &'static str> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("must be exactly 64 hexadecimal characters");
+    }
+    let mut decoded = [0; 32];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        let high = value.as_bytes()[index * 2];
+        let low = value.as_bytes()[index * 2 + 1];
+        *output = (hex_nibble(high) << 4) | hex_nibble(low);
+    }
+    Ok(decoded)
+}
+
+fn hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        b'A'..=b'F' => value - b'A' + 10,
+        _ => unreachable!("decode_sha256 validated hexadecimal input"),
+    }
+}
+
+fn read_bounded_regular_file(
+    path: &Path,
+    name: &str,
+    private: bool,
+) -> Result<Vec<u8>, ConfigError> {
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| ConfigError::Invalid(format!("{name} cannot be read: {error}")))?;
+    validate_tls_metadata(&path_metadata, name, private)?;
+    let mut file = open_identity_read(path)
+        .map_err(|error| ConfigError::Invalid(format!("{name} cannot be opened: {error}")))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| ConfigError::Invalid(format!("{name} cannot be inspected: {error}")))?;
+    let current_metadata = fs::symlink_metadata(path)
+        .map_err(|error| ConfigError::Invalid(format!("{name} cannot be rechecked: {error}")))?;
+    if !same_file(&opened_metadata, &current_metadata) {
+        return Err(ConfigError::Invalid(format!(
+            "{name} changed while it was being opened"
+        )));
+    }
+    validate_tls_metadata(&opened_metadata, name, private)?;
+    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_TLS_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ConfigError::Io(error.to_string()))?;
+    if bytes.len() as u64 > MAX_TLS_FILE_BYTES {
+        return Err(ConfigError::Invalid(format!(
+            "{name} exceeds {MAX_TLS_FILE_BYTES} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
 fn validate_tls_file(path: Option<&Path>, name: &str, private: bool) -> Result<(), ConfigError> {
     let path = path.ok_or_else(|| ConfigError::Invalid(format!("{name} is missing")))?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|e| ConfigError::Invalid(format!("{name} cannot be read: {e}")))?;
+    validate_tls_metadata(&metadata, name, private)
+}
+
+fn validate_tls_metadata(
+    metadata: &fs::Metadata,
+    name: &str,
+    private: bool,
+) -> Result<(), ConfigError> {
     if !metadata.is_file() {
         return Err(ConfigError::Invalid(format!(
             "{name} is not a regular file"
@@ -1002,6 +1274,11 @@ fn validate_tls_file(path: Option<&Path>, name: &str, private: bool) -> Result<(
     }
     if metadata.len() == 0 {
         return Err(ConfigError::Invalid(format!("{name} is empty")));
+    }
+    if metadata.len() > MAX_TLS_FILE_BYTES {
+        return Err(ConfigError::Invalid(format!(
+            "{name} exceeds {MAX_TLS_FILE_BYTES} bytes"
+        )));
     }
     if private {
         #[cfg(unix)]
@@ -1095,6 +1372,107 @@ mod tests {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))
                 .expect("set private test permissions");
         }
+    }
+
+    fn fingerprint(byte: u8) -> String {
+        std::iter::repeat_n(format!("{byte:02x}"), 32).collect()
+    }
+
+    fn authenticated_config(directory: &TestDirectory) -> Config {
+        fs::create_dir_all(directory.path()).expect("create test directory");
+        let ca = directory.path().join("ca.pem");
+        let certificate = directory.path().join("node.pem");
+        let private_key = directory.path().join("node-key.pem");
+        fs::write(&ca, b"test CA").expect("write CA");
+        fs::write(&certificate, b"test certificate").expect("write certificate");
+        fs::write(&private_key, b"test private key").expect("write private key");
+        make_private_file(&private_key);
+        let mut config = Config::defaults(directory.path().join("data"), 1);
+        config.tls = TlsConfig {
+            ca: Some(ca),
+            certificate: Some(certificate),
+            private_key: Some(private_key),
+        };
+        config.initial_nodes = (1..=3)
+            .map(|node_id| InitialNode {
+                node_id,
+                endpoint: format!("https://127.0.0.1:{}", 7000 + node_id),
+                voter: true,
+                tls_dns_name: Some(format!("node-{node_id}.chorus.test")),
+                tls_leaf_sha256: Some(fingerprint(node_id as u8)),
+            })
+            .collect();
+        config
+    }
+
+    #[test]
+    fn authenticated_openraft_manifest_is_complete_unique_and_listen_bound() {
+        let directory = TestDirectory::new("authenticated-manifest");
+        let config = authenticated_config(&directory);
+        config.validate_openraft_mtls().expect("valid manifest");
+        assert_eq!(1, config.openraft_bootstrap_node_id().unwrap());
+        assert_eq!(
+            [1; 32],
+            config.initial_nodes[0].tls_leaf_fingerprint().unwrap()
+        );
+
+        let mut bare_endpoint = config.clone();
+        bare_endpoint.initial_nodes[0].endpoint = "127.0.0.1:7001".into();
+        assert!(
+            bare_endpoint
+                .validate_openraft_mtls()
+                .unwrap_err()
+                .to_string()
+                .contains("https://")
+        );
+
+        let mut duplicate_identity = config.clone();
+        duplicate_identity.initial_nodes[1].tls_leaf_sha256 =
+            duplicate_identity.initial_nodes[0].tls_leaf_sha256.clone();
+        assert!(
+            duplicate_identity
+                .validate_openraft_mtls()
+                .unwrap_err()
+                .to_string()
+                .contains("fingerprints must be unique")
+        );
+
+        let mut mismatched_listen = config.clone();
+        mismatched_listen.raft.listen = "127.0.0.1:7999".into();
+        assert!(
+            mismatched_listen
+                .validate_openraft_mtls()
+                .unwrap_err()
+                .to_string()
+                .contains("raft.listen")
+        );
+
+        let mut partial_identity = config;
+        partial_identity.initial_nodes[2].tls_dns_name = None;
+        assert!(partial_identity.validate().is_err());
+    }
+
+    #[test]
+    fn authenticated_tls_material_reads_exact_bounded_private_files() {
+        let directory = TestDirectory::new("authenticated-tls-material");
+        let config = authenticated_config(&directory);
+        let material = config.transport_tls_material().expect("read TLS material");
+        assert_eq!(b"test CA", material.ca_pem.as_slice());
+        assert_eq!(b"test certificate", material.certificate_pem.as_slice());
+        assert_eq!(b"test private key", material.private_key_pem.as_slice());
+
+        fs::write(
+            config.tls.ca.as_ref().unwrap(),
+            vec![0; MAX_TLS_FILE_BYTES as usize + 1],
+        )
+        .expect("write oversized CA");
+        assert!(
+            config
+                .transport_tls_material()
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
     }
 
     #[test]

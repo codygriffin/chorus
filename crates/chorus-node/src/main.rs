@@ -6,6 +6,7 @@ use chorus_admin::{
 };
 use chorus_codec::{LogicalSnapshot, ReplicatedCommandV1};
 use chorus_common::{LogId, OriginId};
+use chorus_consensus::openraft_transport::{PeerTlsConfig, TransportTlsIdentity, leaf_fingerprint};
 use chorus_consensus::{
     Consensus, ConsensusCommitter, NetworkConsensus, OpenRaftConsensus, StandaloneConsensus,
 };
@@ -153,6 +154,17 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
     let cfg = Config::load(path).map_err(|e| e.to_string())?;
     cfg.validate().map_err(|e| e.to_string())?;
     let openraft_single_node = has_flag(args, "--openraft-single-node");
+    let openraft_mtls = has_flag(args, "--openraft-mtls");
+    if openraft_single_node && openraft_mtls {
+        return Err("choose only one OpenRaft serving mode".into());
+    }
+    if openraft_mtls {
+        let _identity = openraft_transport_identity(&cfg)?;
+        return Err(
+            "authenticated OpenRaft configuration is valid, but multi-node runtime wiring is not enabled in this checkpoint"
+                .into(),
+        );
+    }
     if openraft_single_node {
         validate_openraft_single_node(&cfg)?;
     }
@@ -542,6 +554,82 @@ fn validate_openraft_single_node(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+fn openraft_transport_identity(cfg: &Config) -> Result<Arc<TransportTlsIdentity>, String> {
+    cfg.validate_openraft_mtls()
+        .map_err(|error| error.to_string())?;
+    let material = cfg
+        .transport_tls_material()
+        .map_err(|error| error.to_string())?;
+
+    let mut ca_reader = material.ca_pem.as_slice();
+    let ca_count = rustls_pemfile::certs(&mut ca_reader)
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| format!("could not parse tls.ca: {error}"))?
+        .len();
+    if ca_count == 0 {
+        return Err("tls.ca contains no certificate".into());
+    }
+    let mut certificate_reader = material.certificate_pem.as_slice();
+    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| format!("could not parse tls.certificate: {error}"))?;
+    let local_leaf = certificates
+        .first()
+        .ok_or_else(|| "tls.certificate contains no leaf certificate".to_string())?;
+    let mut key_reader = material.private_key_pem.as_slice();
+    if rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|error| format!("could not parse tls.private_key: {error}"))?
+        .is_none()
+    {
+        return Err("tls.private_key contains no private key".into());
+    }
+
+    let local = cfg
+        .initial_nodes
+        .iter()
+        .find(|node| node.node_id == cfg.node_id)
+        .ok_or_else(|| "local node is missing from the peer manifest".to_string())?;
+    if leaf_fingerprint(local_leaf.as_ref())
+        != local
+            .tls_leaf_fingerprint()
+            .map_err(|error| error.to_string())?
+    {
+        return Err("local TLS leaf does not match the peer manifest fingerprint".into());
+    }
+
+    let peers =
+        cfg.initial_nodes
+            .iter()
+            .filter(|node| node.node_id != cfg.node_id)
+            .map(|node| {
+                Ok((
+                    node.node_id,
+                    PeerTlsConfig {
+                        node_id: node.node_id,
+                        endpoint: node.endpoint.clone(),
+                        dns_name: node.tls_dns_name.clone().ok_or_else(|| {
+                            format!("node {} is missing tls_dns_name", node.node_id)
+                        })?,
+                        leaf_sha256: node
+                            .tls_leaf_fingerprint()
+                            .map_err(|error| error.to_string())?,
+                    },
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+    let identity = Arc::new(TransportTlsIdentity {
+        cluster_id: cfg.cluster_id().0,
+        cluster_incarnation: cfg.cluster_incarnation,
+        node_id: cfg.node_id,
+        ca_pem: material.ca_pem,
+        certificate_pem: material.certificate_pem,
+        private_key_pem: material.private_key_pem,
+        peers,
+    });
+    identity.validate().map_err(|error| error.to_string())?;
+    Ok(identity)
+}
+
 fn ensure_openraft_legacy_state_empty(store: &dyn StateStore) -> Result<(), String> {
     let snapshot = store.snapshot().map_err(|error| error.to_string())?;
     if snapshot.last_applied() != LogId::ZERO
@@ -647,7 +735,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 fn print_help() {
     println!(
-        "Chorus MVP\n\nUSAGE:\n  chorus run --config PATH [--allow-insecure-dev | --openraft-single-node]\n  chorus bootstrap [--config PATH] [--data-dir PATH] [--node-id N] [--confirm] [--openraft-single-node]\n  chorus status|check|metrics|state-hash --config PATH\n  chorus member list [--config PATH]\n  chorus member add-learner|promote|demote|remove --node-id N --config PATH --cluster-id ID --confirm --offline\n  chorus snapshot create|export --config PATH --output PATH --offline\n  chorus snapshot inspect --input PATH\n  chorus restore --input PATH --config PATH --cluster-id ID --confirm --force-new-cluster"
+        "Chorus MVP\n\nUSAGE:\n  chorus run --config PATH [--allow-insecure-dev | --openraft-single-node | --openraft-mtls]\n  chorus bootstrap [--config PATH] [--data-dir PATH] [--node-id N] [--confirm] [--openraft-single-node]\n  chorus status|check|metrics|state-hash --config PATH\n  chorus member list [--config PATH]\n  chorus member add-learner|promote|demote|remove --node-id N --config PATH --cluster-id ID --confirm --offline\n  chorus snapshot create|export --config PATH --output PATH --offline\n  chorus snapshot inspect --input PATH\n  chorus restore --input PATH --config PATH --cluster-id ID --confirm --force-new-cluster"
     );
 }
 
@@ -655,6 +743,75 @@ fn print_help() {
 mod tests {
     use super::*;
     use chorus_admin::InitialNode;
+    use rcgen::{
+        BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+
+    fn test_ca() -> (Certificate, KeyPair) {
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        (certificate, key)
+    }
+
+    fn test_leaf(
+        ca: &Certificate,
+        ca_key: &KeyPair,
+        dns_name: &str,
+    ) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
+        let mut params = CertificateParams::new(vec![dns_name.to_owned()]).unwrap();
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&key, ca, ca_key).unwrap();
+        (
+            certificate.pem().into_bytes(),
+            key.serialize_pem().into_bytes(),
+            leaf_fingerprint(certificate.der().as_ref()),
+        )
+    }
+
+    fn authenticated_test_config(root: &Path) -> Config {
+        let (ca, ca_key) = test_ca();
+        let leaves: Vec<_> = (1..=3)
+            .map(|node_id| test_leaf(&ca, &ca_key, &format!("node-{node_id}.chorus.test")))
+            .collect();
+        let ca_path = root.join("ca.pem");
+        let certificate_path = root.join("node.pem");
+        let key_path = root.join("node-key.pem");
+        fs::write(&ca_path, ca.pem()).unwrap();
+        fs::write(&certificate_path, &leaves[0].0).unwrap();
+        fs::write(&key_path, &leaves[0].1).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut config = Config::defaults(root.join("data"), 1);
+        config.tls.ca = Some(ca_path);
+        config.tls.certificate = Some(certificate_path);
+        config.tls.private_key = Some(key_path);
+        config.initial_nodes = (1..=3)
+            .map(|node_id| InitialNode {
+                node_id,
+                endpoint: format!("https://127.0.0.1:{}", 7000 + node_id),
+                voter: true,
+                tls_dns_name: Some(format!("node-{node_id}.chorus.test")),
+                tls_leaf_sha256: Some(hex(&leaves[node_id as usize - 1].2)),
+            })
+            .collect();
+        config
+    }
 
     #[test]
     fn openraft_bootstrap_is_explicit_reopenable_and_keeps_legacy_state_empty() {
@@ -698,6 +855,8 @@ mod tests {
             node_id: 2,
             endpoint: "127.0.0.1:7002".into(),
             voter: true,
+            tls_dns_name: None,
+            tls_leaf_sha256: None,
         });
         let error = validate_openraft_single_node(&cfg).unwrap_err();
         assert!(error.contains("authenticated Tonic/Rustls transport"));
@@ -735,5 +894,36 @@ mod tests {
         let (raft_path, state_path) = openraft_paths(&cfg);
         assert!(!raft_path.exists());
         assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn openraft_mtls_identity_binds_local_leaf_and_peer_manifest_before_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("chorus.toml");
+        let config = authenticated_test_config(root.path());
+        let identity = openraft_transport_identity(&config).unwrap();
+        assert_eq!(config.cluster_id().0, identity.cluster_id);
+        assert_eq!(1, identity.node_id);
+        assert_eq!(
+            vec![2, 3],
+            identity.peers.keys().copied().collect::<Vec<_>>()
+        );
+
+        config.save(&config_path).unwrap();
+        let error = run_command(
+            &["run".into(), "--openraft-mtls".into()],
+            &config_path.display().to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("runtime wiring is not enabled"));
+        assert!(!config.data_dir.join("raft.redb").exists());
+
+        let mut wrong_leaf = config;
+        wrong_leaf.initial_nodes[0].tls_leaf_sha256 = Some("00".repeat(32));
+        let error = match openraft_transport_identity(&wrong_leaf) {
+            Ok(_) => panic!("mismatched local leaf must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("local TLS leaf"));
     }
 }

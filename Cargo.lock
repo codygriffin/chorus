@@ -390,6 +390,8 @@ dependencies = [
  "chorus-sql",
  "chorus-storage",
  "chorus-txn",
+ "rcgen",
+ "rustls-pemfile",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

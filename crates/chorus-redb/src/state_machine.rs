@@ -5,6 +5,7 @@
 //! image is accepted once and migrated atomically on first reopen; new writes
 //! never recreate that layout.
 
+use std::fs;
 use std::io::{self, Cursor, SeekFrom};
 use std::path::Path;
 use std::pin::Pin;
@@ -171,6 +172,7 @@ const STATE_FORMAT_VERSION: u16 = 1;
 const SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const SNAPSHOT_ENVELOPE_VERSION: u8 = 1;
 const SNAPSHOT_ENVELOPE_MAGIC: &[u8; 16] = b"CHORUS-RAFTSNAP2";
+static NEXT_STATE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 const STATE_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state_meta");
 const STATE_KV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state_kv");
@@ -239,7 +241,9 @@ pub enum RedbStateMachineError {
 
 #[derive(Clone)]
 pub struct RedbStateMachine {
-    db: Arc<Database>,
+    db: Arc<RwLock<Arc<Database>>>,
+    active_path: Arc<std::path::PathBuf>,
+    retired_generations: Arc<Mutex<Vec<(std::path::PathBuf, Arc<Database>)>>>,
     write_lock: Arc<Mutex<()>>,
     healthy: Arc<AtomicBool>,
     current_snapshot: Arc<RwLock<Option<CachedSnapshot>>>,
@@ -291,13 +295,17 @@ impl RedbStateMachine {
                 "cluster id and incarnation must be nonzero".into(),
             ));
         }
+        let active_path = path.as_ref().to_path_buf();
+        recover_missing_generation(&active_path).map_err(state_redb_error)?;
         let db = redb::Builder::new()
             .set_cache_size(STATE_CACHE_BYTES)
-            .create(path)
+            .create(&active_path)
             .map_err(state_redb_error)?;
         initialize_or_validate(&db, cluster_id, cluster_incarnation)?;
         let mut state_machine = Self {
-            db: Arc::new(db),
+            db: Arc::new(RwLock::new(Arc::new(db))),
+            active_path: Arc::new(active_path),
+            retired_generations: Arc::new(Mutex::new(Vec::new())),
             write_lock: Arc::new(Mutex::new(())),
             healthy: Arc::new(AtomicBool::new(true)),
             current_snapshot: Arc::new(RwLock::new(None)),
@@ -310,7 +318,10 @@ impl RedbStateMachine {
             .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
         validate_envelope(&envelope, cluster_id, cluster_incarnation)
             .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
-        let persisted_snapshot = read_persisted_snapshot(&state_machine.db)
+        let active_db = state_machine
+            .database()
+            .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
+        let persisted_snapshot = read_persisted_snapshot(&active_db)
             .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
         if let Some(cached) = &persisted_snapshot {
             validate_cached_snapshot(cached, cluster_id, cluster_incarnation, &envelope)
@@ -354,6 +365,7 @@ impl RedbStateMachine {
             })?;
         }
         state_machine.current_snapshot = Arc::new(RwLock::new(persisted_snapshot));
+        cleanup_stale_generations(&state_machine.active_path);
         Ok(state_machine)
     }
 
@@ -418,13 +430,22 @@ impl RedbStateMachine {
             .map_err(|_| io_other("state-machine write lock is poisoned"))
     }
 
+    fn database(&self) -> io::Result<Arc<Database>> {
+        self.db
+            .read()
+            .map_err(|_| io_other("state-machine database lock is poisoned"))
+            .map(|database| Arc::clone(&database))
+    }
+
     fn read_envelope(&self) -> io::Result<DurableStateEnvelope> {
-        read_envelope(&self.db)
+        let database = self.database()?;
+        read_envelope(&database)
     }
 
     fn commit_envelope(&self, envelope: &DurableStateEnvelope) -> io::Result<()> {
         validate_envelope(envelope, self.cluster_id, self.cluster_incarnation)?;
-        write_envelope(&self.db, envelope)
+        let database = self.database()?;
+        write_envelope(&database, envelope)
     }
 
     fn apply_batch(
@@ -552,7 +573,8 @@ impl RedbStateMachine {
                 marker: snapshot_marker(&payload)?,
             },
         };
-        persist_snapshot(&self.db, &cached)?;
+        let database = self.database()?;
+        persist_snapshot(&database, &cached)?;
         if let Some(purge_fence) = &self.purge_fence {
             // The state snapshot is already committed with redb's Immediate
             // durability before this second durable transaction can move the
@@ -568,6 +590,109 @@ impl RedbStateMachine {
             .write()
             .map_err(|_| io_other("snapshot cache lock is poisoned"))? = Some(cached.clone());
         Ok(cached)
+    }
+
+    /// Publish an imported snapshot as a complete redb generation.
+    ///
+    /// The active database is never partially rewritten: a fully initialized
+    /// temporary database is committed and synced first, then its pathname is
+    /// atomically exchanged with the active pathname.  The previous database
+    /// handle and pathname are retained until no state-machine reader still
+    /// holds a clone of that handle; a later publication reaps it.
+    fn publish_generation(
+        &self,
+        envelope: &DurableStateEnvelope,
+        snapshot: &CachedSnapshot,
+    ) -> io::Result<()> {
+        let mut active_slot = self
+            .db
+            .write()
+            .map_err(|_| io_other("state-machine database lock is poisoned"))?;
+        let previous_db = Arc::clone(&active_slot);
+        let active_path = self.active_path.as_path();
+        let generation = NEXT_STATE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let temp_path = std::path::PathBuf::from(format!(
+            "{}.install-{}.tmp",
+            active_path.display(),
+            generation
+        ));
+        let old_path =
+            std::path::PathBuf::from(format!("{}.old-{}", active_path.display(), generation));
+
+        let temp_db = redb::Builder::new()
+            .set_cache_size(STATE_CACHE_BYTES)
+            .create(&temp_path)
+            .map_err(to_io)?;
+        if let Err(error) =
+            initialize_or_validate(&temp_db, self.cluster_id, self.cluster_incarnation)
+                .map_err(|error| io_other(error.to_string()))
+                .and_then(|_| write_envelope_and_snapshot(&temp_db, envelope, snapshot))
+        {
+            drop(temp_db);
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        drop(temp_db);
+        fs::File::open(&temp_path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                let _ = fs::remove_file(&temp_path);
+                io_other(format!("snapshot generation fsync failed: {error}"))
+            })?;
+
+        let active_exists = fs::symlink_metadata(active_path).is_ok();
+        if active_exists {
+            if let Err(error) = fs::rename(active_path, &old_path) {
+                let _ = fs::remove_file(&temp_path);
+                return Err(io_other(format!(
+                    "could not stage the previous state generation: {error}"
+                )));
+            }
+        }
+        let moved_old = active_exists;
+        if let Err(error) = fs::rename(&temp_path, active_path) {
+            if moved_old {
+                let _ = fs::rename(&old_path, active_path);
+            }
+            let _ = fs::remove_file(&temp_path);
+            return Err(io_other(format!(
+                "could not publish the new state generation: {error}"
+            )));
+        }
+        if let Err(error) = sync_parent_directory(active_path) {
+            let _ = fs::remove_file(active_path);
+            if moved_old {
+                let _ = fs::rename(&old_path, active_path);
+            }
+            return Err(io_other(format!(
+                "state generation parent fsync failed: {error}"
+            )));
+        }
+
+        let new_db = match redb::Builder::new()
+            .set_cache_size(STATE_CACHE_BYTES)
+            .open(active_path)
+        {
+            Ok(database) => Arc::new(database),
+            Err(error) => {
+                let _ = fs::remove_file(active_path);
+                if moved_old {
+                    let _ = fs::rename(&old_path, active_path);
+                }
+                return Err(io_other(format!(
+                    "published state generation could not be reopened: {error}"
+                )));
+            }
+        };
+        *active_slot = Arc::clone(&new_db);
+
+        if moved_old {
+            if let Ok(mut retired) = self.retired_generations.lock() {
+                reap_retired_generations(&mut retired);
+                retired.push((old_path, previous_db));
+            }
+        }
+        Ok(())
     }
 
     fn install_snapshot_record(
@@ -632,7 +757,7 @@ impl RedbStateMachine {
             self.cluster_incarnation,
             &envelope,
         )?;
-        write_envelope_and_snapshot(&self.db, &envelope, &cached)?;
+        self.publish_generation(&envelope, &cached)?;
         if let Some(purge_fence) = &self.purge_fence {
             // The complete state and its imported-snapshot proof are already
             // durable. Only now may raft.redb publish the corresponding
@@ -648,6 +773,23 @@ impl RedbStateMachine {
             .write()
             .map_err(|_| io_other("snapshot cache lock is poisoned"))? = Some(cached);
         Ok(())
+    }
+}
+
+impl Drop for RedbStateMachine {
+    fn drop(&mut self) {
+        // Snapshot readers use copied bounded bytes, so once the final
+        // state-machine clone disappears no redb transaction can still need
+        // the retired generation.  Crash leftovers are handled on the next
+        // successful open by `cleanup_stale_generations`.
+        if Arc::strong_count(&self.retired_generations) == 1 {
+            if let Ok(mut retired) = self.retired_generations.lock() {
+                for (path, database) in retired.drain(..) {
+                    drop(database);
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
     }
 }
 
@@ -1707,6 +1849,76 @@ fn to_io(error: impl std::fmt::Display) -> io::Error {
     io_other(error.to_string())
 }
 
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io_other("state generation has no parent directory"))?;
+    fs::File::open(parent)?.sync_all()
+}
+
+fn generation_name_prefix(path: &Path, suffix: &str) -> Option<(std::path::PathBuf, String)> {
+    let parent = path.parent()?.to_path_buf();
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    Some((parent, format!("{name}{suffix}")))
+}
+
+fn recover_missing_generation(path: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(path).is_ok() {
+        return Ok(());
+    }
+    let Some((parent, prefix)) = generation_name_prefix(path, ".old-") else {
+        return Ok(());
+    };
+    let mut candidate: Option<(String, std::path::PathBuf)> = None;
+    for entry in fs::read_dir(&parent)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix)
+            && candidate
+                .as_ref()
+                .is_none_or(|(current_name, _)| name > *current_name)
+        {
+            candidate = Some((name, entry.path()));
+        }
+    }
+    if let Some((_name, old_path)) = candidate {
+        fs::rename(old_path, path)?;
+        sync_parent_directory(path)?;
+    }
+    Ok(())
+}
+
+fn cleanup_stale_generations(path: &Path) {
+    let Some((parent, old_prefix)) = generation_name_prefix(path, ".old-") else {
+        return;
+    };
+    let Some((_parent, temp_prefix)) = generation_name_prefix(path, ".install-") else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&old_prefix) || name.starts_with(&temp_prefix) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn reap_retired_generations(retired: &mut Vec<(std::path::PathBuf, Arc<Database>)>) {
+    let mut index = 0;
+    while index < retired.len() {
+        if Arc::strong_count(&retired[index].1) == 1 {
+            let (path, database) = retired.remove(index);
+            drop(database);
+            let _ = fs::remove_file(path);
+        } else {
+            index += 1;
+        }
+    }
+}
+
 fn state_redb_error(error: impl std::fmt::Display) -> RedbStateMachineError {
     RedbStateMachineError::Redb(error.to_string())
 }
@@ -2082,6 +2294,16 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            fs::read_dir(destination_dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("state.redb.old-")),
+            "snapshot install must retain the previous generation until the handle is dropped"
+        );
         assert_eq!(Some(log_id(1, 1)), applied(&mut destination).await.0);
         assert_eq!(
             origin,
@@ -2130,6 +2352,35 @@ mod tests {
             .unwrap();
         assert!(bounded.write_all(&[1]).await.is_err());
         assert!(bounded.into_inner().is_empty());
+        drop(destination);
+        assert!(
+            fs::read_dir(destination_dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("state.redb.old-")),
+            "retired generations must be reaped after the final state handle drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_active_generation_recovers_the_last_retained_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let mut state = RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION).unwrap();
+        apply(&mut state, [membership_entry(), noop_entry(1)])
+            .await
+            .unwrap();
+        drop(state);
+
+        let old_path = dir.path().join("state.redb.old-crash");
+        fs::rename(&path, &old_path).unwrap();
+        let mut recovered = RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION).unwrap();
+        assert_eq!(Some(log_id(1, 1)), applied(&mut recovered).await.0);
+        assert!(path.is_file());
+        assert!(!old_path.exists());
     }
 
     #[tokio::test]

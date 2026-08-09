@@ -30,6 +30,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
+use crate::PurgeFenceHandle;
+
 /// In-memory snapshot stream with an allocation bound enforced on every write.
 ///
 /// This is intentionally a bounded correctness adapter, not the final
@@ -208,6 +210,7 @@ pub struct RedbStateMachine {
     db: Arc<Database>,
     write_lock: Arc<Mutex<()>>,
     current_snapshot: Arc<RwLock<Option<CachedSnapshot>>>,
+    purge_fence: Option<PurgeFenceHandle<ChorusRaftConfig>>,
     cluster_id: [u8; 16],
     cluster_incarnation: u64,
 }
@@ -217,6 +220,38 @@ impl RedbStateMachine {
         path: impl AsRef<Path>,
         cluster_id: [u8; 16],
         cluster_incarnation: u64,
+    ) -> Result<Self, RedbStateMachineError> {
+        Self::open_inner(path, cluster_id, cluster_incarnation, None)
+    }
+
+    /// Open a state machine whose locally-built snapshots may authorize purge
+    /// in the matching durable Raft log store.
+    ///
+    /// The handle is an explicit opt-in capability obtained from
+    /// [`crate::RedbRaftLogStore::purge_fence_handle`].  Identity is checked
+    /// before any state is opened; a handle for another cluster or
+    /// incarnation is rejected.
+    pub fn open_with_purge_fence(
+        path: impl AsRef<Path>,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+        purge_fence: PurgeFenceHandle<ChorusRaftConfig>,
+    ) -> Result<Self, RedbStateMachineError> {
+        if purge_fence.cluster_id() != cluster_id
+            || purge_fence.cluster_incarnation() != cluster_incarnation
+        {
+            return Err(RedbStateMachineError::InvalidIdentity(
+                "purge-fence identity does not match state-machine identity".into(),
+            ));
+        }
+        Self::open_inner(path, cluster_id, cluster_incarnation, Some(purge_fence))
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+        purge_fence: Option<PurgeFenceHandle<ChorusRaftConfig>>,
     ) -> Result<Self, RedbStateMachineError> {
         if cluster_id == [0; 16] || cluster_incarnation == 0 {
             return Err(RedbStateMachineError::InvalidIdentity(
@@ -232,6 +267,7 @@ impl RedbStateMachine {
             db: Arc::new(db),
             write_lock: Arc::new(Mutex::new(())),
             current_snapshot: Arc::new(RwLock::new(None)),
+            purge_fence,
             cluster_id,
             cluster_incarnation,
         };
@@ -245,6 +281,25 @@ impl RedbStateMachine {
         if let Some(cached) = &persisted_snapshot {
             validate_cached_snapshot(cached, cluster_id, cluster_incarnation, &envelope)
                 .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
+        }
+        if let (Some(purge_fence), Some(cached)) = (&state_machine.purge_fence, &persisted_snapshot)
+        {
+            // A process can crash after the state database commits a snapshot
+            // and before the separate raft.redb fence transaction commits.
+            // Once the snapshot has passed all validation above, replay the
+            // monotonic publication step during reopen.  This is safe because
+            // `advance` rejects regressions and identity mismatches, while a
+            // missing/unknown log id fails closed and leaves the log retained.
+            let log_id = cached.meta.last_log_id.clone().ok_or_else(|| {
+                RedbStateMachineError::Corrupt(
+                    "durable snapshot is missing its applied log id".into(),
+                )
+            })?;
+            purge_fence.advance(log_id).map_err(|error| {
+                RedbStateMachineError::Corrupt(format!(
+                    "durable snapshot purge-fence reconciliation failed: {error}"
+                ))
+            })?;
         }
         state_machine.current_snapshot = Arc::new(RwLock::new(persisted_snapshot));
         Ok(state_machine)
@@ -412,6 +467,16 @@ impl RedbStateMachine {
         };
         let cached = CachedSnapshot { meta, bytes };
         persist_snapshot(&self.db, &cached)?;
+        if let Some(purge_fence) = &self.purge_fence {
+            // The state snapshot is already committed with redb's Immediate
+            // durability before this second durable transaction can move the
+            // log purge fence.  If this fails, return an error and leave the
+            // in-memory publication cache unchanged; the persisted snapshot
+            // is intentionally recoverable while the log remains retained.
+            purge_fence.advance(last_applied).map_err(|error| {
+                io_other(format!("snapshot purge-fence advance failed: {error}"))
+            })?;
+        }
         *self
             .current_snapshot
             .write()

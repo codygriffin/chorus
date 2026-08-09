@@ -2,13 +2,15 @@
 
 //! Durable OpenRaft log storage backed by redb.
 //!
-//! This crate implements only the log/vote side of OpenRaft's storage-v2
-//! boundary. State-machine application and snapshot construction are separate
-//! integration steps. In particular, purging is fenced by an explicit durable
-//! checkpoint marker that a future state-machine adapter must advance.
+//! This crate implements the durable log/vote and state-machine sides of
+//! OpenRaft's storage-v2 boundary. Locally-built snapshots can opt into an
+//! identity-bound publication handle so the durable purge fence advances only
+//! after the logical snapshot is recoverable.
 
+pub mod purge_fence;
 pub mod state_machine;
 
+pub use purge_fence::PurgeFenceHandle;
 pub use state_machine::{
     BoundedSnapshotData, ChorusRaftConfig, RedbStateMachine, RedbStateMachineError,
 };
@@ -130,6 +132,12 @@ impl<C: RaftTypeConfig> RedbRaftLogStore<C> {
         self.cluster_incarnation
     }
 
+    /// Return an explicit capability for state/snapshot publication to
+    /// advance this store's durable purge fence.
+    pub fn purge_fence_handle(&self) -> PurgeFenceHandle<C> {
+        PurgeFenceHandle::from_store(self)
+    }
+
     /// Advance the durable proof through which log entries may be purged.
     ///
     /// This method must only be called after the state machine or a logical
@@ -152,6 +160,13 @@ impl<C: RaftTypeConfig> RedbRaftLogStore<C> {
             validate_known_log_id::<C>(db, &log_id)?;
             write_meta(db, KEY_PURGE_FENCE, &log_id)
         })
+    }
+
+    pub(crate) fn read_purge_fence(
+        &self,
+    ) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
+        read_meta::<LogId<C::NodeId>>(&self.db, KEY_PURGE_FENCE)
+            .map_err(|e| storage_error(ErrorSubject::Store, ErrorVerb::Read, e))
     }
 
     fn lock_writes(&self) -> io::Result<MutexGuard<'_, ()>> {

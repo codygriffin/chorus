@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::task::{Context, Poll};
 
-use chorus_codec::{ApplyResult, LogicalSnapshot, ReplicatedCommandV1};
+use chorus_codec::{ApplyResult, LogicalSnapshot, ReplicatedCommandV1, hash32};
 use chorus_common::LogId as ChorusLogId;
 use chorus_storage::{
     Membership as ChorusMembership, MemoryStateStore, StateData, StateSnapshot, StateStore,
@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 use crate::PurgeFenceHandle;
+use crate::purge_fence::{DurableSnapshotMarker, SNAPSHOT_MARKER_FORMAT_VERSION};
 
 /// In-memory snapshot stream with an allocation bound enforced on every write.
 ///
@@ -168,6 +169,7 @@ const STATE_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state_me
 const KEY_STATE: &[u8] = b"state_envelope";
 const KEY_SNAPSHOT_META: &[u8] = b"snapshot_meta";
 const KEY_SNAPSHOT_DATA: &[u8] = b"snapshot_data";
+const KEY_SNAPSHOT_PUBLICATION: &[u8] = b"snapshot_publication";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DurableStateEnvelope {
@@ -189,10 +191,23 @@ struct LogicalRaftSnapshot {
     logical_state: LogicalSnapshot,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum SnapshotSource {
+    Local,
+    Imported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct SnapshotPublication {
+    source: SnapshotSource,
+    marker: DurableSnapshotMarker<u64>,
+}
+
 #[derive(Clone)]
 struct CachedSnapshot {
     meta: SnapshotMeta<u64, BasicNode>,
     bytes: Vec<u8>,
+    publication: SnapshotPublication,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -282,20 +297,38 @@ impl RedbStateMachine {
             validate_cached_snapshot(cached, cluster_id, cluster_incarnation, &envelope)
                 .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
         }
+        if let Some(purge_fence) = &state_machine.purge_fence {
+            let durable_fence = purge_fence.current().map_err(|error| {
+                RedbStateMachineError::Corrupt(format!(
+                    "durable snapshot purge-fence read failed: {error}"
+                ))
+            })?;
+            let imported_marker = purge_fence.imported_marker().map_err(|error| {
+                RedbStateMachineError::Corrupt(format!(
+                    "durable imported-snapshot marker read failed: {error}"
+                ))
+            })?;
+            validate_log_publication_binding(
+                persisted_snapshot.as_ref(),
+                durable_fence.as_ref(),
+                imported_marker.as_ref(),
+            )
+            .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
+        }
         if let (Some(purge_fence), Some(cached)) = (&state_machine.purge_fence, &persisted_snapshot)
         {
             // A process can crash after the state database commits a snapshot
             // and before the separate raft.redb fence transaction commits.
             // Once the snapshot has passed all validation above, replay the
-            // monotonic publication step during reopen.  This is safe because
-            // `advance` rejects regressions and identity mismatches, while a
-            // missing/unknown log id fails closed and leaves the log retained.
-            let log_id = cached.meta.last_log_id.clone().ok_or_else(|| {
-                RedbStateMachineError::Corrupt(
-                    "durable snapshot is missing its applied log id".into(),
-                )
-            })?;
-            purge_fence.advance(log_id).map_err(|error| {
+            // monotonic publication step during reopen. Imported snapshots
+            // carry a state-durable proof because their last-applied LogId may
+            // never have existed in this follower's local log.
+            let publication = cached.publication.clone();
+            let publication_result = match publication.source {
+                SnapshotSource::Local => purge_fence.advance(publication.marker.last_applied),
+                SnapshotSource::Imported => purge_fence.publish_imported(publication.marker),
+            };
+            publication_result.map_err(|error| {
                 RedbStateMachineError::Corrupt(format!(
                     "durable snapshot purge-fence reconciliation failed: {error}"
                 ))
@@ -465,7 +498,14 @@ impl RedbStateMachine {
                 hex_prefix(&digest)
             ),
         };
-        let cached = CachedSnapshot { meta, bytes };
+        let cached = CachedSnapshot {
+            meta,
+            bytes,
+            publication: SnapshotPublication {
+                source: SnapshotSource::Local,
+                marker: snapshot_marker(&payload)?,
+            },
+        };
         persist_snapshot(&self.db, &cached)?;
         if let Some(purge_fence) = &self.purge_fence {
             // The state snapshot is already committed with redb's Immediate
@@ -521,18 +561,23 @@ impl RedbStateMachine {
             }
         }
 
+        let publication = SnapshotPublication {
+            source: SnapshotSource::Imported,
+            marker: snapshot_marker(&payload)?,
+        };
         let envelope = DurableStateEnvelope {
             format_version: STATE_FORMAT_VERSION,
             cluster_id: self.cluster_id,
             cluster_incarnation: self.cluster_incarnation,
             state: memory.data(),
-            last_applied: Some(payload.last_applied),
-            membership: payload.membership,
+            last_applied: Some(payload.last_applied.clone()),
+            membership: payload.membership.clone(),
         };
         validate_envelope(&envelope, self.cluster_id, self.cluster_incarnation)?;
         let cached = CachedSnapshot {
             meta: meta.clone(),
             bytes,
+            publication,
         };
         validate_cached_snapshot(
             &cached,
@@ -541,13 +586,20 @@ impl RedbStateMachine {
             &envelope,
         )?;
         write_envelope_and_snapshot(&self.db, &envelope, &cached)?;
+        if let Some(purge_fence) = &self.purge_fence {
+            // The complete state and its imported-snapshot proof are already
+            // durable. Only now may raft.redb publish the corresponding
+            // virtual log boundary and authorize purge.
+            purge_fence
+                .publish_imported(cached.publication.marker.clone())
+                .map_err(|error| {
+                    io_other(format!("imported snapshot publication failed: {error}"))
+                })?;
+        }
         *self
             .current_snapshot
             .write()
-            .map_err(|_| io_other("snapshot cache lock is poisoned"))? = Some(CachedSnapshot {
-            meta: cached.meta,
-            bytes: cached.bytes,
-        });
+            .map_err(|_| io_other("snapshot cache lock is poisoned"))? = Some(cached);
         Ok(())
     }
 }
@@ -655,7 +707,11 @@ fn initialize_or_validate(
         for record in table.iter().map_err(state_redb_error)? {
             let (key, _) = record.map_err(state_redb_error)?;
             let key = key.value();
-            if key != KEY_STATE && key != KEY_SNAPSHOT_META && key != KEY_SNAPSHOT_DATA {
+            if key != KEY_STATE
+                && key != KEY_SNAPSHOT_META
+                && key != KEY_SNAPSHOT_DATA
+                && key != KEY_SNAPSHOT_PUBLICATION
+            {
                 return Err(RedbStateMachineError::Corrupt(
                     "state storage contains an unknown metadata key".into(),
                 ));
@@ -757,14 +813,23 @@ fn read_persisted_snapshot(db: &Database) -> io::Result<Option<CachedSnapshot>> 
         .get(KEY_SNAPSHOT_DATA)
         .map_err(to_io)?
         .map(|value| value.value().to_vec());
-    match (meta, bytes) {
-        (None, None) => Ok(None),
-        (Some(meta), Some(bytes)) => {
+    let publication = table
+        .get(KEY_SNAPSHOT_PUBLICATION)
+        .map_err(to_io)?
+        .map(|value| value.value().to_vec());
+    match (meta, bytes, publication) {
+        (None, None, None) => Ok(None),
+        (Some(meta), Some(bytes), Some(publication)) => {
             if bytes.is_empty() || bytes.len() > MAX_SNAPSHOT_BYTES {
                 return Err(io_other("durable snapshot payload has an invalid size"));
             }
             let meta = decode_bounded(&meta, MAX_SNAPSHOT_META_BYTES)?;
-            Ok(Some(CachedSnapshot { meta, bytes }))
+            let publication = decode_bounded(&publication, MAX_SNAPSHOT_META_BYTES)?;
+            Ok(Some(CachedSnapshot {
+                meta,
+                bytes,
+                publication,
+            }))
         }
         _ => Err(io_other("durable snapshot metadata is incomplete")),
     }
@@ -772,6 +837,7 @@ fn read_persisted_snapshot(db: &Database) -> io::Result<Option<CachedSnapshot>> 
 
 fn persist_snapshot(db: &Database, snapshot: &CachedSnapshot) -> io::Result<()> {
     let meta = encode_bounded(&snapshot.meta, MAX_SNAPSHOT_META_BYTES)?;
+    let publication = encode_bounded(&snapshot.publication, MAX_SNAPSHOT_META_BYTES)?;
     if snapshot.bytes.is_empty() || snapshot.bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(io_other("snapshot payload has an invalid size"));
     }
@@ -787,6 +853,9 @@ fn persist_snapshot(db: &Database, snapshot: &CachedSnapshot) -> io::Result<()> 
         table
             .insert(KEY_SNAPSHOT_DATA, snapshot.bytes.as_slice())
             .map_err(to_io)?;
+        table
+            .insert(KEY_SNAPSHOT_PUBLICATION, publication.as_slice())
+            .map_err(to_io)?;
     }
     transaction.commit().map_err(to_io)
 }
@@ -798,6 +867,7 @@ fn write_envelope_and_snapshot(
 ) -> io::Result<()> {
     let state = encode_bounded(envelope, MAX_STATE_ENVELOPE_BYTES)?;
     let meta = encode_bounded(&snapshot.meta, MAX_SNAPSHOT_META_BYTES)?;
+    let publication = encode_bounded(&snapshot.publication, MAX_SNAPSHOT_META_BYTES)?;
     if snapshot.bytes.is_empty() || snapshot.bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(io_other("snapshot payload has an invalid size"));
     }
@@ -813,6 +883,9 @@ fn write_envelope_and_snapshot(
             .map_err(to_io)?;
         table
             .insert(KEY_SNAPSHOT_DATA, snapshot.bytes.as_slice())
+            .map_err(to_io)?;
+        table
+            .insert(KEY_SNAPSHOT_PUBLICATION, publication.as_slice())
             .map_err(to_io)?;
     }
     transaction.commit().map_err(to_io)
@@ -867,6 +940,80 @@ fn decode_and_validate_snapshot(
     Ok(payload)
 }
 
+fn snapshot_marker(payload: &LogicalRaftSnapshot) -> io::Result<DurableSnapshotMarker<u64>> {
+    let membership = encode_bounded(&payload.membership, MAX_SNAPSHOT_META_BYTES)?;
+    let domain = b"CHORUS-IMPORTED-SNAPSHOT-MEMBERSHIP-V1\0";
+    let capacity = domain
+        .len()
+        .checked_add(membership.len())
+        .ok_or_else(|| io_other("snapshot membership digest input overflow"))?;
+    let mut digest_input = Vec::with_capacity(capacity);
+    digest_input.extend_from_slice(domain);
+    digest_input.extend_from_slice(&membership);
+
+    Ok(DurableSnapshotMarker {
+        format_version: SNAPSHOT_MARKER_FORMAT_VERSION,
+        cluster_id: payload.cluster_id,
+        cluster_incarnation: payload.cluster_incarnation,
+        last_applied: payload.last_applied.clone(),
+        membership_log_id: payload.membership.log_id().clone(),
+        membership_digest: hash32(&digest_input),
+        logical_digest: payload.logical_state.header.digest,
+    })
+}
+
+fn validate_snapshot_publication(
+    publication: &SnapshotPublication,
+    payload: &LogicalRaftSnapshot,
+    cluster_id: [u8; 16],
+    cluster_incarnation: u64,
+) -> io::Result<()> {
+    publication
+        .marker
+        .validate_identity(cluster_id, cluster_incarnation)
+        .map_err(io_other)?;
+    let expected = snapshot_marker(payload)?;
+    if publication.marker != expected {
+        return Err(io_other(
+            "snapshot publication proof does not match its applied state or membership",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_log_publication_binding(
+    snapshot: Option<&CachedSnapshot>,
+    durable_fence: Option<&LogId<u64>>,
+    imported_marker: Option<&DurableSnapshotMarker<u64>>,
+) -> io::Result<()> {
+    if let Some(fence) = durable_fence {
+        let snapshot = snapshot.ok_or_else(|| {
+            io_other("raft purge fence exists without a durable state snapshot publication")
+        })?;
+        let applied = &snapshot.publication.marker.last_applied;
+        if applied.index < fence.index || (applied.index == fence.index && applied != fence) {
+            return Err(io_other(
+                "durable state snapshot is behind or conflicts with the raft purge fence",
+            ));
+        }
+    }
+    if let Some(imported) = imported_marker {
+        let snapshot = snapshot.ok_or_else(|| {
+            io_other("raft import marker exists without a durable state snapshot publication")
+        })?;
+        let state_marker = &snapshot.publication.marker;
+        if state_marker.last_applied.index < imported.last_applied.index
+            || (state_marker.last_applied.index == imported.last_applied.index
+                && state_marker != imported)
+        {
+            return Err(io_other(
+                "durable state publication is behind or conflicts with the raft import marker",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_cached_snapshot(
     snapshot: &CachedSnapshot,
     cluster_id: [u8; 16],
@@ -876,6 +1023,12 @@ fn validate_cached_snapshot(
     let payload = decode_and_validate_snapshot(
         &snapshot.meta,
         &snapshot.bytes,
+        cluster_id,
+        cluster_incarnation,
+    )?;
+    validate_snapshot_publication(
+        &snapshot.publication,
+        &payload,
         cluster_id,
         cluster_incarnation,
     )?;
@@ -1411,5 +1564,87 @@ mod tests {
             .unwrap();
         assert!(bounded.write_all(&[1]).await.is_err());
         assert!(bounded.into_inner().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_publication_is_complete_identity_and_membership_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let mut state = RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION).unwrap();
+        apply(&mut state, [membership_entry(), noop_entry(1)])
+            .await
+            .unwrap();
+        state
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        drop(state);
+
+        let original = {
+            let db = redb::Builder::new().open(&path).unwrap();
+            let tx = db.begin_read().unwrap();
+            let table = tx.open_table(STATE_META).unwrap();
+            table
+                .get(KEY_SNAPSHOT_PUBLICATION)
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec()
+        };
+
+        {
+            let db = redb::Builder::new().open(&path).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.set_durability(Durability::Immediate).unwrap();
+            tx.open_table(STATE_META)
+                .unwrap()
+                .remove(KEY_SNAPSHOT_PUBLICATION)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(matches!(
+            RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION),
+            Err(RedbStateMachineError::Corrupt(_))
+        ));
+
+        let mut forged: SnapshotPublication =
+            decode_bounded(&original, MAX_SNAPSHOT_META_BYTES).unwrap();
+        forged.marker.membership_digest[0] ^= 0xff;
+        let forged = encode_bounded(&forged, MAX_SNAPSHOT_META_BYTES).unwrap();
+        {
+            let db = redb::Builder::new().open(&path).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.set_durability(Durability::Immediate).unwrap();
+            tx.open_table(STATE_META)
+                .unwrap()
+                .insert(KEY_SNAPSHOT_PUBLICATION, forged.as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(matches!(
+            RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION),
+            Err(RedbStateMachineError::Corrupt(_))
+        ));
+
+        let mut forged: SnapshotPublication =
+            decode_bounded(&original, MAX_SNAPSHOT_META_BYTES).unwrap();
+        forged.marker.cluster_id = [0x71; 16];
+        let forged = encode_bounded(&forged, MAX_SNAPSHOT_META_BYTES).unwrap();
+        {
+            let db = redb::Builder::new().open(&path).unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.set_durability(Durability::Immediate).unwrap();
+            tx.open_table(STATE_META)
+                .unwrap()
+                .insert(KEY_SNAPSHOT_PUBLICATION, forged.as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(matches!(
+            RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION),
+            Err(RedbStateMachineError::Corrupt(_))
+        ));
     }
 }

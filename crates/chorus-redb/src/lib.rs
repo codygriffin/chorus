@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use openraft::storage::{LogFlushed, RaftLogStorage};
 use openraft::{
-    ErrorSubject, ErrorVerb, LogId, LogState, OptionalSend, RaftLogId, RaftLogReader,
+    ErrorSubject, ErrorVerb, LogId, LogState, NodeId, OptionalSend, RaftLogId, RaftLogReader,
     RaftTypeConfig, StorageError, Vote,
 };
 use redb::{
@@ -32,6 +32,8 @@ use redb::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+use crate::purge_fence::DurableSnapshotMarker;
 
 const DEFAULT_RAFT_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENCODED_VALUE_BYTES: usize = 8 * 1024 * 1024;
@@ -50,6 +52,7 @@ const KEY_VOTE: &[u8] = b"vote";
 const KEY_COMMITTED: &[u8] = b"committed";
 const KEY_PURGED: &[u8] = b"purged";
 const KEY_PURGE_FENCE: &[u8] = b"purge_fence";
+const KEY_IMPORTED_SNAPSHOT: &[u8] = b"imported_snapshot";
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct StoredIdentity {
@@ -169,6 +172,27 @@ impl<C: RaftTypeConfig> RedbRaftLogStore<C> {
             .map_err(|e| storage_error(ErrorSubject::Store, ErrorVerb::Read, e))
     }
 
+    pub(crate) fn read_imported_snapshot_marker(
+        &self,
+    ) -> Result<Option<DurableSnapshotMarker<C::NodeId>>, StorageError<C::NodeId>> {
+        read_meta::<DurableSnapshotMarker<C::NodeId>>(&self.db, KEY_IMPORTED_SNAPSHOT)
+            .map_err(|e| storage_error(ErrorSubject::Store, ErrorVerb::Read, e))
+    }
+
+    pub(crate) fn publish_imported_snapshot(
+        &self,
+        marker: DurableSnapshotMarker<C::NodeId>,
+    ) -> Result<(), StorageError<C::NodeId>> {
+        self.with_write(ErrorSubject::Store, |db| {
+            publish_imported_snapshot_immediate::<C>(
+                db,
+                self.cluster_id,
+                self.cluster_incarnation,
+                &marker,
+            )
+        })
+    }
+
     fn lock_writes(&self) -> io::Result<MutexGuard<'_, ()>> {
         self.write_lock
             .lock()
@@ -198,6 +222,7 @@ impl<C: RaftTypeConfig> RedbRaftLogStore<C> {
                 KEY_COMMITTED,
                 KEY_PURGED,
                 KEY_PURGE_FENCE,
+                KEY_IMPORTED_SNAPSHOT,
             ]
             .contains(&key)
             {
@@ -223,6 +248,8 @@ impl<C: RaftTypeConfig> RedbRaftLogStore<C> {
         let committed = read_meta_from_tx::<LogId<C::NodeId>>(&tx, KEY_COMMITTED)?;
         let purged = read_meta_from_tx::<LogId<C::NodeId>>(&tx, KEY_PURGED)?;
         let fence = read_meta_from_tx::<LogId<C::NodeId>>(&tx, KEY_PURGE_FENCE)?;
+        let imported =
+            read_meta_from_tx::<DurableSnapshotMarker<C::NodeId>>(&tx, KEY_IMPORTED_SNAPSHOT)?;
         let _vote = read_meta_from_tx::<Vote<C::NodeId>>(&tx, KEY_VOTE)?;
 
         if let (Some(purged), Some(fence)) = (&purged, &fence)
@@ -237,6 +264,17 @@ impl<C: RaftTypeConfig> RedbRaftLogStore<C> {
         }
         if (purged.is_some() || fence.is_some()) && committed.is_none() {
             return Err(io_other("purge metadata exists without committed metadata"));
+        }
+        if let Some(marker) = &imported {
+            marker
+                .validate_identity(self.cluster_id, self.cluster_incarnation)
+                .map_err(io_other)?;
+            validate_cursor_at_or_after(
+                committed.as_ref(),
+                &marker.last_applied,
+                "committed metadata",
+            )?;
+            validate_cursor_at_or_after(fence.as_ref(), &marker.last_applied, "purge fence")?;
         }
 
         let log = tx.open_table(LOG).map_err(to_io)?;
@@ -271,6 +309,14 @@ impl<C: RaftTypeConfig> RedbRaftLogStore<C> {
         }
         if let Some(fence) = &fence {
             validate_known_log_id_in_tx::<C>(&tx, fence)?;
+        }
+        if let Some(marker) = &imported {
+            let covered_by_purge = purged.as_ref().is_some_and(|purged| {
+                purged.index > marker.last_applied.index || purged == &marker.last_applied
+            });
+            if !covered_by_purge {
+                validate_known_log_id_in_tx::<C>(&tx, &marker.last_applied)?;
+            }
         }
         Ok(())
     }
@@ -589,6 +635,148 @@ fn initialize_or_validate_identity(
     } else {
         tx.abort().map_err(redb_error)
     }
+}
+
+fn validate_cursor_at_or_after<NID: NodeId>(
+    current: Option<&LogId<NID>>,
+    expected: &LogId<NID>,
+    label: &str,
+) -> io::Result<()> {
+    let current = current.ok_or_else(|| io_other(format!("{label} is missing")))?;
+    if current.index < expected.index || (current.index == expected.index && current != expected) {
+        return Err(io_other(format!(
+            "{label} is behind or conflicts with the imported snapshot"
+        )));
+    }
+    Ok(())
+}
+
+fn cursor_needs_advance<NID: NodeId>(
+    current: Option<&LogId<NID>>,
+    incoming: &LogId<NID>,
+    label: &str,
+) -> io::Result<bool> {
+    if let Some(current) = current
+        && current.index == incoming.index
+        && current != incoming
+    {
+        return Err(io_other(format!(
+            "{label} conflicts with the imported snapshot at the same index"
+        )));
+    }
+    Ok(current.is_none_or(|current| current.index < incoming.index))
+}
+
+fn publish_imported_snapshot_immediate<C: RaftTypeConfig>(
+    db: &Database,
+    cluster_id: [u8; 16],
+    cluster_incarnation: u64,
+    marker: &DurableSnapshotMarker<C::NodeId>,
+) -> io::Result<()> {
+    marker
+        .validate_identity(cluster_id, cluster_incarnation)
+        .map_err(io_other)?;
+    let encoded_marker = encode_value(marker)?;
+    let mut tx = db.begin_write().map_err(to_io)?;
+    tx.set_durability(Durability::Immediate).map_err(to_io)?;
+
+    let existing =
+        read_meta_from_write::<DurableSnapshotMarker<C::NodeId>>(&tx, KEY_IMPORTED_SNAPSHOT)?;
+    let committed = read_meta_from_write::<LogId<C::NodeId>>(&tx, KEY_COMMITTED)?;
+    let fence = read_meta_from_write::<LogId<C::NodeId>>(&tx, KEY_PURGE_FENCE)?;
+    let purged = read_meta_from_write::<LogId<C::NodeId>>(&tx, KEY_PURGED)?;
+
+    if existing.as_ref() == Some(marker) {
+        validate_cursor_at_or_after(
+            committed.as_ref(),
+            &marker.last_applied,
+            "committed metadata",
+        )?;
+        validate_cursor_at_or_after(fence.as_ref(), &marker.last_applied, "purge fence")?;
+        tx.abort().map_err(to_io)?;
+        return Ok(());
+    }
+    if let Some(existing) = &existing {
+        if existing.last_applied.index > marker.last_applied.index
+            || (existing.last_applied.index == marker.last_applied.index && existing != marker)
+        {
+            return Err(io_other(
+                "imported snapshot marker cannot regress or conflict",
+            ));
+        }
+    }
+    let advance_committed = cursor_needs_advance(
+        committed.as_ref(),
+        &marker.last_applied,
+        "committed metadata",
+    )?;
+    let advance_fence = cursor_needs_advance(fence.as_ref(), &marker.last_applied, "purge fence")?;
+    let advance_purged =
+        cursor_needs_advance(purged.as_ref(), &marker.last_applied, "purged metadata")?;
+
+    let covered_by_purge = purged.as_ref().is_some_and(|purged| {
+        purged.index > marker.last_applied.index || purged == &marker.last_applied
+    });
+
+    let exact_log_retained = !covered_by_purge && {
+        let table = tx.open_table(LOG).map_err(to_io)?;
+        match table.get(marker.last_applied.index).map_err(to_io)? {
+            Some(value) => {
+                let entry: C::Entry = decode_value(value.value())?;
+                entry.get_log_id() == &marker.last_applied
+            }
+            None => false,
+        }
+    };
+
+    if !covered_by_purge
+        && !exact_log_retained
+        && [committed.as_ref(), fence.as_ref(), purged.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|cursor| cursor.index > marker.last_applied.index)
+    {
+        return Err(io_other(
+            "raft metadata is ahead of an imported snapshot absent from local history",
+        ));
+    }
+
+    {
+        let mut log = tx.open_table(LOG).map_err(to_io)?;
+        if !covered_by_purge && !exact_log_retained {
+            // Raft may retain a suffix after snapshot installation only when
+            // the local entry at last_applied matches exactly. With no such
+            // entry, every local entry may belong to a divergent history.
+            let indexes = log
+                .iter()
+                .map_err(to_io)?
+                .map(|item| item.map(|(key, _)| key.value()).map_err(to_io))
+                .collect::<io::Result<Vec<_>>>()?;
+            for index in indexes {
+                log.remove(index).map_err(to_io)?;
+            }
+        }
+    }
+
+    {
+        let mut meta = tx.open_table(META).map_err(to_io)?;
+        let encoded_applied = encode_value(&marker.last_applied)?;
+        meta.insert(KEY_IMPORTED_SNAPSHOT, encoded_marker.as_slice())
+            .map_err(to_io)?;
+        if advance_committed {
+            meta.insert(KEY_COMMITTED, encoded_applied.as_slice())
+                .map_err(to_io)?;
+        }
+        if advance_fence {
+            meta.insert(KEY_PURGE_FENCE, encoded_applied.as_slice())
+                .map_err(to_io)?;
+        }
+        if !exact_log_retained && advance_purged {
+            meta.insert(KEY_PURGED, encoded_applied.as_slice())
+                .map_err(to_io)?;
+        }
+    }
+    tx.commit().map_err(to_io)
 }
 
 fn truncate_immediate<C: RaftTypeConfig>(db: &Database, from: u64) -> io::Result<()> {

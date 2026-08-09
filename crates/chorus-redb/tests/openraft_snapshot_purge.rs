@@ -1,8 +1,8 @@
 //! Snapshot publication and Raft-log purge ordering gates.
 //!
-//! These tests cover the local durable-snapshot path only. Snapshot import on
-//! a follower that does not retain the snapshot's LogId remains a separate
-//! adapter milestone.
+//! These tests cover both locally-built snapshots and imported follower
+//! snapshots whose exact last-applied LogId was never present in the local
+//! Raft log.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -46,6 +46,13 @@ fn membership_entry() -> Entry<ChorusRaftConfig> {
 fn blank_entry() -> Entry<ChorusRaftConfig> {
     Entry {
         log_id: log_id(1, 1),
+        payload: EntryPayload::Blank,
+    }
+}
+
+fn blank_entry_at(term: u64, index: u64) -> Entry<ChorusRaftConfig> {
+    Entry {
+        log_id: log_id(term, index),
         payload: EntryPayload::Blank,
     }
 }
@@ -152,6 +159,164 @@ async fn persisted_snapshot_without_fence_retains_logs_then_reconciles_on_reopen
         .is_err()
     );
     assert!(!mismatched_state_path.exists());
+}
+
+#[tokio::test]
+async fn imported_snapshot_without_local_log_id_publishes_after_state_and_survives_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let source_state_path = root.path().join("source-state.redb");
+    let target_state_path = root.path().join("target-state.redb");
+    let target_raft_path = root.path().join("target-raft.redb");
+
+    let mut source = RedbStateMachine::open(&source_state_path, CLUSTER_ID, INCARNATION).unwrap();
+    source
+        .apply([membership_entry(), blank_entry()])
+        .await
+        .unwrap();
+    let expected_membership = source.exact_membership().unwrap();
+    let mut builder = source.get_snapshot_builder().await;
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let snapshot_meta = snapshot.meta.clone();
+    assert_eq!(Some(log_id(1, 1)), snapshot_meta.last_log_id);
+    drop(builder);
+    drop(source);
+
+    // Model the first crash window: state.redb has committed the imported
+    // payload and publication proof, but raft.redb has not published a
+    // virtual log boundary yet.
+    let mut target_log = LogStore::open(&target_raft_path, CLUSTER_ID, INCARNATION).unwrap();
+    let fence = target_log.purge_fence_handle();
+    let mut target_state =
+        RedbStateMachine::open(&target_state_path, CLUSTER_ID, INCARNATION).unwrap();
+    target_state
+        .install_snapshot(&snapshot_meta, snapshot.snapshot)
+        .await
+        .unwrap();
+    assert_eq!(
+        Some(log_id(1, 1)),
+        target_state.applied_state().await.unwrap().0
+    );
+    assert_eq!(
+        expected_membership,
+        target_state.exact_membership().unwrap()
+    );
+    assert_eq!(None, target_log.read_committed().await.unwrap());
+    assert_eq!(None, fence.current().unwrap());
+    assert_eq!(
+        None,
+        target_log.get_log_state().await.unwrap().last_purged_log_id
+    );
+    drop(target_state);
+
+    // Reopen with the explicit capability. Reconciliation must consume only
+    // the validated state-durable proof, then atomically publish commit,
+    // fence, and purge metadata even though index 1 never existed locally.
+    let mut target_state = RedbStateMachine::open_with_purge_fence(
+        &target_state_path,
+        CLUSTER_ID,
+        INCARNATION,
+        fence.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        Some(log_id(1, 1)),
+        target_log.read_committed().await.unwrap()
+    );
+    assert_eq!(Some(log_id(1, 1)), fence.current().unwrap());
+    assert_eq!(
+        Some(log_id(1, 1)),
+        target_log.get_log_state().await.unwrap().last_purged_log_id
+    );
+    assert_eq!(
+        Some(log_id(1, 1)),
+        target_state.applied_state().await.unwrap().0
+    );
+    assert_eq!(
+        expected_membership,
+        target_state.exact_membership().unwrap()
+    );
+    drop(target_state);
+    drop(fence);
+    drop(target_log);
+
+    // Model the second crash window: the marker transaction committed before
+    // process restart. Both databases must reopen consistently, and the next
+    // entry must continue at exactly last_applied + 1.
+    let mut target_log = LogStore::open(&target_raft_path, CLUSTER_ID, INCARNATION).unwrap();
+    let fence = target_log.purge_fence_handle();
+    let mut target_state = RedbStateMachine::open_with_purge_fence(
+        &target_state_path,
+        CLUSTER_ID,
+        INCARNATION,
+        fence.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        Some(log_id(1, 1)),
+        target_log.read_committed().await.unwrap()
+    );
+    assert_eq!(Some(log_id(1, 1)), fence.current().unwrap());
+    assert_eq!(
+        expected_membership,
+        target_state.exact_membership().unwrap()
+    );
+    assert_eq!(
+        Some(log_id(1, 1)),
+        target_state
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .unwrap()
+            .meta
+            .last_log_id
+    );
+
+    let next = blank_entry_at(1, 2);
+    target_log.blocking_append([next.clone()]).await.unwrap();
+    target_log.save_committed(Some(log_id(1, 2))).await.unwrap();
+    assert_eq!(
+        vec![ApplyResult::Noop],
+        target_state.apply([next]).await.unwrap()
+    );
+    assert_eq!(
+        Some(log_id(1, 2)),
+        target_state.applied_state().await.unwrap().0
+    );
+    drop(target_state);
+    drop(fence);
+    drop(target_log);
+
+    let mut target_log = LogStore::open(&target_raft_path, CLUSTER_ID, INCARNATION).unwrap();
+    let fence = target_log.purge_fence_handle();
+    let mut target_state = RedbStateMachine::open_with_purge_fence(
+        &target_state_path,
+        CLUSTER_ID,
+        INCARNATION,
+        fence.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        Some(log_id(1, 2)),
+        target_log.read_committed().await.unwrap()
+    );
+    assert_eq!(Some(log_id(1, 1)), fence.current().unwrap());
+    assert_eq!(
+        Some(log_id(1, 2)),
+        target_state.applied_state().await.unwrap().0
+    );
+
+    // A durable import boundary must never be paired with a fresh or lost
+    // state database: the state-side proof is the authority for virtualizing
+    // the absent LogId.
+    assert!(
+        RedbStateMachine::open_with_purge_fence(
+            root.path().join("lost-target-state.redb"),
+            CLUSTER_ID,
+            INCARNATION,
+            fence,
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

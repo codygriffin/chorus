@@ -826,10 +826,10 @@ async fn run_runtime(
             } => {
                 let result = tokio::time::timeout(
                     OPERATION_TIMEOUT,
-                    add_one_authorized_learner(&raft, &authorized_nodes, voters, learners),
+                    apply_bounded_membership_change(&raft, &authorized_nodes, voters, learners),
                 )
                 .await
-                .map_err(|_| ChorusError::Consensus("OpenRaft learner addition timed out".into()))
+                .map_err(|_| ChorusError::Consensus("OpenRaft membership change timed out".into()))
                 .and_then(|result| result);
                 let _ = response.send(result);
             }
@@ -889,10 +889,11 @@ async fn checkpoint_runtime(raft: &ChorusRaft) -> Result<()> {
     Ok(())
 }
 
-/// Phase-one live membership support: add one pre-provisioned learner while
-/// leaving the voter set unchanged. Promotion, demotion, removal and peer
-/// directory rotation require separate operator workflows and fail closed.
-async fn add_one_authorized_learner(
+/// Bounded live-membership support. A leader may add one pre-provisioned
+/// learner, or replace exactly one nonleader voter with exactly one caught-up
+/// learner while retaining the former voter as a learner. Arbitrary removal,
+/// multi-node changes, leader demotion and peer-directory rotation fail closed.
+async fn apply_bounded_membership_change(
     raft: &ChorusRaft,
     authorized_nodes: &BTreeMap<u64, BasicNode>,
     voters: Vec<u64>,
@@ -927,15 +928,38 @@ async fn add_one_authorized_learner(
         .membership()
         .learner_ids()
         .collect();
-    if requested_voters != current_voters {
+    if metrics.current_leader != Some(metrics.id) {
         return Err(ChorusError::Consensus(
-            "phase-one membership supports learner addition only; voter changes are disabled"
-                .into(),
+            "OpenRaft membership changes must be submitted to the current leader".into(),
         ));
+    }
+    if metrics
+        .membership_config
+        .membership()
+        .get_joint_config()
+        .len()
+        != 1
+    {
+        return Err(ChorusError::Consensus(
+            "OpenRaft membership is still joint; wait for recovery before another change".into(),
+        ));
+    }
+
+    if requested_voters != current_voters {
+        return replace_one_voter(
+            raft,
+            authorized_nodes,
+            &current_voters,
+            &current_learners,
+            &requested_voters,
+            &requested_learners,
+            metrics.current_leader,
+        )
+        .await;
     }
     if !current_learners.is_subset(&requested_learners) {
         return Err(ChorusError::Consensus(
-            "phase-one membership does not support learner removal".into(),
+            "bounded membership does not support learner removal".into(),
         ));
     }
     let added: Vec<_> = requested_learners
@@ -950,12 +974,12 @@ async fn add_one_authorized_learner(
         [] if requested_learners.len() == 1 => *requested_learners.iter().next().unwrap(),
         [] => {
             return Err(ChorusError::Consensus(
-                "phase-one membership cannot revalidate multiple learners".into(),
+                "bounded membership cannot revalidate multiple learners".into(),
             ));
         }
         _ => {
             return Err(ChorusError::Consensus(
-                "phase-one membership adds exactly one learner per request".into(),
+                "bounded membership adds exactly one learner per request".into(),
             ));
         }
     };
@@ -968,12 +992,95 @@ async fn add_one_authorized_learner(
     raft.add_learner(target, node, true)
         .await
         .map_err(|error| ChorusError::Consensus(format!("OpenRaft add learner failed: {error}")))?;
+    verify_uniform_membership(raft, &requested_voters, &requested_learners)
+}
+
+async fn replace_one_voter(
+    raft: &ChorusRaft,
+    authorized_nodes: &BTreeMap<u64, BasicNode>,
+    current_voters: &BTreeSet<u64>,
+    current_learners: &BTreeSet<u64>,
+    requested_voters: &BTreeSet<u64>,
+    requested_learners: &BTreeSet<u64>,
+    current_leader: Option<u64>,
+) -> Result<()> {
+    if !matches!(current_voters.len(), 3 | 5) || requested_voters.len() != current_voters.len() {
+        return Err(ChorusError::Consensus(
+            "voter replacement must preserve an existing 3- or 5-voter set".into(),
+        ));
+    }
+    let promoted: Vec<_> = requested_voters
+        .difference(current_voters)
+        .copied()
+        .collect();
+    let demoted: Vec<_> = current_voters
+        .difference(requested_voters)
+        .copied()
+        .collect();
+    let (promoted, demoted) = match (promoted.as_slice(), demoted.as_slice()) {
+        ([promoted], [demoted]) => (*promoted, *demoted),
+        _ => {
+            return Err(ChorusError::Consensus(
+                "bounded voter replacement requires exactly one promotion and one demotion".into(),
+            ));
+        }
+    };
+    if !current_learners.contains(&promoted) {
+        return Err(ChorusError::Consensus(format!(
+            "replacement voter {promoted} is not a current learner"
+        )));
+    }
+    if current_leader == Some(demoted) {
+        return Err(ChorusError::Consensus(
+            "bounded voter replacement cannot demote the current leader without leader transfer"
+                .into(),
+        ));
+    }
+    let mut expected_learners = current_learners.clone();
+    expected_learners.remove(&promoted);
+    expected_learners.insert(demoted);
+    if requested_learners != &expected_learners {
+        return Err(ChorusError::Consensus(
+            "voter replacement must retain the demoted voter and every other learner".into(),
+        ));
+    }
+    let node = authorized_nodes.get(&promoted).cloned().ok_or_else(|| {
+        ChorusError::Consensus(format!(
+            "replacement voter {promoted} is absent from the signed peer manifest"
+        ))
+    })?;
+
+    // Re-adding an existing learner with `blocking=true` is OpenRaft's
+    // explicit line-rate/catch-up gate immediately before promotion.
+    raft.add_learner(promoted, node, true)
+        .await
+        .map_err(|error| {
+            ChorusError::Consensus(format!(
+                "OpenRaft replacement learner catch-up failed: {error}"
+            ))
+        })?;
+    raft.change_membership(requested_voters.clone(), true)
+        .await
+        .map_err(|error| {
+            ChorusError::Consensus(format!("OpenRaft voter replacement failed: {error}"))
+        })?;
+    verify_uniform_membership(raft, requested_voters, requested_learners)
+}
+
+fn verify_uniform_membership(
+    raft: &ChorusRaft,
+    requested_voters: &BTreeSet<u64>,
+    requested_learners: &BTreeSet<u64>,
+) -> Result<()> {
     let membership = raft.metrics().borrow().membership_config.clone();
     let observed_voters: BTreeSet<_> = membership.voter_ids().collect();
     let observed_learners: BTreeSet<_> = membership.membership().learner_ids().collect();
-    if observed_voters != requested_voters || observed_learners != requested_learners {
+    if membership.membership().get_joint_config().len() != 1
+        || &observed_voters != requested_voters
+        || &observed_learners != requested_learners
+    {
         return Err(ChorusError::Consensus(
-            "OpenRaft learner response did not publish the requested exact membership".into(),
+            "OpenRaft did not publish the requested uniform exact membership".into(),
         ));
     }
     Ok(())

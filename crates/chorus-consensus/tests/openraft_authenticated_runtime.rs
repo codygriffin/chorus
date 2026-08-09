@@ -303,7 +303,7 @@ fn authenticated_three_node_runtime_bootstraps_replicates_and_restarts() {
 }
 
 #[test]
-fn authenticated_leader_adds_preprovisioned_learner_and_reopens_exact_membership() {
+fn authenticated_leader_adds_and_promotes_one_preprovisioned_learner() {
     let root = tempfile::tempdir().unwrap();
     let ca = test_ca();
     let leaves: Vec<_> = (1..=4)
@@ -385,7 +385,11 @@ fn authenticated_leader_adds_preprovisioned_learner_and_reopens_exact_membership
             .contains("not a current Raft member")
     );
     let follower_error = node2.change_membership(vec![1, 2, 3], vec![4]).unwrap_err();
-    assert!(follower_error.to_string().contains("add learner failed"));
+    assert!(
+        follower_error
+            .to_string()
+            .contains("submitted to the current leader")
+    );
     let unknown = node1
         .change_membership(vec![1, 2, 3], vec![99])
         .unwrap_err();
@@ -425,18 +429,77 @@ fn authenticated_leader_adds_preprovisioned_learner_and_reopens_exact_membership
             .is_some_and(|snapshot| snapshot.get(b"lrn") == Some(&b"learner-value"[..]))
     });
 
-    drop(node4);
-    let learner_state_path = root.path().join("node-4/state/active.redb");
-    let learner_state =
-        RedbStateMachine::open(&learner_state_path, CLUSTER_ID, INCARNATION).unwrap();
-    let exact = learner_state.exact_membership().unwrap();
-    assert_eq!(vec![1, 2, 3], exact.voter_ids().collect::<Vec<_>>());
+    let removal = node1
+        .change_membership(vec![1, 2, 3], Vec::new())
+        .unwrap_err();
+    assert!(removal.to_string().contains("learner removal"));
+    let multi_swap = node1.change_membership(vec![1, 4], vec![2, 3]).unwrap_err();
+    assert!(
+        multi_swap
+            .to_string()
+            .contains("preserve an existing 3- or 5-voter set")
+    );
+    let leader_demotion = node1.change_membership(vec![2, 3, 4], vec![1]).unwrap_err();
+    assert!(leader_demotion.to_string().contains("current leader"));
+
+    // Replace nonleader voter 3 with the caught-up learner. OpenRaft first
+    // commits a joint config and then a uniform [1,2,4] voter set, retaining
+    // node 3 as a learner. An exact retry is safe after an ambiguous reply.
+    node1.change_membership(vec![1, 2, 4], vec![3]).unwrap();
+    node1.change_membership(vec![1, 2, 4], vec![3]).unwrap();
+    wait_for(Duration::from_secs(5), || {
+        [&node1, &node2, &node3, &node4].into_iter().all(|node| {
+            let status = node.status();
+            status.voters == [1, 2, 4] && status.learners == [3]
+        })
+    });
+
+    // The former voter is no longer needed for quorum. Stop it, commit with
+    // the new voter set, then exercise the follower read barrier on promoted
+    // node 4.
+    drop(node3);
+    let demoted_state_path = root.path().join("node-3/state/active.redb");
+    let demoted_state =
+        RedbStateMachine::open(&demoted_state_path, CLUSTER_ID, INCARNATION).unwrap();
+    let exact = demoted_state.exact_membership().unwrap();
+    assert_eq!(1, exact.membership().get_joint_config().len());
+    assert_eq!(vec![1, 2, 4], exact.voter_ids().collect::<Vec<_>>());
     assert_eq!(
-        vec![4],
+        vec![3],
+        exact.membership().learner_ids().collect::<Vec<_>>()
+    );
+    drop(demoted_state);
+    let request_id = RequestId::new(origin, 2);
+    let mutation = KvMutationV1::Put {
+        key: b"rpl".to_vec(),
+        value: b"replacement-value".to_vec(),
+    };
+    let canonical = canonical_mutations(std::slice::from_ref(&mutation)).unwrap();
+    let result = node1
+        .submit(CommitTransactionV1 {
+            request_id,
+            payload_hash: payload_hash(1, &request_id, 1, &canonical),
+            base_epoch: 1,
+            mutations: vec![mutation],
+        })
+        .unwrap();
+    assert!(matches!(result, ApplyResult::Committed { epoch: 2, .. }));
+    let promoted_read = node4.read_barrier().unwrap();
+    assert_eq!(promoted_read.get(b"rpl"), Some(&b"replacement-value"[..]));
+
+    drop(node4);
+    let promoted_state_path = root.path().join("node-4/state/active.redb");
+    let promoted_state =
+        RedbStateMachine::open(&promoted_state_path, CLUSTER_ID, INCARNATION).unwrap();
+    let exact = promoted_state.exact_membership().unwrap();
+    assert_eq!(1, exact.membership().get_joint_config().len());
+    assert_eq!(vec![1, 2, 4], exact.voter_ids().collect::<Vec<_>>());
+    assert_eq!(
+        vec![3],
         exact.membership().learner_ids().collect::<Vec<_>>()
     );
     assert_eq!(endpoints[&4], exact.membership().get_node(&4).unwrap().addr);
-    drop(learner_state);
+    drop(promoted_state);
 
     let restarted = open_node(
         root.path(),
@@ -448,12 +511,25 @@ fn authenticated_leader_adds_preprovisioned_learner_and_reopens_exact_membership
     );
     wait_for(Duration::from_secs(5), || {
         let status = restarted.status();
-        status.learners == [4]
-            && restarted
-                .store()
-                .snapshot()
-                .ok()
-                .is_some_and(|snapshot| snapshot.get(b"lrn") == Some(&b"learner-value"[..]))
+        status.voters == [1, 2, 4]
+            && status.learners == [3]
+            && restarted.store().snapshot().ok().is_some_and(|snapshot| {
+                snapshot.get(b"lrn") == Some(&b"learner-value"[..])
+                    && snapshot.get(b"rpl") == Some(&b"replacement-value"[..])
+            })
+    });
+
+    let restarted_demoted = open_node(
+        root.path(),
+        3,
+        false,
+        Arc::clone(&identities[2]),
+        &voters,
+        &addresses,
+    );
+    wait_for(Duration::from_secs(5), || {
+        let status = restarted_demoted.status();
+        status.voters == [1, 2, 4] && status.learners == [3]
     });
 
     drop(node1);
@@ -461,9 +537,9 @@ fn authenticated_leader_adds_preprovisioned_learner_and_reopens_exact_membership
     let voter_state = RedbStateMachine::open(&voter_state_path, CLUSTER_ID, INCARNATION).unwrap();
     let exact = voter_state.exact_membership().unwrap();
     assert_eq!(1, exact.membership().get_joint_config().len());
-    assert_eq!(vec![1, 2, 3], exact.voter_ids().collect::<Vec<_>>());
+    assert_eq!(vec![1, 2, 4], exact.voter_ids().collect::<Vec<_>>());
     assert_eq!(
-        vec![4],
+        vec![3],
         exact.membership().learner_ids().collect::<Vec<_>>()
     );
     drop(voter_state);
@@ -477,11 +553,11 @@ fn authenticated_leader_adds_preprovisioned_learner_and_reopens_exact_membership
     );
     wait_for(Duration::from_secs(5), || {
         let status = restarted_voter.status();
-        status.voters == [1, 2, 3] && status.learners == [4]
+        status.voters == [1, 2, 4] && status.learners == [3]
     });
 
     drop(restarted_voter);
     drop(restarted);
+    drop(restarted_demoted);
     drop(node2);
-    drop(node3);
 }

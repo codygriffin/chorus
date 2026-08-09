@@ -27,7 +27,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::storage::RaftLogStorage;
-use openraft::{BasicNode, Config, Raft, SnapshotPolicy, metrics::Metric};
+use openraft::{BasicNode, ChangeMembers, Config, Raft, SnapshotPolicy, metrics::Metric};
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -235,6 +235,11 @@ impl OpenRaftConsensus {
                 }
                 RuntimeMode::Authenticated { identity, .. } => {
                     let membership = stored_membership.membership();
+                    if membership.get_node(&node_id).is_none() {
+                        return Err(ChorusError::Consensus(format!(
+                            "local node {node_id} is absent from its durable OpenRaft membership"
+                        )));
+                    }
                     for (member_id, node) in membership.nodes() {
                         if *member_id == node_id {
                             continue;
@@ -891,8 +896,9 @@ async fn checkpoint_runtime(raft: &ChorusRaft) -> Result<()> {
 
 /// Bounded live-membership support. A leader may add one pre-provisioned
 /// learner, or replace exactly one nonleader voter with exactly one caught-up
-/// learner while retaining the former voter as a learner. Arbitrary removal,
-/// multi-node changes, leader demotion and peer-directory rotation fail closed.
+/// learner while retaining the former voter as a learner, or remove exactly
+/// one already-demoted learner. Voter removal, multi-node changes, leader
+/// demotion and peer-directory rotation fail closed.
 async fn apply_bounded_membership_change(
     raft: &ChorusRaft,
     authorized_nodes: &BTreeMap<u64, BasicNode>,
@@ -957,15 +963,37 @@ async fn apply_bounded_membership_change(
         )
         .await;
     }
-    if !current_learners.is_subset(&requested_learners) {
-        return Err(ChorusError::Consensus(
-            "bounded membership does not support learner removal".into(),
-        ));
-    }
+    let removed: Vec<_> = current_learners
+        .difference(&requested_learners)
+        .copied()
+        .collect();
     let added: Vec<_> = requested_learners
         .difference(&current_learners)
         .copied()
         .collect();
+    if !removed.is_empty() {
+        if !added.is_empty() {
+            return Err(ChorusError::Consensus(
+                "bounded membership cannot add and remove learners in one request".into(),
+            ));
+        }
+        let target = match removed.as_slice() {
+            [target] => *target,
+            _ => {
+                return Err(ChorusError::Consensus(
+                    "bounded membership removes exactly one learner per request".into(),
+                ));
+            }
+        };
+        return remove_one_learner(
+            raft,
+            &current_voters,
+            &requested_voters,
+            &requested_learners,
+            target,
+        )
+        .await;
+    }
     let target = match added.as_slice() {
         [target] => *target,
         [] if requested_learners.is_empty() => return Ok(()),
@@ -993,6 +1021,26 @@ async fn apply_bounded_membership_change(
         .await
         .map_err(|error| ChorusError::Consensus(format!("OpenRaft add learner failed: {error}")))?;
     verify_uniform_membership(raft, &requested_voters, &requested_learners)
+}
+
+async fn remove_one_learner(
+    raft: &ChorusRaft,
+    current_voters: &BTreeSet<u64>,
+    requested_voters: &BTreeSet<u64>,
+    requested_learners: &BTreeSet<u64>,
+    target: u64,
+) -> Result<()> {
+    if !matches!(current_voters.len(), 3 | 5) || requested_voters != current_voters {
+        return Err(ChorusError::Consensus(
+            "learner removal must preserve an existing 3- or 5-voter set".into(),
+        ));
+    }
+    raft.change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([target])), false)
+        .await
+        .map_err(|error| {
+            ChorusError::Consensus(format!("OpenRaft learner {target} removal failed: {error}"))
+        })?;
+    verify_uniform_membership(raft, requested_voters, requested_learners)
 }
 
 async fn replace_one_voter(

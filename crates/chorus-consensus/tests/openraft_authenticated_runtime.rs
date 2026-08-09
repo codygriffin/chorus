@@ -303,7 +303,7 @@ fn authenticated_three_node_runtime_bootstraps_replicates_and_restarts() {
 }
 
 #[test]
-fn authenticated_leader_adds_and_promotes_one_preprovisioned_learner() {
+fn authenticated_leader_adds_promotes_and_removes_one_preprovisioned_learner() {
     let root = tempfile::tempdir().unwrap();
     let ca = test_ca();
     let leaves: Vec<_> = (1..=4)
@@ -429,10 +429,6 @@ fn authenticated_leader_adds_and_promotes_one_preprovisioned_learner() {
             .is_some_and(|snapshot| snapshot.get(b"lrn") == Some(&b"learner-value"[..]))
     });
 
-    let removal = node1
-        .change_membership(vec![1, 2, 3], Vec::new())
-        .unwrap_err();
-    assert!(removal.to_string().contains("learner removal"));
     let multi_swap = node1.change_membership(vec![1, 4], vec![2, 3]).unwrap_err();
     assert!(
         multi_swap
@@ -532,16 +528,107 @@ fn authenticated_leader_adds_and_promotes_one_preprovisioned_learner() {
         status.voters == [1, 2, 4] && status.learners == [3]
     });
 
-    drop(node1);
-    let voter_state_path = root.path().join("node-1/state/active.redb");
-    let voter_state = RedbStateMachine::open(&voter_state_path, CLUSTER_ID, INCARNATION).unwrap();
-    let exact = voter_state.exact_membership().unwrap();
+    // A demoted node remains a full member until an explicit second phase.
+    // Activate it, remove exactly that learner, then require both its origin
+    // and authenticated gateway authority to disappear with the membership.
+    let removed_origin = OriginId::new(3);
+    restarted_demoted.activate_origin(removed_origin).unwrap();
+    node1.change_membership(vec![1, 2, 4], Vec::new()).unwrap();
+    node1.change_membership(vec![1, 2, 4], Vec::new()).unwrap();
+    wait_for(Duration::from_secs(5), || {
+        [&node1, &node2, &restarted].into_iter().all(|node| {
+            let status = node.status();
+            status.voters == [1, 2, 4]
+                && status.learners.is_empty()
+                && !node.store().snapshot().unwrap().origins().contains_key(&3)
+        })
+    });
+    assert!(!restarted_demoted.status().quorum);
+    assert!(restarted_demoted.activate_origin(removed_origin).is_err());
+    assert!(restarted_demoted.read_barrier().is_err());
+
+    let removed_factory = AuthenticatedNetworkFactory::new(Arc::clone(&identities[2])).unwrap();
+    let removed_write = client_runtime
+        .block_on(removed_factory.forward_client_write(
+            1,
+            ReplicatedCommandV1::ActivateOrigin(ActivateOriginV1 {
+                origin: removed_origin,
+            }),
+            Duration::from_secs(2),
+        ))
+        .unwrap_err();
+    assert!(
+        removed_write
+            .to_string()
+            .contains("not a current Raft member")
+    );
+    let removed_read = client_runtime
+        .block_on(removed_factory.forward_read_barrier(1, Duration::from_secs(2)))
+        .unwrap_err();
+    assert!(
+        removed_read
+            .to_string()
+            .contains("not a current Raft member")
+    );
+
+    drop(restarted_demoted);
+    let removed_state =
+        RedbStateMachine::open(&demoted_state_path, CLUSTER_ID, INCARNATION).unwrap();
+    let exact = removed_state.exact_membership().unwrap();
+    // OpenRaft stops replication to a removed learner before that learner can
+    // apply its own removal entry. Its local image is intentionally stale;
+    // the current voters' membership and gateway authorization are the
+    // authority that keep it quarantined.
     assert_eq!(1, exact.membership().get_joint_config().len());
     assert_eq!(vec![1, 2, 4], exact.voter_ids().collect::<Vec<_>>());
     assert_eq!(
         vec![3],
         exact.membership().learner_ids().collect::<Vec<_>>()
     );
+    assert!(removed_state.state_data().unwrap().origins.contains_key(&3));
+    drop(removed_state);
+
+    let quarantined = open_node(
+        root.path(),
+        3,
+        false,
+        Arc::clone(&identities[2]),
+        &voters,
+        &addresses,
+    );
+    assert!(!quarantined.status().quorum);
+    assert!(quarantined.activate_origin(removed_origin).is_err());
+    assert!(quarantined.read_barrier().is_err());
+    drop(quarantined);
+
+    let request_id = RequestId::new(origin, 3);
+    let mutation = KvMutationV1::Put {
+        key: b"rmv".to_vec(),
+        value: b"post-removal".to_vec(),
+    };
+    let canonical = canonical_mutations(std::slice::from_ref(&mutation)).unwrap();
+    let result = node1
+        .submit(CommitTransactionV1 {
+            request_id,
+            payload_hash: payload_hash(1, &request_id, 2, &canonical),
+            base_epoch: 2,
+            mutations: vec![mutation],
+        })
+        .unwrap();
+    assert!(matches!(result, ApplyResult::Committed { epoch: 3, .. }));
+    assert_eq!(
+        restarted.read_barrier().unwrap().get(b"rmv"),
+        Some(&b"post-removal"[..])
+    );
+
+    drop(node1);
+    let voter_state_path = root.path().join("node-1/state/active.redb");
+    let voter_state = RedbStateMachine::open(&voter_state_path, CLUSTER_ID, INCARNATION).unwrap();
+    let exact = voter_state.exact_membership().unwrap();
+    assert_eq!(1, exact.membership().get_joint_config().len());
+    assert_eq!(vec![1, 2, 4], exact.voter_ids().collect::<Vec<_>>());
+    assert!(exact.membership().learner_ids().next().is_none());
+    assert!(exact.membership().get_node(&3).is_none());
     drop(voter_state);
     let restarted_voter = open_node(
         root.path(),
@@ -553,11 +640,10 @@ fn authenticated_leader_adds_and_promotes_one_preprovisioned_learner() {
     );
     wait_for(Duration::from_secs(5), || {
         let status = restarted_voter.status();
-        status.voters == [1, 2, 4] && status.learners == [3]
+        status.voters == [1, 2, 4] && status.learners.is_empty()
     });
 
     drop(restarted_voter);
     drop(restarted);
-    drop(restarted_demoted);
     drop(node2);
 }

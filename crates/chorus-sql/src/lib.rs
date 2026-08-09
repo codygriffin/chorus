@@ -1554,6 +1554,9 @@ impl SqlSession {
         parameter_types: &[SqlType],
     ) -> std::result::Result<Option<Vec<ResultColumn>>, SqlError> {
         let statements = Parser::batch(sql)?;
+        if statements.is_empty() {
+            return Ok(None);
+        }
         if statements.len() != 1 {
             return Err(SqlError::new(
                 "42601",
@@ -1601,10 +1604,13 @@ impl SqlSession {
                     .get(name)
                     .ok_or_else(|| SqlError::new("26000", "prepared statement does not exist"))?;
                 let statements = Parser::batch(sql)?;
-                if statements.len() != 1 {
+                if statements.is_empty() {
+                    return Ok(None);
+                }
+                if statements.len() > 1 {
                     return Err(SqlError::new(
                         "42601",
-                        "prepared statements must contain exactly one SQL statement",
+                        "prepared statements must contain at most one SQL statement",
                     ));
                 }
                 self.describe_statement(&statements[0], catalog, parameter_types, depth + 1)
@@ -1889,10 +1895,10 @@ impl SqlSession {
         Ok(())
     }
     pub fn prepare(&mut self, name: &str, sql: &str) -> std::result::Result<(), SqlError> {
-        if Parser::batch(sql)?.len() != 1 {
+        if Parser::batch(sql)?.len() > 1 {
             return Err(SqlError::new(
                 "42601",
-                "prepared statements must contain exactly one SQL statement",
+                "prepared statements must contain at most one SQL statement",
             ));
         }
         self.prepared.insert(name.into(), sql.into());
@@ -6337,6 +6343,34 @@ mod tests {
         assert_eq!(session.transaction_status(), TransactionStatus::Active);
         assert_eq!(store.snapshot().unwrap().db_epoch(), active_before);
         session.execute("ROLLBACK", &[]).unwrap();
+    }
+
+    #[test]
+    fn empty_prepared_statement_describes_and_executes_without_a_result_shape() {
+        let origin = OriginId::new(115);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store.clone(), committer, Limits::default());
+        let mut session = engine.session();
+        let before = store.snapshot().unwrap().db_epoch();
+
+        session.prepare("empty", "  ; ; ").unwrap();
+        assert!(session.describe_sql("  ; ; ", &[]).unwrap().is_none());
+        let result = session.execute_prepared("empty", &[]).unwrap();
+        assert!(result.command_tag.is_empty());
+        assert!(result.columns.is_empty());
+        assert!(result.rows.is_empty());
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+        assert_eq!(store.snapshot().unwrap().db_epoch(), before);
+
+        assert_eq!(
+            session
+                .prepare("multi", "SELECT 1; SELECT 2")
+                .unwrap_err()
+                .code,
+            "42601"
+        );
     }
 
     #[test]

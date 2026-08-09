@@ -1465,10 +1465,11 @@ impl Connection {
     }
     fn command_complete(&mut self, r: &QueryResult) -> std::io::Result<()> {
         let mut tag = r.command_tag.clone();
+        if tag.is_empty() {
+            return self.write_message(b'I', &[]);
+        }
         if tag.eq_ignore_ascii_case("SELECT") {
             tag = format!("SELECT {}", r.affected_rows);
-        } else if tag.is_empty() {
-            tag = "SELECT 0".into();
         }
         let mut b = tag.into_bytes();
         b.push(0);

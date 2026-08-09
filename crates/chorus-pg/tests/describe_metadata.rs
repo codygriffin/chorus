@@ -340,3 +340,68 @@ fn portal_describe_is_non_mutating_and_execute_uses_the_described_formats_once()
     drop(stream);
     handle.shutdown().expect("shutdown test listener");
 }
+
+#[test]
+fn empty_simple_and_extended_queries_emit_empty_query_response() {
+    let (handle, mut stream) = open_connection();
+
+    for sql in ["", "  ; ;  "] {
+        let messages = simple_query(&mut stream, sql);
+        assert_eq!(
+            messages.iter().map(|message| message.0).collect::<Vec<_>>(),
+            vec![b'I', b'Z']
+        );
+        assert!(messages[0].1.is_empty());
+        assert_eq!(messages[1].1, vec![b'I']);
+    }
+
+    let begun = simple_query(&mut stream, "BEGIN");
+    assert_eq!(begun.last().unwrap().1, vec![b'T']);
+    let active_empty = simple_query(&mut stream, ";");
+    assert_eq!(
+        active_empty
+            .iter()
+            .map(|message| message.0)
+            .collect::<Vec<_>>(),
+        vec![b'I', b'Z']
+    );
+    assert_eq!(active_empty.last().unwrap().1, vec![b'T']);
+    assert_eq!(
+        simple_query(&mut stream, "ROLLBACK").last().unwrap().1,
+        vec![b'I']
+    );
+
+    parse(&mut stream, "empty_statement", " ; ", &[]);
+    bind(&mut stream, "empty_portal", "empty_statement", &[], &[]);
+    describe(&mut stream, b'S', "empty_statement");
+    describe(&mut stream, b'P', "empty_portal");
+    execute(&mut stream, "empty_portal");
+    sync(&mut stream);
+    let extended = read_until_ready(&mut stream);
+    assert_eq!(
+        extended.iter().map(|message| message.0).collect::<Vec<_>>(),
+        vec![b'1', b'2', b't', b'n', b'n', b'I', b'Z']
+    );
+    assert_eq!(extended[2].1, vec![0, 0]);
+    for index in [3usize, 4, 5] {
+        assert!(extended[index].1.is_empty());
+    }
+    assert_eq!(extended.last().unwrap().1, vec![b'I']);
+
+    let ordinary = simple_query(&mut stream, "SELECT 1");
+    assert_eq!(
+        ordinary.iter().map(|message| message.0).collect::<Vec<_>>(),
+        vec![b'T', b'D', b'C', b'Z']
+    );
+
+    parse(&mut stream, "multi", "SELECT 1; SELECT 2", &[]);
+    sync(&mut stream);
+    let multi = read_until_ready(&mut stream);
+    assert_eq!(
+        multi.iter().map(|message| message.0).collect::<Vec<_>>(),
+        vec![b'E', b'Z']
+    );
+
+    drop(stream);
+    handle.shutdown().expect("shutdown test listener");
+}

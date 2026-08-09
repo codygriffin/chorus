@@ -19,6 +19,10 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     if let Err(e) = dispatch(env::args().skip(1).collect()) {
@@ -324,15 +328,115 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
             max_connections: cfg.postgres.max_connections,
         },
     );
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (signal_ready_tx, signal_ready_rx) = mpsc::sync_channel(1);
+    let signal_shutdown = Arc::clone(&shutdown);
+    let signal_thread =
+        thread::spawn(move || wait_for_shutdown_signal(signal_shutdown, signal_ready_tx));
+    match signal_ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(true) => {}
+        Ok(false) => {
+            shutdown.store(true, Ordering::Release);
+            let _ = signal_thread.join();
+            return Err("could not install process shutdown signal handlers".into());
+        }
+        Err(error) => {
+            shutdown.store(true, Ordering::Release);
+            let _ = signal_thread.join();
+            return Err(format!("shutdown signal watcher did not start: {error}"));
+        }
+    }
+    let server_handle =
+        match server.start_with_shutdown(Arc::clone(&shutdown), Duration::from_secs(5)) {
+            Ok(handle) => handle,
+            Err(error) => {
+                shutdown.store(true, Ordering::Release);
+                let _ = signal_thread.join();
+                return Err(error.to_string());
+            }
+        };
     log_event(
         "listeners_ready",
         serde_json::json!({
             "node_id": cfg.node_id,
-            "tcp": cfg.postgres.listen,
-            "unix_socket": socket,
+            "tcp": server_handle.tcp_addr().map(|address| address.to_string()),
+            "unix_socket": server_handle.unix_socket().map(|path| path.display().to_string()),
         }),
     );
-    server.serve().map_err(|e| e.to_string())
+    let result = server_handle.wait().map_err(|error| error.to_string());
+    // If the manager stopped for an internal error rather than a signal, let
+    // the watcher observe the token and exit instead of joining forever.
+    shutdown.store(true, Ordering::Release);
+    let _ = signal_thread.join();
+    result
+}
+
+/// Wait for process termination signals without introducing unsafe signal
+/// handlers into the node crate. The PostgreSQL server owns listener/session
+/// drain; this thread only flips its shutdown token. OpenRaft shutdown and
+/// checkpoint ordering remain explicit follow-up lifecycle work.
+fn wait_for_shutdown_signal(shutdown: Arc<AtomicBool>, ready: mpsc::SyncSender<bool>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            shutdown.store(true, Ordering::Release);
+            let _ = ready.send(false);
+            return;
+        }
+    };
+    let _runtime_guard = runtime.enter();
+    #[cfg(unix)]
+    let mut terminate =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(_) => {
+                shutdown.store(true, Ordering::Release);
+                let _ = ready.send(false);
+                return;
+            }
+        };
+    #[cfg(unix)]
+    let mut interrupt =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+            Ok(signal) => signal,
+            Err(_) => {
+                shutdown.store(true, Ordering::Release);
+                let _ = ready.send(false);
+                return;
+            }
+        };
+    drop(_runtime_guard);
+    let _ = ready.send(true);
+    runtime.block_on(async move {
+        let mut poll = tokio::time::interval(Duration::from_millis(25));
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+                _ = poll.tick() => {
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = poll.tick() => {
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+            }
+        }
+        shutdown.store(true, Ordering::Release);
+    });
 }
 
 fn snapshot_command(args: &[String], config_path: &str) -> Result<(), String> {
@@ -1076,5 +1180,16 @@ mod tests {
         assert!(!config.identity_path().exists());
         assert!(!config.data_dir.join("raft.redb").exists());
         assert!(!config.data_dir.join("state").join("active.redb").exists());
+    }
+
+    #[test]
+    fn shutdown_signal_watcher_acknowledges_setup_and_observes_pre_set_token() {
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let watcher_shutdown = Arc::clone(&shutdown);
+        let watcher = thread::spawn(move || wait_for_shutdown_signal(watcher_shutdown, ready_tx));
+        assert_eq!(ready_rx.recv_timeout(Duration::from_secs(1)).unwrap(), true);
+        watcher.join().expect("signal watcher thread");
+        assert!(shutdown.load(Ordering::Acquire));
     }
 }

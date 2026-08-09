@@ -101,13 +101,14 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
                 let (raft_path, state_path) = openraft_paths(&cfg);
                 validate_redb_target(&raft_path, "raft.redb")?;
                 validate_redb_target(&state_path, "state/active.redb")?;
-                let consensus = OpenRaftConsensus::open(
+                let consensus = OpenRaftConsensus::open_with_snapshot_log_bytes(
                     cfg.node_id,
                     &raft_path,
                     &state_path,
                     cfg.cluster_id().0,
                     cfg.cluster_incarnation,
                     true,
+                    cfg.raft.snapshot_log_bytes,
                 )
                 .map_err(|error| error.to_string())?;
                 harden_file(&raft_path, false)?;
@@ -255,13 +256,14 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
         let (raft_path, state_path) = openraft_paths(&cfg);
         validate_redb_target(&raft_path, "raft.redb")?;
         validate_redb_target(&state_path, "state/active.redb")?;
-        let consensus = OpenRaftConsensus::open(
+        let consensus = OpenRaftConsensus::open_with_snapshot_log_bytes(
             cfg.node_id,
             &raft_path,
             &state_path,
             cfg.cluster_id().0,
             cfg.cluster_incarnation,
             false,
+            cfg.raft.snapshot_log_bytes,
         )
         .map_err(|error| error.to_string())?;
         harden_file(&raft_path, false)?;
@@ -1237,6 +1239,7 @@ fn open_authenticated_consensus(
         election_timeout_min_ms: cfg.raft.election_timeout_min_ms,
         election_timeout_max_ms: cfg.raft.election_timeout_max_ms,
         snapshot_entries: cfg.raft.snapshot_entries,
+        snapshot_log_bytes: cfg.raft.snapshot_log_bytes,
     };
     let consensus = OpenRaftConsensus::open_authenticated(
         cfg.node_id,

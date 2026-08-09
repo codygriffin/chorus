@@ -45,6 +45,7 @@ const STATUS_METADATA_TIMEOUT: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_GATEWAY_REDIRECTS: usize = 3;
 const COALESCED_BARRIER_WAIT_TIMEOUT: Duration = Duration::from_secs(11);
+const DEFAULT_SINGLE_NODE_SNAPSHOT_LOG_BYTES: u64 = 128 * 1024 * 1024;
 
 type ChorusRaft = Raft<ChorusRaftConfig>;
 
@@ -64,10 +65,13 @@ pub struct OpenRaftRuntimeOptions {
     pub election_timeout_min_ms: u64,
     pub election_timeout_max_ms: u64,
     pub snapshot_entries: u64,
+    pub snapshot_log_bytes: u64,
 }
 
 enum RuntimeMode {
-    SingleNode,
+    SingleNode {
+        snapshot_log_bytes: u64,
+    },
     Authenticated {
         identity: Arc<TransportTlsIdentity>,
         initial_voters: BTreeMap<u64, BasicNode>,
@@ -215,6 +219,29 @@ impl OpenRaftConsensus {
         cluster_incarnation: u64,
         initialize: bool,
     ) -> Result<Arc<Self>> {
+        Self::open_with_snapshot_log_bytes(
+            node_id,
+            raft_path,
+            state_path,
+            cluster_id,
+            cluster_incarnation,
+            initialize,
+            DEFAULT_SINGLE_NODE_SNAPSHOT_LOG_BYTES,
+        )
+    }
+
+    /// Open a durable single-node group with an explicit retained-log byte
+    /// snapshot trigger. The legacy `open` constructor keeps the default for
+    /// callers that do not expose raft limits.
+    pub fn open_with_snapshot_log_bytes(
+        node_id: u64,
+        raft_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+        initialize: bool,
+        snapshot_log_bytes: u64,
+    ) -> Result<Arc<Self>> {
         Self::open_inner(
             node_id,
             raft_path,
@@ -222,7 +249,7 @@ impl OpenRaftConsensus {
             cluster_id,
             cluster_incarnation,
             initialize,
-            RuntimeMode::SingleNode,
+            RuntimeMode::SingleNode { snapshot_log_bytes },
         )
     }
 
@@ -345,7 +372,7 @@ impl OpenRaftConsensus {
             let voters: Vec<_> = stored_membership.voter_ids().collect();
             let learners: Vec<_> = stored_membership.membership().learner_ids().collect();
             match &mode {
-                RuntimeMode::SingleNode if voters != [node_id] || !learners.is_empty() => {
+                RuntimeMode::SingleNode { .. } if voters != [node_id] || !learners.is_empty() => {
                     return Err(ChorusError::Consensus(
                         "single-node adapter refuses durable multi-node or foreign-node membership"
                             .into(),
@@ -488,6 +515,12 @@ impl OpenRaftConsensus {
     pub fn checkpoint(&self) -> Result<()> {
         self.send(|response| RuntimeRequest::Checkpoint { response })
     }
+
+    /// Return the last snapshot cursor currently published by OpenRaft.
+    /// This is a diagnostic/readiness probe; it does not trigger a snapshot.
+    pub fn snapshot_cursor(&self) -> Result<Option<ChorusLogId>> {
+        self.send(|response| RuntimeRequest::Snapshot { response })
+    }
 }
 
 impl Consensus for OpenRaftConsensus {
@@ -595,6 +628,9 @@ enum RuntimeRequest {
     Checkpoint {
         response: std_mpsc::SyncSender<Result<()>>,
     },
+    Snapshot {
+        response: std_mpsc::SyncSender<Result<Option<ChorusLogId>>>,
+    },
     Shutdown {
         response: std_mpsc::SyncSender<()>,
     },
@@ -611,6 +647,10 @@ async fn run_runtime(
     mut receiver: mpsc::Receiver<RuntimeRequest>,
     startup: std_mpsc::SyncSender<std::result::Result<(), String>>,
 ) {
+    let snapshot_log_bytes = match &mode {
+        RuntimeMode::Authenticated { options, .. } => options.snapshot_log_bytes,
+        RuntimeMode::SingleNode { snapshot_log_bytes } => *snapshot_log_bytes,
+    };
     let authenticated = matches!(mode, RuntimeMode::Authenticated { .. });
     let mut log_store = log_store;
     let committed = match log_store.read_committed().await {
@@ -655,7 +695,7 @@ async fn run_runtime(
     let mut server_shutdown = None;
     let mut server_task = None;
     let (raft, initial_members, wait_for_self_leader, gateway, authorized_nodes) = match mode {
-        RuntimeMode::SingleNode => {
+        RuntimeMode::SingleNode { .. } => {
             let config = match single_node_config() {
                 Ok(config) => config,
                 Err(error) => {
@@ -820,10 +860,17 @@ async fn run_runtime(
     }
     let _ = startup.send(Ok(()));
 
+    let mut snapshot_tick = tokio::time::interval(Duration::from_secs(1));
+    snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         let request = if let Some(task) = server_task.as_mut() {
             tokio::select! {
                 request = receiver.recv() => request,
+                _ = snapshot_tick.tick() => {
+                    maybe_trigger_snapshot(&raft, &status_log_store, snapshot_log_bytes).await;
+                    continue;
+                }
                 result = task => {
                     server_task = None;
                     let message = match result {
@@ -836,7 +883,13 @@ async fn run_runtime(
                 }
             }
         } else {
-            receiver.recv().await
+            tokio::select! {
+                request = receiver.recv() => request,
+                _ = snapshot_tick.tick() => {
+                    maybe_trigger_snapshot(&raft, &status_log_store, snapshot_log_bytes).await;
+                    continue;
+                }
+            }
         };
         let Some(request) = request else {
             break;
@@ -967,6 +1020,13 @@ async fn run_runtime(
                 let result = checkpoint_runtime(&raft).await;
                 let _ = response.send(result);
             }
+            RuntimeRequest::Snapshot { response } => {
+                let snapshot = raft.metrics().borrow().snapshot.map(|log_id| ChorusLogId {
+                    term: log_id.leader_id.term,
+                    index: log_id.index,
+                });
+                let _ = response.send(Ok(snapshot));
+            }
             RuntimeRequest::Shutdown { response } => {
                 let checkpoint = tokio::time::timeout(SHUTDOWN_TIMEOUT, checkpoint_runtime(&raft))
                     .await
@@ -989,6 +1049,41 @@ async fn run_runtime(
     }
     stop_transport_server(&mut server_shutdown, &mut server_task).await;
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, raft.shutdown()).await;
+}
+
+async fn maybe_trigger_snapshot(
+    raft: &ChorusRaft,
+    log_store: &RedbRaftLogStore<ChorusRaftConfig>,
+    snapshot_log_bytes: u64,
+) {
+    if snapshot_log_bytes == 0 {
+        return;
+    }
+    let retained_bytes = match log_store.retained_log_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("could not measure retained OpenRaft log bytes: {error}");
+            return;
+        }
+    };
+    if retained_bytes < snapshot_log_bytes {
+        return;
+    }
+
+    let metrics = raft.metrics().borrow().clone();
+    let Some(last_applied) = metrics.last_applied else {
+        return;
+    };
+    if metrics
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot >= &last_applied)
+    {
+        return;
+    }
+    if let Err(error) = raft.trigger().snapshot().await {
+        eprintln!("OpenRaft byte-threshold snapshot trigger failed: {error}");
+    }
 }
 
 async fn checkpoint_runtime(raft: &ChorusRaft) -> Result<()> {

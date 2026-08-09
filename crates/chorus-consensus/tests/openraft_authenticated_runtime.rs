@@ -117,6 +117,26 @@ fn open_node(
     voters: &BTreeMap<u64, String>,
     addresses: &[SocketAddr],
 ) -> Arc<OpenRaftConsensus> {
+    open_node_with_snapshot_bytes(
+        root,
+        node_id,
+        initialize,
+        identity,
+        voters,
+        addresses,
+        128 * 1024 * 1024,
+    )
+}
+
+fn open_node_with_snapshot_bytes(
+    root: &std::path::Path,
+    node_id: u64,
+    initialize: bool,
+    identity: Arc<TransportTlsIdentity>,
+    voters: &BTreeMap<u64, String>,
+    addresses: &[SocketAddr],
+    snapshot_log_bytes: u64,
+) -> Arc<OpenRaftConsensus> {
     let directory = root.join(format!("node-{node_id}"));
     std::fs::create_dir_all(directory.join("state")).unwrap();
     OpenRaftConsensus::open_authenticated(
@@ -134,6 +154,7 @@ fn open_node(
             election_timeout_min_ms: 240,
             election_timeout_max_ms: 480,
             snapshot_entries: 100,
+            snapshot_log_bytes,
         },
     )
     .unwrap()
@@ -302,6 +323,59 @@ fn authenticated_three_node_runtime_bootstraps_replicates_and_restarts() {
     drop(restarted);
     drop(node1);
     drop(node2);
+}
+
+#[test]
+fn authenticated_runtime_triggers_snapshot_at_retained_log_byte_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let ca = test_ca();
+    let leaves: Vec<_> = (1..=3)
+        .map(|node_id| test_leaf(&ca, &format!("node-{node_id}.chorus.test")))
+        .collect();
+    let addresses = free_addresses(3);
+    let voters: BTreeMap<_, _> = addresses
+        .iter()
+        .enumerate()
+        .map(|(index, address)| (index as u64 + 1, format!("https://{address}")))
+        .collect();
+    let identities: Vec<_> = (1..=3)
+        .map(|node_id| identity(&ca, node_id, &leaves, &voters))
+        .collect();
+
+    let node2 = open_node(
+        root.path(),
+        2,
+        false,
+        Arc::clone(&identities[1]),
+        &voters,
+        &addresses,
+    );
+    let node3 = open_node(
+        root.path(),
+        3,
+        false,
+        Arc::clone(&identities[2]),
+        &voters,
+        &addresses,
+    );
+    let node1 = open_node_with_snapshot_bytes(
+        root.path(),
+        1,
+        true,
+        Arc::clone(&identities[0]),
+        &voters,
+        &addresses,
+        1,
+    );
+    node1.activate_origin(OriginId::new(1)).unwrap();
+
+    wait_for(Duration::from_secs(6), || {
+        node1.snapshot_cursor().ok().flatten().is_some()
+    });
+
+    drop(node1);
+    drop(node2);
+    drop(node3);
 }
 
 #[test]

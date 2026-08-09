@@ -135,6 +135,25 @@ impl<C: RaftTypeConfig> RedbRaftLogStore<C> {
         self.cluster_incarnation
     }
 
+    /// Return the encoded bytes retained in the physical Raft log.
+    ///
+    /// This is deliberately the bounded on-disk value payload total rather
+    /// than a filesystem-size estimate: it is the quantity used by the
+    /// runtime's configured `snapshot_log_bytes` trigger.  The read is
+    /// consistent with one redb transaction and never materializes entries.
+    pub fn retained_log_bytes(&self) -> Result<u64, RedbRaftError> {
+        let tx = self.db.begin_read().map_err(redb_error)?;
+        let table = tx.open_table(LOG).map_err(redb_error)?;
+        let mut total = 0u64;
+        for item in table.iter().map_err(redb_error)? {
+            let (_index, value) = item.map_err(redb_error)?;
+            total = total
+                .checked_add(value.value().len() as u64)
+                .ok_or_else(|| RedbRaftError::Corrupt("raft log byte count overflow".into()))?;
+        }
+        Ok(total)
+    }
+
     /// Return an explicit capability for state/snapshot publication to
     /// advance this store's durable purge fence.
     pub fn purge_fence_handle(&self) -> PurgeFenceHandle<C> {
@@ -1036,6 +1055,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raft.redb");
         let mut store = Store::open(&path, CLUSTER_ID, INCARNATION).unwrap();
+        assert_eq!(0, store.retained_log_bytes().unwrap());
         assert!(
             store
                 .blocking_append([entry(1, 1, "missing-zero")])
@@ -1044,6 +1064,7 @@ mod tests {
         );
         assert_eq!(None, store.get_log_state().await.unwrap().last_log_id);
         append(&mut store, [entry(1, 0, "zero"), entry(1, 1, "one")]).await;
+        assert!(store.retained_log_bytes().unwrap() > 0);
 
         let vote = Vote::new_committed(3, 9);
         store.save_vote(&vote).await.unwrap();
@@ -1054,6 +1075,7 @@ mod tests {
         assert_eq!(Some(vote), reopened.read_vote().await.unwrap());
         assert!(reopened.read_vote().await.unwrap().unwrap().is_committed());
         assert_eq!(Some(log_id(1, 1)), reopened.read_committed().await.unwrap());
+        assert!(reopened.retained_log_bytes().unwrap() > 0);
         assert!(reopened.save_committed(None).await.is_err());
         drop(reopened);
 

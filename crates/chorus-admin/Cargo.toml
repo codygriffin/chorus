@@ -9,7 +9,12 @@ chorus-common = { path = "../chorus-common" }
 chorus-codec = { path = "../chorus-codec" }
 chorus-storage = { path = "../chorus-storage" }
 chorus-consensus = { path = "../chorus-consensus" }
+ring = "=0.17.14"
+rustls-pemfile = "=2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.19"
 toml = "1.1.2"
+
+[dev-dependencies]
+rcgen = "=0.13.2"

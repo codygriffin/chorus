@@ -8,6 +8,8 @@ use chorus_codec::LogicalSnapshot;
 use chorus_common::{ClusterId, Limits};
 use chorus_consensus::ConsensusStatus;
 use chorus_storage::{FileStateStore, StateStore, StoreStatus};
+use ring::digest::{SHA256, digest};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
@@ -30,6 +32,14 @@ const IDENTITY_FILE_NAME: &str = "identity.toml";
 const IDENTITY_VERSION: u32 = 1;
 const MAX_IDENTITY_BYTES: u64 = 4096;
 const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_MANIFEST_CANONICAL_BYTES: usize = 64 * 1024;
+const MAX_MANIFEST_KEY_BYTES: u64 = 64;
+const MAX_MANIFEST_BINDING_BYTES: u64 = 4096;
+const MANIFEST_FORMAT_VERSION: u16 = 1;
+const MANIFEST_BINDING_VERSION: u16 = 1;
+const MANIFEST_DOMAIN: &[u8] = b"chorus/openraft-bootstrap-manifest/v1\0";
+const MANIFEST_BINDING_FILE_NAME: &str = "bootstrap-manifest.lock";
 static NEXT_IDENTITY_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -55,6 +65,12 @@ pub struct Config {
     pub allow_insecure_dev: bool,
     #[serde(default)]
     pub initial_nodes: Vec<InitialNode>,
+    /// Signature metadata for the shared authenticated OpenRaft bootstrap
+    /// manifest. Node-local paths and `node_id` are deliberately excluded
+    /// from the signed projection so every initial node uses the same
+    /// signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_manifest: Option<BootstrapManifestSignature>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -165,6 +181,40 @@ pub struct InitialNode {
     pub tls_leaf_sha256: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapManifestSignature {
+    pub format_version: u16,
+    pub algorithm: String,
+    pub generation: u64,
+    /// Lower-case SHA-256 of the raw 32-byte Ed25519 public key.
+    pub key_id: String,
+    /// Lower-case SHA-256 of the canonical DER CA trust set.
+    pub ca_sha256: String,
+    /// Lower-case hexadecimal 64-byte Ed25519 signature. This field alone is
+    /// excluded from the canonical signed bytes.
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedOpenRaftManifest {
+    pub format_version: u16,
+    pub generation: u64,
+    pub signer_key_id: [u8; 32],
+    pub manifest_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestBinding {
+    format_version: u16,
+    cluster_id: String,
+    cluster_incarnation: u64,
+    generation: u64,
+    signer_key_id: String,
+    manifest_digest: String,
+}
+
 impl InitialNode {
     pub fn endpoint_socket_addr(&self) -> Result<SocketAddr, ConfigError> {
         parse_initial_endpoint(&self.endpoint).map(|(address, _)| address)
@@ -222,6 +272,7 @@ impl Config {
                 tls_dns_name: None,
                 tls_leaf_sha256: None,
             }],
+            bootstrap_manifest: None,
         }
     }
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -234,23 +285,28 @@ impl Config {
             )));
         }
         let text = fs::read_to_string(path).map_err(|e| ConfigError::Io(e.to_string()))?;
-        // `Limits` predates the config loader and does not carry serde field
-        // defaults. Merge only nested option tables so a config containing,
-        // for example, just `[limits].query_workers` remains compatible with
-        // the documented TOML while required top-level identity fields still
-        // have to be present.
-        let mut value: toml::Value =
-            toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        let defaults = toml::Value::try_from(Self::defaults(".", 1))
-            .map_err(|e| ConfigError::Parse(e.to_string()))?;
-        for section in ["postgres", "raft", "storage", "limits", "tls"] {
-            merge_toml_table(&mut value, &defaults, section);
-        }
-        let c: Self = value
-            .try_into()
-            .map_err(|e: toml::de::Error| ConfigError::Parse(e.to_string()))?;
-        c.validate()?;
-        Ok(c)
+        parse_config_text(&text)
+    }
+
+    /// Load, verify, and immutably bind the authenticated OpenRaft bootstrap
+    /// manifest before any durable database or listener is opened.
+    pub fn load_openraft_signed(
+        config_path: impl AsRef<Path>,
+        trust_key_path: impl AsRef<Path>,
+    ) -> Result<Self, ConfigError> {
+        let bytes = read_bounded_nofollow(
+            config_path.as_ref(),
+            "signed configuration",
+            MAX_MANIFEST_BYTES,
+            true,
+        )?;
+        let text = std::str::from_utf8(&bytes).map_err(|error| {
+            ConfigError::Parse(format!("signed configuration is not UTF-8: {error}"))
+        })?;
+        let config = parse_config_text(text)?;
+        let verified = config.verify_openraft_manifest(trust_key_path)?;
+        ensure_manifest_binding(&config, &verified)?;
+        Ok(config)
     }
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         self.validate()?;
@@ -506,6 +562,9 @@ impl Config {
             validate_tls_file(self.tls.certificate.as_deref(), "tls.certificate", false)?;
             validate_tls_file(self.tls.private_key.as_deref(), "tls.private_key", true)?;
         }
+        if let Some(manifest) = &self.bootstrap_manifest {
+            validate_manifest_signature_metadata(manifest)?;
+        }
         Ok(())
     }
     pub fn cluster_id(&self) -> ClusterId {
@@ -518,10 +577,9 @@ impl Config {
         self.data_dir.join(IDENTITY_FILE_NAME)
     }
 
-    /// Validate the operator-provisioned static peer manifest used by the
-    /// authenticated OpenRaft mode. This does not claim that the TOML file is
-    /// cryptographically signed; signature verification remains a release
-    /// gate until a manifest signature format and trust key are configured.
+    /// Validate the semantic peer-directory fields used by authenticated
+    /// OpenRaft. Cryptographic verification is performed separately by
+    /// [`Config::load_openraft_signed`].
     pub fn validate_openraft_mtls(&self) -> Result<(), ConfigError> {
         self.validate()?;
         if !self.tls.complete() {
@@ -584,6 +642,60 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// Return the exact domain-separated bytes covered by the bootstrap
+    /// signature. The hexadecimal `signature` field itself is intentionally
+    /// excluded; every other manifest-signature field is bound.
+    pub fn openraft_manifest_signing_bytes(&self) -> Result<Vec<u8>, ConfigError> {
+        self.validate_openraft_mtls()?;
+        canonical_openraft_manifest(self)
+    }
+
+    pub fn verify_openraft_manifest(
+        &self,
+        trust_key_path: impl AsRef<Path>,
+    ) -> Result<VerifiedOpenRaftManifest, ConfigError> {
+        self.validate_openraft_mtls()?;
+        let manifest = self.bootstrap_manifest.as_ref().ok_or_else(|| {
+            ConfigError::Invalid(
+                "authenticated OpenRaft requires bootstrap_manifest signature metadata".into(),
+            )
+        })?;
+        let public_key = read_manifest_public_key(trust_key_path.as_ref())?;
+        let key_id = sha256(&public_key);
+        let configured_key_id = decode_lower_hex::<32>(&manifest.key_id, "manifest key_id")?;
+        if key_id != configured_key_id {
+            return Err(ConfigError::Invalid(
+                "trusted manifest key does not match bootstrap_manifest.key_id".into(),
+            ));
+        }
+
+        let ca_bytes = read_bounded_regular_file(
+            self.tls.ca.as_deref().expect("validated CA path"),
+            "tls.ca",
+            false,
+        )?;
+        let actual_ca_digest = canonical_ca_trust_digest(&ca_bytes)?;
+        let configured_ca_digest =
+            decode_lower_hex::<32>(&manifest.ca_sha256, "manifest ca_sha256")?;
+        if actual_ca_digest != configured_ca_digest {
+            return Err(ConfigError::Invalid(
+                "tls.ca trust set does not match the signed manifest digest".into(),
+            ));
+        }
+
+        let signed = canonical_openraft_manifest(self)?;
+        let signature = decode_lower_hex::<64>(&manifest.signature, "manifest signature")?;
+        UnparsedPublicKey::new(&ED25519, public_key)
+            .verify(&signed, &signature)
+            .map_err(|_| ConfigError::Invalid("bootstrap manifest signature is invalid".into()))?;
+        Ok(VerifiedOpenRaftManifest {
+            format_version: manifest.format_version,
+            generation: manifest.generation,
+            signer_key_id: key_id,
+            manifest_digest: sha256(&signed),
+        })
     }
 
     pub fn openraft_bootstrap_node_id(&self) -> Result<u64, ConfigError> {
@@ -801,6 +913,429 @@ pub fn is_logical_backup(snapshot: &LogicalSnapshot) -> bool {
         .meta
         .get("backup_kind")
         .is_some_and(|kind| kind.as_slice() == b"chorus-logical-backup-v1")
+}
+
+fn parse_config_text(text: &str) -> Result<Config, ConfigError> {
+    // `Limits` predates the config loader and does not carry serde field
+    // defaults. Merge only nested option tables so partial nested sections
+    // remain compatible while required top-level identity fields stay
+    // mandatory.
+    let mut value: toml::Value =
+        toml::from_str(text).map_err(|error| ConfigError::Parse(error.to_string()))?;
+    let defaults = toml::Value::try_from(Config::defaults(".", 1))
+        .map_err(|error| ConfigError::Parse(error.to_string()))?;
+    for section in ["postgres", "raft", "storage", "limits", "tls"] {
+        merge_toml_table(&mut value, &defaults, section);
+    }
+    let config: Config = value
+        .try_into()
+        .map_err(|error: toml::de::Error| ConfigError::Parse(error.to_string()))?;
+    config.validate()?;
+    Ok(config)
+}
+
+fn validate_manifest_signature_metadata(
+    manifest: &BootstrapManifestSignature,
+) -> Result<(), ConfigError> {
+    if manifest.format_version != MANIFEST_FORMAT_VERSION {
+        return Err(ConfigError::Invalid(format!(
+            "bootstrap manifest format version {} is unsupported",
+            manifest.format_version
+        )));
+    }
+    if manifest.algorithm != "ed25519" {
+        return Err(ConfigError::Invalid(
+            "bootstrap manifest algorithm must be ed25519".into(),
+        ));
+    }
+    if manifest.generation == 0 {
+        return Err(ConfigError::Invalid(
+            "bootstrap manifest generation must be nonzero".into(),
+        ));
+    }
+    decode_lower_hex::<32>(&manifest.key_id, "manifest key_id")?;
+    decode_lower_hex::<32>(&manifest.ca_sha256, "manifest ca_sha256")?;
+    decode_lower_hex::<64>(&manifest.signature, "manifest signature")?;
+    Ok(())
+}
+
+fn canonical_openraft_manifest(config: &Config) -> Result<Vec<u8>, ConfigError> {
+    let manifest = config.bootstrap_manifest.as_ref().ok_or_else(|| {
+        ConfigError::Invalid(
+            "authenticated OpenRaft requires bootstrap_manifest signature metadata".into(),
+        )
+    })?;
+    validate_manifest_signature_metadata(manifest)?;
+    let key_id = decode_lower_hex::<32>(&manifest.key_id, "manifest key_id")?;
+    let ca_digest = decode_lower_hex::<32>(&manifest.ca_sha256, "manifest ca_sha256")?;
+
+    let mut encoded = Vec::with_capacity(2048);
+    encoded.extend_from_slice(MANIFEST_DOMAIN);
+    encoded.extend_from_slice(&manifest.format_version.to_be_bytes());
+    put_manifest_bytes(&mut encoded, manifest.algorithm.as_bytes())?;
+    encoded.extend_from_slice(&manifest.generation.to_be_bytes());
+    encoded.extend_from_slice(&key_id);
+    put_manifest_bytes(&mut encoded, config.cluster_id.as_bytes())?;
+    encoded.extend_from_slice(&config.cluster_id().0);
+    encoded.extend_from_slice(&config.cluster_incarnation.to_be_bytes());
+    encoded.extend_from_slice(&ca_digest);
+
+    let mut nodes: Vec<_> = config.initial_nodes.iter().collect();
+    nodes.sort_by_key(|node| node.node_id);
+    let count = u16::try_from(nodes.len())
+        .map_err(|_| ConfigError::Invalid("bootstrap manifest has too many nodes".into()))?;
+    encoded.extend_from_slice(&count.to_be_bytes());
+    for node in nodes {
+        encoded.extend_from_slice(&node.node_id.to_be_bytes());
+        encoded.push(u8::from(node.voter));
+        let (endpoint, https) = parse_initial_endpoint(&node.endpoint)?;
+        if !https {
+            return Err(ConfigError::Invalid(format!(
+                "authenticated OpenRaft node {} endpoint must use https://",
+                node.node_id
+            )));
+        }
+        match endpoint {
+            SocketAddr::V4(address) => {
+                encoded.push(4);
+                encoded.extend_from_slice(&address.ip().octets());
+                encoded.extend_from_slice(&address.port().to_be_bytes());
+            }
+            SocketAddr::V6(address) => {
+                encoded.push(6);
+                encoded.extend_from_slice(&address.ip().octets());
+                encoded.extend_from_slice(&address.port().to_be_bytes());
+                encoded.extend_from_slice(&address.flowinfo().to_be_bytes());
+                encoded.extend_from_slice(&address.scope_id().to_be_bytes());
+            }
+        }
+        let dns_name = node.tls_dns_name.as_deref().ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "authenticated OpenRaft node {} is missing tls_dns_name",
+                node.node_id
+            ))
+        })?;
+        put_manifest_bytes(&mut encoded, dns_name.to_ascii_lowercase().as_bytes())?;
+        encoded.extend_from_slice(&node.tls_leaf_fingerprint()?);
+        if encoded.len() > MAX_MANIFEST_CANONICAL_BYTES {
+            return Err(ConfigError::Invalid(
+                "canonical bootstrap manifest exceeds 64 KiB".into(),
+            ));
+        }
+    }
+    Ok(encoded)
+}
+
+fn put_manifest_bytes(encoded: &mut Vec<u8>, value: &[u8]) -> Result<(), ConfigError> {
+    let length = u16::try_from(value.len())
+        .map_err(|_| ConfigError::Invalid("bootstrap manifest field is too long".into()))?;
+    let next = encoded
+        .len()
+        .checked_add(2)
+        .and_then(|length| length.checked_add(value.len()))
+        .ok_or_else(|| ConfigError::Invalid("bootstrap manifest length overflow".into()))?;
+    if next > MAX_MANIFEST_CANONICAL_BYTES {
+        return Err(ConfigError::Invalid(
+            "canonical bootstrap manifest exceeds 64 KiB".into(),
+        ));
+    }
+    encoded.extend_from_slice(&length.to_be_bytes());
+    encoded.extend_from_slice(value);
+    Ok(())
+}
+
+fn canonical_ca_trust_digest(pem: &[u8]) -> Result<[u8; 32], ConfigError> {
+    let mut reader = pem;
+    let mut certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| ConfigError::Invalid(format!("could not parse tls.ca: {error}")))?;
+    if certificates.is_empty() || certificates.len() > 64 {
+        return Err(ConfigError::Invalid(
+            "tls.ca must contain between 1 and 64 certificates".into(),
+        ));
+    }
+    certificates.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+    if certificates
+        .windows(2)
+        .any(|pair| pair[0].as_ref() == pair[1].as_ref())
+    {
+        return Err(ConfigError::Invalid(
+            "tls.ca contains a duplicate certificate".into(),
+        ));
+    }
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(b"chorus/ca-trust-set/v1\0");
+    canonical.extend_from_slice(&(certificates.len() as u16).to_be_bytes());
+    for certificate in certificates {
+        let der = certificate.as_ref();
+        let length = u32::try_from(der.len())
+            .map_err(|_| ConfigError::Invalid("tls.ca certificate is too large".into()))?;
+        canonical.extend_from_slice(&length.to_be_bytes());
+        canonical.extend_from_slice(der);
+    }
+    Ok(sha256(&canonical))
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    digest(&SHA256, bytes)
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 output is exactly 32 bytes")
+}
+
+fn decode_lower_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], ConfigError> {
+    if value.len() != N.saturating_mul(2)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{label} must be exactly {} lower-case hexadecimal characters",
+            N.saturating_mul(2)
+        )));
+    }
+    let mut decoded = [0; N];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        *output = (hex_nibble(value.as_bytes()[index * 2]) << 4)
+            | hex_nibble(value.as_bytes()[index * 2 + 1]);
+    }
+    Ok(decoded)
+}
+
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn read_manifest_public_key(path: &Path) -> Result<[u8; 32], ConfigError> {
+    let bytes = read_bounded_nofollow(path, "manifest trust key", MAX_MANIFEST_KEY_BYTES, true)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| ConfigError::Invalid("manifest trust key is not ASCII hex".into()))?;
+    decode_lower_hex::<32>(text, "manifest trust key")
+}
+
+fn read_bounded_nofollow(
+    path: &Path,
+    label: &str,
+    maximum: u64,
+    reject_group_world_write: bool,
+) -> Result<Vec<u8>, ConfigError> {
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| ConfigError::Invalid(format!("{label} cannot be read: {error}")))?;
+    validate_bounded_file_metadata(&path_metadata, label, maximum, reject_group_world_write)?;
+    let mut file = open_identity_read(path)
+        .map_err(|error| ConfigError::Invalid(format!("{label} cannot be opened: {error}")))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| ConfigError::Invalid(format!("{label} cannot be inspected: {error}")))?;
+    let current_metadata = fs::symlink_metadata(path)
+        .map_err(|error| ConfigError::Invalid(format!("{label} cannot be rechecked: {error}")))?;
+    if !same_file(&opened_metadata, &current_metadata) {
+        return Err(ConfigError::Invalid(format!(
+            "{label} changed while it was being opened"
+        )));
+    }
+    validate_bounded_file_metadata(&opened_metadata, label, maximum, reject_group_world_write)?;
+    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ConfigError::Io(error.to_string()))?;
+    if bytes.len() as u64 > maximum {
+        return Err(ConfigError::Invalid(format!(
+            "{label} exceeds {maximum} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_bounded_file_metadata(
+    metadata: &fs::Metadata,
+    label: &str,
+    maximum: u64,
+    reject_group_world_write: bool,
+) -> Result<(), ConfigError> {
+    if !metadata.is_file() {
+        return Err(ConfigError::Invalid(format!(
+            "{label} is not a regular file"
+        )));
+    }
+    if metadata.len() == 0 || metadata.len() > maximum {
+        return Err(ConfigError::Invalid(format!(
+            "{label} size must be between 1 and {maximum} bytes"
+        )));
+    }
+    #[cfg(unix)]
+    if reject_group_world_write {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(ConfigError::Invalid(format!(
+                "{label} must not be group/world-writable"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_manifest_binding(
+    config: &Config,
+    verified: &VerifiedOpenRaftManifest,
+) -> Result<(), ConfigError> {
+    ensure_private_dir(&config.data_dir)?;
+    let path = config.data_dir.join(MANIFEST_BINDING_FILE_NAME);
+    let expected = ManifestBinding {
+        format_version: MANIFEST_BINDING_VERSION,
+        cluster_id: config.cluster_id.clone(),
+        cluster_incarnation: config.cluster_incarnation,
+        generation: verified.generation,
+        signer_key_id: encode_lower_hex(&verified.signer_key_id),
+        manifest_digest: encode_lower_hex(&verified.manifest_digest),
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let existing = read_manifest_binding(&path)?;
+            if existing != expected {
+                return Err(ConfigError::Invalid(
+                    "persisted bootstrap manifest binding does not match the verified manifest"
+                        .into(),
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(artifact) = existing_manifest_bound_artifact(config)? {
+                return Err(ConfigError::Invalid(format!(
+                    "bootstrap manifest binding is missing while durable state exists at {}; refusing to bind an existing installation",
+                    artifact.display()
+                )));
+            }
+            create_manifest_binding(&path, &expected)
+        }
+        Err(error) => Err(ConfigError::Io(error.to_string())),
+    }
+}
+
+fn existing_manifest_bound_artifact(config: &Config) -> Result<Option<PathBuf>, ConfigError> {
+    match fs::symlink_metadata(config.identity_path()) {
+        Ok(_) => return Ok(Some(config.identity_path())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ConfigError::Io(error.to_string())),
+    }
+    existing_durable_artifact(config)
+}
+
+fn read_manifest_binding(path: &Path) -> Result<ManifestBinding, ConfigError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| ConfigError::Io(error.to_string()))?;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(ConfigError::Invalid(
+                "bootstrap manifest binding must not be group/world-accessible".into(),
+            ));
+        }
+    }
+    let bytes = read_bounded_nofollow(
+        path,
+        "bootstrap manifest binding",
+        MAX_MANIFEST_BINDING_BYTES,
+        true,
+    )?;
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        ConfigError::Parse(format!("bootstrap manifest binding is not UTF-8: {error}"))
+    })?;
+    let binding: ManifestBinding =
+        toml::from_str(text).map_err(|error| ConfigError::Parse(error.to_string()))?;
+    if binding.format_version != MANIFEST_BINDING_VERSION
+        || binding.cluster_id.trim().is_empty()
+        || binding.cluster_incarnation == 0
+        || binding.generation == 0
+    {
+        return Err(ConfigError::Invalid(
+            "bootstrap manifest binding contains invalid metadata".into(),
+        ));
+    }
+    decode_lower_hex::<32>(&binding.signer_key_id, "binding signer_key_id")?;
+    decode_lower_hex::<32>(&binding.manifest_digest, "binding manifest_digest")?;
+    Ok(binding)
+}
+
+fn create_manifest_binding(path: &Path, binding: &ManifestBinding) -> Result<(), ConfigError> {
+    let text = toml::to_string(binding).map_err(|error| ConfigError::Parse(error.to_string()))?;
+    if text.is_empty() || text.len() as u64 > MAX_MANIFEST_BINDING_BYTES {
+        return Err(ConfigError::Invalid(
+            "bootstrap manifest binding exceeds its size limit".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| ConfigError::Invalid("manifest binding path has no parent".into()))?;
+    let mut temporary = None;
+    for _ in 0..64 {
+        let sequence = NEXT_IDENTITY_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{MANIFEST_BINDING_FILE_NAME}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ConfigError::Io(error.to_string())),
+        }
+    }
+    let (temporary_path, mut file) = temporary.ok_or_else(|| {
+        ConfigError::Io("could not allocate a manifest binding temporary file".into())
+    })?;
+    harden_open_file_permissions(&file)?;
+    if let Err(error) = file
+        .write_all(text.as_bytes())
+        .and_then(|_| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&temporary_path);
+        return Err(ConfigError::Io(error.to_string()));
+    }
+    drop(file);
+    match fs::hard_link(&temporary_path, path) {
+        Ok(()) => {
+            sync_parent(path)?;
+            fs::remove_file(&temporary_path).map_err(|error| ConfigError::Io(error.to_string()))?;
+            sync_parent(path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&temporary_path).map_err(|error| ConfigError::Io(error.to_string()))?;
+            if read_manifest_binding(path)? == *binding {
+                Ok(())
+            } else {
+                Err(ConfigError::Invalid(
+                    "a different bootstrap manifest binding won concurrent first-open creation"
+                        .into(),
+                ))
+            }
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary_path);
+            Err(ConfigError::Io(error.to_string()))
+        }
+    }
 }
 
 pub fn snapshot_file_within_limit(path: impl AsRef<Path>) -> Result<(), ConfigError> {
@@ -1330,6 +1865,8 @@ mod tests {
     };
     use chorus_common::{LogId, OriginId, RequestId};
     use chorus_storage::StateStore;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair as RcgenKeyPair};
+    use ring::signature::{Ed25519KeyPair, KeyPair as RingKeyPair};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_TEST_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1405,6 +1942,58 @@ mod tests {
         config
     }
 
+    fn ed25519_key(seed: u8) -> Ed25519KeyPair {
+        Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).expect("test Ed25519 seed")
+    }
+
+    fn valid_ca_pem() -> String {
+        let mut params = CertificateParams::new(Vec::new()).expect("CA parameters");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let key = RcgenKeyPair::generate().expect("CA key");
+        params.self_signed(&key).expect("CA certificate").pem()
+    }
+
+    fn sign_manifest(config: &mut Config, key: &Ed25519KeyPair, generation: u64) {
+        let ca = fs::read(config.tls.ca.as_ref().expect("CA path")).expect("CA bytes");
+        config.bootstrap_manifest = Some(BootstrapManifestSignature {
+            format_version: MANIFEST_FORMAT_VERSION,
+            algorithm: "ed25519".into(),
+            generation,
+            key_id: encode_lower_hex(&sha256(key.public_key().as_ref())),
+            ca_sha256: encode_lower_hex(&canonical_ca_trust_digest(&ca).expect("CA digest")),
+            signature: "00".repeat(64),
+        });
+        let signed = config
+            .openraft_manifest_signing_bytes()
+            .expect("canonical manifest");
+        config
+            .bootstrap_manifest
+            .as_mut()
+            .expect("manifest metadata")
+            .signature = encode_lower_hex(key.sign(&signed).as_ref());
+    }
+
+    fn signed_config(
+        directory: &TestDirectory,
+        key_seed: u8,
+    ) -> (Config, PathBuf, PathBuf, Ed25519KeyPair) {
+        let mut config = authenticated_config(directory);
+        fs::write(config.tls.ca.as_ref().unwrap(), valid_ca_pem()).expect("valid CA PEM");
+        let key = ed25519_key(key_seed);
+        let trust_key_path = directory.path().join("manifest-ed25519.pub");
+        fs::write(&trust_key_path, encode_lower_hex(key.public_key().as_ref())).expect("trust key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&trust_key_path, fs::Permissions::from_mode(0o644))
+                .expect("trust-key permissions");
+        }
+        sign_manifest(&mut config, &key, 1);
+        let config_path = directory.path().join("chorus.toml");
+        config.save(&config_path).expect("signed config");
+        (config, config_path, trust_key_path, key)
+    }
+
     #[test]
     fn authenticated_openraft_manifest_is_complete_unique_and_listen_bound() {
         let directory = TestDirectory::new("authenticated-manifest");
@@ -1450,6 +2039,182 @@ mod tests {
         let mut partial_identity = config;
         partial_identity.initial_nodes[2].tls_dns_name = None;
         assert!(partial_identity.validate().is_err());
+    }
+
+    #[test]
+    fn signed_manifest_verifies_canonical_order_and_pins_first_open() {
+        let directory = TestDirectory::new("signed-manifest-valid");
+        let (mut config, config_path, trust_key_path, _) = signed_config(&directory, 7);
+        let canonical = config.openraft_manifest_signing_bytes().unwrap();
+        let loaded = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap();
+        assert_eq!(canonical, loaded.openraft_manifest_signing_bytes().unwrap());
+
+        let binding_path = config.data_dir.join(MANIFEST_BINDING_FILE_NAME);
+        let binding_before = fs::read(&binding_path).expect("manifest binding");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                0o600,
+                fs::metadata(&binding_path).unwrap().permissions().mode() & 0o777
+            );
+        }
+
+        config.initial_nodes.reverse();
+        config.save(&config_path).unwrap();
+        let reordered = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap();
+        assert_eq!(
+            canonical,
+            reordered.openraft_manifest_signing_bytes().unwrap()
+        );
+        assert_eq!(binding_before, fs::read(binding_path).unwrap());
+        assert!(!config.identity_path().exists());
+        assert!(!config.data_dir.join("raft.redb").exists());
+        assert!(!config.state_path().exists());
+    }
+
+    #[test]
+    fn signed_manifest_rejects_tamper_wrong_key_and_invalid_signature_before_binding() {
+        let tampered_directory = TestDirectory::new("signed-manifest-payload-tamper");
+        let (mut tampered, config_path, trust_key_path, _) = signed_config(&tampered_directory, 8);
+        tampered.initial_nodes[1].endpoint = "https://127.0.0.1:7202".into();
+        tampered.save(&config_path).unwrap();
+        let error = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap_err();
+        assert!(error.to_string().contains("signature is invalid"));
+        assert!(!tampered.data_dir.exists());
+
+        let signature_directory = TestDirectory::new("signed-manifest-signature-tamper");
+        let (mut bad_signature, config_path, trust_key_path, _) =
+            signed_config(&signature_directory, 9);
+        bad_signature
+            .bootstrap_manifest
+            .as_mut()
+            .unwrap()
+            .signature
+            .replace_range(..2, "01");
+        bad_signature.save(&config_path).unwrap();
+        let error = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap_err();
+        assert!(error.to_string().contains("signature is invalid"));
+        assert!(!bad_signature.data_dir.exists());
+
+        let wrong_key_directory = TestDirectory::new("signed-manifest-wrong-key");
+        let (wrong_key, config_path, trust_key_path, _) = signed_config(&wrong_key_directory, 10);
+        fs::write(
+            &trust_key_path,
+            encode_lower_hex(ed25519_key(11).public_key().as_ref()),
+        )
+        .unwrap();
+        let error = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+        assert!(!wrong_key.data_dir.exists());
+    }
+
+    #[test]
+    fn manifest_binding_rejects_content_signer_rotation_and_missing_pin_with_artifacts() {
+        let directory = TestDirectory::new("manifest-binding-immutable");
+        let (original, config_path, trust_key_path, key) = signed_config(&directory, 12);
+        Config::load_openraft_signed(&config_path, &trust_key_path).unwrap();
+        let binding_path = original.data_dir.join(MANIFEST_BINDING_FILE_NAME);
+        let binding_before = fs::read(&binding_path).unwrap();
+
+        let mut changed = original.clone();
+        changed.initial_nodes[1].endpoint = "https://127.0.0.1:7302".into();
+        sign_manifest(&mut changed, &key, 2);
+        changed.save(&config_path).unwrap();
+        let error = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap_err();
+        assert!(error.to_string().contains("binding does not match"));
+        assert_eq!(binding_before, fs::read(&binding_path).unwrap());
+
+        let replacement_key = ed25519_key(13);
+        let mut rekeyed = original.clone();
+        sign_manifest(&mut rekeyed, &replacement_key, 1);
+        rekeyed.save(&config_path).unwrap();
+        fs::write(
+            &trust_key_path,
+            encode_lower_hex(replacement_key.public_key().as_ref()),
+        )
+        .unwrap();
+        let error = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap_err();
+        assert!(error.to_string().contains("binding does not match"));
+        assert_eq!(binding_before, fs::read(&binding_path).unwrap());
+
+        let artifact_directory = TestDirectory::new("manifest-binding-artifact-gate");
+        let (artifact_config, config_path, trust_key_path, _) =
+            signed_config(&artifact_directory, 14);
+        fs::create_dir_all(&artifact_config.data_dir).unwrap();
+        let raft_path = artifact_config.data_dir.join("raft.redb");
+        fs::write(&raft_path, b"existing durable bytes").unwrap();
+        let error = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap_err();
+        assert!(error.to_string().contains("binding is missing"));
+        assert_eq!(
+            b"existing durable bytes".as_slice(),
+            fs::read(&raft_path).unwrap()
+        );
+        assert!(
+            !artifact_config
+                .data_dir
+                .join(MANIFEST_BINDING_FILE_NAME)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn manifest_key_and_config_size_bounds_fail_before_binding() {
+        let key_directory = TestDirectory::new("manifest-key-oversize");
+        let (key_config, config_path, trust_key_path, _) = signed_config(&key_directory, 15);
+        fs::write(
+            &trust_key_path,
+            vec![b'a'; MAX_MANIFEST_KEY_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(Config::load_openraft_signed(&config_path, &trust_key_path).is_err());
+        assert!(!key_config.data_dir.exists());
+
+        let config_directory = TestDirectory::new("manifest-config-oversize");
+        fs::create_dir_all(config_directory.path()).unwrap();
+        let config_path = config_directory.path().join("chorus.toml");
+        let key_path = config_directory.path().join("manifest.pub");
+        fs::write(&config_path, vec![b'x'; MAX_MANIFEST_BYTES as usize + 1]).unwrap();
+        fs::write(&key_path, "00".repeat(32)).unwrap();
+        assert!(Config::load_openraft_signed(&config_path, &key_path).is_err());
+        assert!(!config_directory.path().join("data").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_manifest_rejects_config_and_key_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("manifest-symlinks");
+        let (config, config_path, trust_key_path, _) = signed_config(&directory, 16);
+        let config_link = directory.path().join("config-link.toml");
+        symlink(&config_path, &config_link).unwrap();
+        assert!(Config::load_openraft_signed(&config_link, &trust_key_path).is_err());
+
+        let key_link = directory.path().join("key-link.pub");
+        symlink(&trust_key_path, &key_link).unwrap();
+        assert!(Config::load_openraft_signed(&config_path, &key_link).is_err());
+        assert!(!config.data_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_manifest_rejects_group_or_world_writable_inputs_before_binding() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("manifest-writable-inputs");
+        let (config, config_path, trust_key_path, _) = signed_config(&directory, 17);
+
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o620)).unwrap();
+        let error = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap_err();
+        assert!(error.to_string().contains("group/world-writable"));
+        assert!(!config.data_dir.exists());
+
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&trust_key_path, fs::Permissions::from_mode(0o666)).unwrap();
+        let error = Config::load_openraft_signed(&config_path, &trust_key_path).unwrap_err();
+        assert!(error.to_string().contains("group/world-writable"));
+        assert!(!config.data_dir.exists());
     }
 
     #[test]

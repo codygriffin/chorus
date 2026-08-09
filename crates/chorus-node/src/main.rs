@@ -43,7 +43,7 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
                             .into(),
                     );
                 }
-                let cfg = Config::load(&path).map_err(|error| error.to_string())?;
+                let cfg = load_command_config(&args, &path, true)?;
                 if cfg.node_id
                     != cfg
                         .openraft_bootstrap_node_id()
@@ -138,7 +138,7 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         "status" | "check" | "state-hash" | "metrics" => {
-            let cfg = Config::load(&config_path).map_err(|e| e.to_string())?;
+            let cfg = load_command_config(&args, &config_path, false)?;
             let store = open_store(&cfg).map_err(|e| e.to_string())?;
             match command {
                 "state-hash" => {
@@ -182,10 +182,10 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
             path
         ));
     }
-    let cfg = Config::load(path).map_err(|e| e.to_string())?;
-    cfg.validate().map_err(|e| e.to_string())?;
     let openraft_single_node = has_flag(args, "--openraft-single-node");
     let openraft_mtls = has_flag(args, "--openraft-mtls");
+    let cfg = load_command_config(args, path, openraft_mtls)?;
+    cfg.validate().map_err(|e| e.to_string())?;
     if openraft_single_node && openraft_mtls {
         return Err("choose only one OpenRaft serving mode".into());
     }
@@ -338,7 +338,7 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
 fn snapshot_command(args: &[String], config_path: &str) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
         Some("create") | Some("export") => {
-            let cfg = Config::load(config_path).map_err(|e| e.to_string())?;
+            let cfg = load_command_config(args, config_path, false)?;
             let store = open_store(&cfg).map_err(|e| e.to_string())?;
             let store_status = store.status();
             if !store_status.healthy {
@@ -393,7 +393,7 @@ fn restore_command(args: &[String], config_path: &str) -> Result<(), String> {
     }
     let input =
         arg_value(args, "--input").ok_or_else(|| "restore requires --input PATH".to_string())?;
-    let cfg = Config::load(config_path).map_err(|e| e.to_string())?;
+    let cfg = load_command_config(args, config_path, false)?;
     require_cluster_confirmation(args, &cfg)?;
     snapshot_file_within_limit(&input).map_err(|e| e.to_string())?;
     let bytes = fs::read(&input).map_err(|e| e.to_string())?;
@@ -477,7 +477,7 @@ fn restore_command(args: &[String], config_path: &str) -> Result<(), String> {
 }
 
 fn member_command(args: &[String], config_path: &str) -> Result<(), String> {
-    let cfg = Config::load(config_path).map_err(|e| e.to_string())?;
+    let cfg = load_command_config(args, config_path, false)?;
     let store = open_store(&cfg).map_err(|e| e.to_string())?;
     let snapshot = store.snapshot().map_err(|e| e.to_string())?;
     match args.get(1).map(String::as_str).unwrap_or("list") {
@@ -761,6 +761,37 @@ fn validate_redb_target(path: &Path, label: &str) -> Result<(), String> {
     }
 }
 
+fn load_command_config(
+    args: &[String],
+    path: &str,
+    require_signed_manifest: bool,
+) -> Result<Config, String> {
+    let trust_key = arg_value(args, "--manifest-key");
+    if require_signed_manifest {
+        let trust_key = trust_key.ok_or_else(|| {
+            "authenticated OpenRaft requires --manifest-key PATH before state or listeners are opened"
+                .to_string()
+        })?;
+        return Config::load_openraft_signed(path, trust_key).map_err(|error| error.to_string());
+    }
+
+    let config = Config::load(path).map_err(|error| error.to_string())?;
+    if config.bootstrap_manifest.is_some() {
+        let trust_key = trust_key.ok_or_else(|| {
+            "signed OpenRaft configuration requires --manifest-key PATH before state access"
+                .to_string()
+        })?;
+        Config::load_openraft_signed(path, trust_key).map_err(|error| error.to_string())
+    } else if trust_key.is_some() {
+        Err(
+            "--manifest-key was supplied but the configuration has no signed bootstrap_manifest"
+                .into(),
+        )
+    } else {
+        Ok(config)
+    }
+}
+
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
 }
@@ -829,7 +860,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 fn print_help() {
     println!(
-        "Chorus MVP\n\nUSAGE:\n  chorus run --config PATH [--allow-insecure-dev | --openraft-single-node | --openraft-mtls]\n  chorus bootstrap [--config PATH] [--data-dir PATH] [--node-id N] [--confirm] [--openraft-single-node]\n  chorus status|check|metrics|state-hash --config PATH\n  chorus member list [--config PATH]\n  chorus member add-learner|promote|demote|remove --node-id N --config PATH --cluster-id ID --confirm --offline\n  chorus snapshot create|export --config PATH --output PATH --offline\n  chorus snapshot inspect --input PATH\n  chorus restore --input PATH --config PATH --cluster-id ID --confirm --force-new-cluster"
+        "Chorus MVP\n\nUSAGE:\n  chorus run --config PATH [--allow-insecure-dev | --openraft-single-node | --openraft-mtls --manifest-key PATH]\n  chorus bootstrap [--config PATH] [--data-dir PATH] [--node-id N] [--confirm] [--openraft-single-node | --openraft-mtls --manifest-key PATH]\n  chorus status|check|metrics|state-hash --config PATH [--manifest-key PATH]\n  chorus member list [--config PATH] [--manifest-key PATH]\n  chorus member add-learner|promote|demote|remove --node-id N --config PATH --cluster-id ID --confirm --offline [--manifest-key PATH]\n  chorus snapshot create|export --config PATH --output PATH --offline [--manifest-key PATH]\n  chorus snapshot inspect --input PATH\n  chorus restore --input PATH --config PATH --cluster-id ID --confirm --force-new-cluster [--manifest-key PATH]"
     );
 }
 
@@ -1010,5 +1041,24 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("local TLS leaf"));
+    }
+
+    #[test]
+    fn openraft_mtls_requires_external_manifest_key_before_state_access() {
+        let root = tempfile::tempdir().unwrap();
+        let config = authenticated_test_config(root.path());
+        let config_path = root.path().join("chorus.toml");
+        config.save(&config_path).unwrap();
+
+        let error = run_command(
+            &["run".into(), "--openraft-mtls".into()],
+            &config_path.display().to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("--manifest-key"));
+        assert!(!config.data_dir.exists());
+        assert!(!config.identity_path().exists());
+        assert!(!config.data_dir.join("raft.redb").exists());
+        assert!(!config.data_dir.join("state").join("active.redb").exists());
     }
 }

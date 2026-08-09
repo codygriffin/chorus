@@ -296,6 +296,7 @@ impl SqlEngine {
             transaction_timestamp_us: None,
             statement_timestamp_us: None,
             query_permit: None,
+            commit_outcome_unknown: false,
         }
     }
     pub fn store(&self) -> &Arc<dyn StateStore> {
@@ -358,6 +359,16 @@ enum Statement {
         params: Vec<Expr>,
     },
     Unsupported(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchStatementKind {
+    Begin,
+    Commit,
+    Rollback,
+    SessionControl,
+    Ddl,
+    Ordinary,
 }
 #[derive(Clone, Debug)]
 struct ColumnSpec {
@@ -1507,6 +1518,11 @@ pub struct SqlSession {
     transaction_timestamp_us: Option<i64>,
     statement_timestamp_us: Option<i64>,
     query_permit: Option<QueryPermit>,
+    // An uncertain submit keeps the exact transaction overlay available for
+    // a byte-for-byte COMMIT retry.  While this latch is set, parse and
+    // preflight errors must not convert that retained transaction into an
+    // ordinary failed transaction.
+    commit_outcome_unknown: bool,
 }
 impl SqlSession {
     /// Install or clear the cooperative cancellation hook for this session.
@@ -1587,6 +1603,44 @@ impl SqlSession {
         result
     }
 
+    fn effective_batch_kind(&self, statement: &Statement) -> BatchStatementKind {
+        self.effective_batch_kind_at_depth(statement, 0)
+    }
+
+    fn effective_batch_kind_at_depth(
+        &self,
+        statement: &Statement,
+        depth: usize,
+    ) -> BatchStatementKind {
+        const MAX_NESTED_PREPARED_CLASSIFICATION: usize = 16;
+        let Statement::Execute { name, .. } = statement else {
+            return statement.batch_kind();
+        };
+        if depth >= MAX_NESTED_PREPARED_CLASSIFICATION {
+            return BatchStatementKind::Ordinary;
+        }
+        let Some(sql) = self.prepared.get(name) else {
+            return BatchStatementKind::Ordinary;
+        };
+        let Ok(mut statements) = Parser::batch(sql) else {
+            return BatchStatementKind::Ordinary;
+        };
+        if statements.len() != 1 {
+            return BatchStatementKind::Ordinary;
+        }
+        self.effective_batch_kind_at_depth(&statements.remove(0), depth + 1)
+    }
+
+    fn fail_open_transaction_for_batch_error(&mut self) {
+        if self.commit_outcome_unknown {
+            return;
+        }
+        if let Some(transaction) = self.txn.as_mut() {
+            self.failed = true;
+            transaction.fail();
+        }
+    }
+
     fn execute_batch_with_deadline(
         &mut self,
         sql: &str,
@@ -1601,12 +1655,20 @@ impl SqlSession {
         }
         let statements = match Parser::batch(sql) {
             Ok(statements) => statements,
-            Err(error) => return BatchExecution::failure(Vec::new(), error),
+            Err(error) => {
+                self.fail_open_transaction_for_batch_error();
+                return BatchExecution::failure(Vec::new(), error);
+            }
         };
         if statements.is_empty() {
             return BatchExecution::success(vec![QueryResult::command("", 0)]);
         }
-        if statements.iter().any(|s| s.is_ddl()) && statements.len() != 1 {
+        let statement_kinds = statements
+            .iter()
+            .map(|statement| self.effective_batch_kind(statement))
+            .collect::<Vec<_>>();
+        if statement_kinds.contains(&BatchStatementKind::Ddl) && statements.len() != 1 {
+            self.fail_open_transaction_for_batch_error();
             return BatchExecution::failure(
                 Vec::new(),
                 SqlError::new("25001", "DDL statements must be executed alone in the MVP"),
@@ -1620,13 +1682,27 @@ impl SqlSession {
         // as explicit is conservative: only COMMIT/ROLLBACK can resolve it.
         let mut explicit_transaction = self.txn.is_some();
 
-        for statement in statements {
-            let is_begin = matches!(&statement, Statement::Begin { .. });
-            let is_commit = matches!(&statement, Statement::Commit);
-            let is_rollback = matches!(&statement, Statement::Rollback);
-            let is_txn_control = statement.txn_control();
-            let is_session_control = statement.session_control();
-            let is_ddl = statement.is_ddl();
+        for (statement, statement_kind) in statements.into_iter().zip(statement_kinds) {
+            let is_begin = statement_kind == BatchStatementKind::Begin;
+            let is_commit = statement_kind == BatchStatementKind::Commit;
+            let is_rollback = statement_kind == BatchStatementKind::Rollback;
+            let is_txn_control = matches!(
+                statement_kind,
+                BatchStatementKind::Begin
+                    | BatchStatementKind::Commit
+                    | BatchStatementKind::Rollback
+            );
+            let is_session_control = statement_kind == BatchStatementKind::SessionControl;
+            let is_ddl = statement_kind == BatchStatementKind::Ddl;
+
+            if self.commit_outcome_unknown && !is_commit && !is_rollback {
+                return BatchExecution::failure(
+                    completed,
+                    SqlError::transaction_outcome_unknown(
+                        "the previous COMMIT outcome is unknown; retry COMMIT or ROLLBACK",
+                    ),
+                );
+            }
 
             // BEGIN starts a new explicit boundary. Commit the preceding
             // ordinary implicit segment before executing BEGIN itself.
@@ -1757,8 +1833,14 @@ impl SqlSession {
         s: Statement,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
-        if self.failed && !matches!(s, Statement::Commit | Statement::Rollback) {
-            return Err(SqlError::failed_transaction());
+        if self.failed {
+            let kind = self.effective_batch_kind(&s);
+            if !matches!(
+                kind,
+                BatchStatementKind::Commit | BatchStatementKind::Rollback
+            ) {
+                return Err(SqlError::failed_transaction());
+            }
         }
         match s {
             Statement::Begin { read_only } => {
@@ -1860,6 +1942,7 @@ impl SqlSession {
         self.statement_timestamp_us = Some(transaction.statement_timestamp_us);
         self.txn = Some(transaction);
         self.failed = false;
+        self.commit_outcome_unknown = false;
         Ok(())
     }
     fn commit_internal(&mut self) -> std::result::Result<(), SqlError> {
@@ -1879,9 +1962,13 @@ impl SqlSession {
                     // execute path also keeps 08007 out of failed-transaction
                     // handling.
                     self.txn = Some(txn);
+                    self.commit_outcome_unknown = true;
                     return Err(to_sql(error));
                 }
-                Err(error) => return Err(to_sql(error)),
+                Err(error) => {
+                    self.commit_outcome_unknown = false;
+                    return Err(to_sql(error));
+                }
             };
             if matches!(r, ApplyResult::SerializationFailure { .. }) {
                 return Err(SqlError::serialization(
@@ -1890,6 +1977,7 @@ impl SqlSession {
             }
         }
         self.failed = false;
+        self.commit_outcome_unknown = false;
         self.transaction_timestamp_us = None;
         self.statement_timestamp_us = None;
         Ok(())
@@ -1900,6 +1988,7 @@ impl SqlSession {
         }
         self.txn = None;
         self.failed = false;
+        self.commit_outcome_unknown = false;
         self.transaction_timestamp_us = None;
         self.statement_timestamp_us = None;
     }
@@ -3166,21 +3255,26 @@ impl SqlSession {
 }
 
 impl Statement {
-    fn is_ddl(&self) -> bool {
-        matches!(
-            self,
+    fn batch_kind(&self) -> BatchStatementKind {
+        match self {
+            Self::Begin { .. } => BatchStatementKind::Begin,
+            Self::Commit => BatchStatementKind::Commit,
+            Self::Rollback => BatchStatementKind::Rollback,
+            Self::Set(..) | Self::Show(..) | Self::Prepare { .. } => {
+                BatchStatementKind::SessionControl
+            }
             Self::CreateTable { .. }
-                | Self::DropTable { .. }
-                | Self::AlterTable { .. }
-                | Self::CreateIndex { .. }
-                | Self::DropIndex { .. }
-        )
-    }
-    fn txn_control(&self) -> bool {
-        matches!(self, Self::Begin { .. } | Self::Commit | Self::Rollback)
-    }
-    fn session_control(&self) -> bool {
-        matches!(self, Self::Set(..) | Self::Show(..) | Self::Prepare { .. })
+            | Self::DropTable { .. }
+            | Self::AlterTable { .. }
+            | Self::CreateIndex { .. }
+            | Self::DropIndex { .. } => BatchStatementKind::Ddl,
+            Self::Select(..)
+            | Self::Insert(..)
+            | Self::Update(..)
+            | Self::Delete(..)
+            | Self::Execute { .. }
+            | Self::Unsupported(..) => BatchStatementKind::Ordinary,
+        }
     }
 }
 
@@ -5170,6 +5264,13 @@ mod tests {
             assert_eq!(error.code, "08007");
             assert_eq!(session.transaction_status(), TransactionStatus::Active);
 
+            // A parser error must not relabel or discard an exact uncertain
+            // COMMIT. Ordinary work remains fenced until that COMMIT is
+            // retried or the session rolls it back.
+            assert_eq!(session.execute("SELECT (", &[]).unwrap_err().code, "42601");
+            assert_eq!(session.transaction_status(), TransactionStatus::Active);
+            assert_eq!(session.execute("SELECT 1", &[]).unwrap_err().code, "08007");
+
             session.execute("COMMIT", &[]).unwrap();
             assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
             assert_eq!(store.snapshot().unwrap().db_epoch(), 2);
@@ -5469,6 +5570,120 @@ mod tests {
             .unwrap();
         assert_eq!(rows.rows.len(), 3);
         assert!(matches!(rows.rows[2][0], Datum::Int32(3)));
+    }
+
+    #[test]
+    fn prepared_transaction_control_preserves_batch_boundaries() {
+        let origin = OriginId::new(112);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE prepared_boundaries (id integer primary key);",
+                &[],
+            )
+            .unwrap();
+        session.prepare("p_begin", "BEGIN").unwrap();
+        session.prepare("p_commit", "COMMIT").unwrap();
+        session.prepare("p_rollback", "ROLLBACK").unwrap();
+
+        let committed = session
+            .execute_batch(
+                "EXECUTE p_begin; INSERT INTO prepared_boundaries VALUES (1); EXECUTE p_commit; INSERT INTO prepared_boundaries VALUES (2);",
+                &[],
+            )
+            .expect("prepared COMMIT must close the explicit segment");
+        assert_eq!(
+            committed
+                .iter()
+                .map(|result| result.command_tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BEGIN", "INSERT 0 1", "COMMIT", "INSERT 0 1"]
+        );
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+
+        session
+            .execute_batch(
+                "EXECUTE p_begin; INSERT INTO prepared_boundaries VALUES (3); EXECUTE p_rollback; INSERT INTO prepared_boundaries VALUES (4);",
+                &[],
+            )
+            .expect("prepared ROLLBACK must discard only its explicit segment");
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+
+        // An ordinary prepared statement still belongs to the surrounding
+        // implicit segment and must roll back with a later statement error.
+        session
+            .prepare("p_insert", "INSERT INTO prepared_boundaries VALUES (5)")
+            .unwrap();
+        let failed = session.execute_simple_batch(
+            "EXECUTE p_insert; INSERT INTO missing_prepared_boundary VALUES (6);",
+            &[],
+        );
+        assert!(failed.results.is_empty());
+        assert_eq!(failed.error.as_ref().map(|error| error.code), Some("42P01"));
+
+        let rows = session
+            .execute("SELECT id FROM prepared_boundaries ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(
+            rows.rows
+                .iter()
+                .map(|row| match row.first() {
+                    Some(Datum::Int32(value)) => *value,
+                    other => panic!("unexpected row: {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
+    }
+
+    #[test]
+    fn batch_preflight_errors_fail_only_an_open_transaction() {
+        let origin = OriginId::new(113);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store.clone(), committer, Limits::default());
+        let mut session = engine.session();
+        session.prepare("p_rollback", "ROLLBACK").unwrap();
+
+        assert_eq!(session.execute("SELECT (", &[]).unwrap_err().code, "42601");
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+
+        session.execute("BEGIN", &[]).unwrap();
+        assert_eq!(session.execute("SELECT (", &[]).unwrap_err().code, "42601");
+        assert_eq!(session.transaction_status(), TransactionStatus::Failed);
+        assert_eq!(session.execute("SELECT 1", &[]).unwrap_err().code, "25P02");
+        assert_eq!(
+            session
+                .execute("EXECUTE p_rollback", &[])
+                .unwrap()
+                .command_tag,
+            "ROLLBACK"
+        );
+
+        session.execute("BEGIN", &[]).unwrap();
+        assert_eq!(
+            session
+                .execute("CREATE TABLE rejected_batch (id integer); SELECT 1;", &[],)
+                .unwrap_err()
+                .code,
+            "25001"
+        );
+        assert_eq!(session.transaction_status(), TransactionStatus::Failed);
+        assert_eq!(session.execute("SELECT 1", &[]).unwrap_err().code, "25P02");
+        session.execute("ROLLBACK", &[]).unwrap();
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .catalog()
+                .table_by_name("rejected_batch")
+                .is_none()
+        );
     }
 
     #[test]

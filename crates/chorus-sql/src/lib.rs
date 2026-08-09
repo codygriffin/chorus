@@ -14,7 +14,8 @@ use chorus_storage::{
 use chorus_txn::{CommitSequencer, Committer, Transaction, TransactionStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct ResultColumn {
@@ -50,6 +51,15 @@ impl QueryResult {
 /// adapter's cancellation request is being handled on another thread.
 pub trait CancellationChecker: Send + Sync {
     fn is_cancelled(&self) -> bool;
+
+    /// Return the protocol-visible error for this cancellation source.
+    ///
+    /// Existing protocol adapters represent an explicit CancelRequest as a
+    /// user cancellation.  Statement deadlines override this only when the
+    /// external request has not already won the race.
+    fn cancellation_error(&self) -> SqlError {
+        cancellation_error()
+    }
 }
 
 impl CancellationChecker for AtomicBool {
@@ -62,11 +72,56 @@ fn cancellation_error() -> SqlError {
     SqlError::new("57014", "canceling statement due to user request")
 }
 
+fn statement_timeout_error() -> SqlError {
+    SqlError::new("57014", "canceling statement due to statement timeout")
+}
+
 fn check_cancelled(checker: Option<&dyn CancellationChecker>) -> std::result::Result<(), SqlError> {
     if checker.is_some_and(CancellationChecker::is_cancelled) {
-        Err(cancellation_error())
+        Err(checker
+            .expect("cancellation checker was present")
+            .cancellation_error())
     } else {
         Ok(())
+    }
+}
+
+struct StatementCancellation {
+    external: Option<Arc<dyn CancellationChecker>>,
+    deadline: Option<Instant>,
+    reason: AtomicU8,
+}
+
+impl CancellationChecker for StatementCancellation {
+    fn is_cancelled(&self) -> bool {
+        if self
+            .external
+            .as_ref()
+            .is_some_and(|checker| checker.is_cancelled())
+        {
+            self.reason.store(1, Ordering::Release);
+            true
+        } else if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.reason.store(2, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cancellation_error(&self) -> SqlError {
+        match self.reason.load(Ordering::Acquire) {
+            1 => self
+                .external
+                .as_ref()
+                .map(|checker| checker.cancellation_error())
+                .unwrap_or_else(cancellation_error),
+            2 => statement_timeout_error(),
+            _ => statement_timeout_error(),
+        }
     }
 }
 
@@ -1394,6 +1449,23 @@ impl SqlSession {
         sql: &str,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
+        // The protocol cancellation hook belongs to the connection and must
+        // survive a statement.  A timeout wrapper is installed only for the
+        // duration of this call and is restored even when parsing/execution
+        // returns an error.  This also composes correctly for EXECUTE of a
+        // prepared statement, which nests another call to execute().
+        let previous_checker = self.cancellation_checker.clone();
+        let result = self.execute_with_deadline(sql, params, previous_checker.clone());
+        self.cancellation_checker = previous_checker;
+        result
+    }
+
+    fn execute_with_deadline(
+        &mut self,
+        sql: &str,
+        params: &[Datum],
+        parent_checker: Option<Arc<dyn CancellationChecker>>,
+    ) -> std::result::Result<QueryResult, SqlError> {
         if sql.len() > self.engine.limits.max_sql_message_bytes {
             return Err(SqlError::new(
                 "54000",
@@ -1414,11 +1486,20 @@ impl SqlSession {
             && !statements.iter().any(Statement::txn_control)
             && !statements.iter().any(Statement::is_ddl)
             && !statements.iter().all(Statement::session_control);
+        let mut first_statement = true;
         if implicit {
+            self.install_statement_checker(parent_checker.clone())?;
             self.start_txn()?;
         }
         let mut last = QueryResult::command("", 0);
         for statement in statements {
+            if !implicit || !first_statement {
+                // Each AST statement gets a fresh timeout budget.  The
+                // external CancelRequest checker remains shared across the
+                // complete protocol Execute/Simple Query operation.
+                self.install_statement_checker(parent_checker.clone())?;
+            }
+            first_statement = false;
             let result = check_cancelled(self.cancellation_checker())
                 .and_then(|()| self.exec_statement(statement, params));
             match result {
@@ -1441,7 +1522,16 @@ impl SqlSession {
                 self.rollback_internal();
                 return Err(error);
             }
-            self.commit_internal()?;
+            if let Err(error) = self.commit_internal() {
+                // A timeout racing with the final pre-submit check must not
+                // leave an implicit transaction behind.  Once the committer
+                // call begins, commit_internal never checks again, so a slow
+                // successful submission keeps its real outcome.
+                if error.code == "57014" {
+                    self.rollback_internal();
+                }
+                return Err(error);
+            }
         }
         Ok(last)
     }
@@ -1532,6 +1622,28 @@ impl SqlSession {
     fn check_cancelled(&self) -> std::result::Result<(), SqlError> {
         check_cancelled(self.cancellation_checker())
     }
+
+    fn install_statement_checker(
+        &mut self,
+        parent: Option<Arc<dyn CancellationChecker>>,
+    ) -> std::result::Result<(), SqlError> {
+        let deadline = if self.settings.statement_timeout_ms == 0 {
+            None
+        } else {
+            Some(
+                Instant::now()
+                    .checked_add(Duration::from_millis(self.settings.statement_timeout_ms))
+                    .ok_or_else(|| SqlError::new("22023", "invalid timeout"))?,
+            )
+        };
+        self.cancellation_checker = Some(Arc::new(StatementCancellation {
+            external: parent,
+            deadline,
+            reason: AtomicU8::new(0),
+        }));
+        Ok(())
+    }
+
     fn check_draining(&self) -> std::result::Result<(), SqlError> {
         if self.engine.drain_token.load(Ordering::Acquire) {
             Err(SqlError::new(
@@ -1543,6 +1655,9 @@ impl SqlSession {
         }
     }
     fn start_txn(&mut self) -> std::result::Result<(), SqlError> {
+        // Check before the read barrier so a statement which has already
+        // timed out cannot create a transaction or touch the committer.
+        self.check_cancelled()?;
         self.check_draining()?;
         let snapshot = self.engine.committer.read_barrier().map_err(to_sql)?;
         let transaction = Transaction::begin(snapshot, self.engine.limits.clone());
@@ -1553,6 +1668,11 @@ impl SqlSession {
         Ok(())
     }
     fn commit_internal(&mut self) -> std::result::Result<(), SqlError> {
+        // This is the final cooperative check before entering the committer
+        // submission path.  Command encoding that follows is bounded by the
+        // transaction/message limits and is intentionally not rechecked: a
+        // slow but successful submission must return its real outcome.
+        self.check_cancelled()?;
         if let Some(mut txn) = self.txn.take() {
             let r = match txn.commit(self.engine.committer.as_ref(), &self.sequencer) {
                 Ok(result) => result,
@@ -1611,6 +1731,11 @@ impl SqlSession {
             "datestyle" => self.settings.datestyle.clone(),
             "transaction_isolation" => self.settings.transaction_isolation.clone(),
             "transaction_read_only" => self.settings.transaction_read_only.to_string(),
+            "statement_timeout" => self.settings.statement_timeout_ms.to_string(),
+            "idle_in_transaction_session_timeout" => self
+                .settings
+                .idle_in_transaction_session_timeout_ms
+                .to_string(),
             "server_version" => "16.0 (Chorus MVP)".into(),
             "server_version_num" => "160000".into(),
             "integer_datetimes" => "on".into(),
@@ -1649,6 +1774,7 @@ impl SqlSession {
                 "DDL cannot run inside an explicit transaction",
             ));
         }
+        self.check_cancelled()?;
         self.check_draining()?;
         let snap = self.engine.committer.read_barrier().map_err(to_sql)?;
         // IF [NOT] EXISTS branches are true no-ops.  They must not consume a
@@ -1684,7 +1810,9 @@ impl SqlSession {
             }
             _ => {}
         }
+        self.check_cancelled()?;
         let (op, tag) = bind_ddl(s, &snap)?;
+        self.check_cancelled()?;
         let r = self
             .sequencer
             .submit_schema(self.engine.committer.as_ref(), snap.db_epoch(), op)
@@ -1724,6 +1852,10 @@ impl SqlSession {
         if self.txn.is_none() {
             self.start_txn()?;
         }
+        // A slow read barrier may have consumed the statement budget.  Check
+        // while the transaction is still owned by the session so an error
+        // cannot accidentally drop an explicit transaction overlay.
+        self.check_cancelled()?;
         let mut tx = self.txn.take().expect("transaction initialized");
         if let Err(error) = self.prepare_statement(&mut tx) {
             self.txn = Some(tx);
@@ -1740,6 +1872,7 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
+        self.check_cancelled()?;
         if q.from
             .as_deref()
             .is_some_and(|name| is_virtual_relation(name))
@@ -2168,6 +2301,7 @@ impl SqlSession {
         if self.txn.is_none() {
             self.start_txn()?;
         }
+        self.check_cancelled()?;
         let mut tx = self.txn.take().expect("transaction initialized");
         if let Err(error) = self.prepare_statement(&mut tx) {
             self.txn = Some(tx);
@@ -2184,6 +2318,7 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
+        self.check_cancelled()?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let checker = self.cancellation_checker();
         let cols: Vec<_> = if q.columns.is_empty() {
@@ -2384,6 +2519,7 @@ impl SqlSession {
         if self.txn.is_none() {
             self.start_txn()?;
         }
+        self.check_cancelled()?;
         let mut tx = self.txn.take().expect("transaction initialized");
         if let Err(error) = self.prepare_statement(&mut tx) {
             self.txn = Some(tx);
@@ -2400,6 +2536,7 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
+        self.check_cancelled()?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let checker = self.cancellation_checker();
         let targets = scan(tx, &table, checker)?;
@@ -2488,6 +2625,7 @@ impl SqlSession {
         if self.txn.is_none() {
             self.start_txn()?;
         }
+        self.check_cancelled()?;
         let mut tx = self.txn.take().expect("transaction initialized");
         if let Err(error) = self.prepare_statement(&mut tx) {
             self.txn = Some(tx);
@@ -2504,6 +2642,7 @@ impl SqlSession {
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
         tx.check_age().map_err(to_sql)?;
+        self.check_cancelled()?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let checker = self.cancellation_checker();
         let targets = scan(tx, &table, checker)?;
@@ -4097,6 +4236,28 @@ fn like(text: &str, pattern: &str) -> bool {
     }
     pattern.ends_with('%') || pos == text.len()
 }
+
+fn parse_timeout_setting(value: &str, default_ms: u64) -> std::result::Result<u64, SqlError> {
+    let timeout = if value.eq_ignore_ascii_case("default") {
+        default_ms
+    } else {
+        value
+            .parse()
+            .map_err(|_| SqlError::new("22023", "invalid timeout"))?
+    };
+    // Instant has a finite representable range.  Reject a value that cannot
+    // form a deadline at SET time rather than accepting it and failing a
+    // later unrelated statement.
+    if timeout != 0
+        && Instant::now()
+            .checked_add(Duration::from_millis(timeout))
+            .is_none()
+    {
+        return Err(SqlError::new("22023", "invalid timeout"));
+    }
+    Ok(timeout)
+}
+
 fn set_setting(s: &mut SessionSettings, n: &str, raw: &str) -> std::result::Result<(), SqlError> {
     let n = n.to_ascii_lowercase();
     let v = raw.trim().trim_matches('\'').trim_matches('"');
@@ -4125,14 +4286,13 @@ fn set_setting(s: &mut SessionSettings, n: &str, raw: &str) -> std::result::Resu
             s.transaction_read_only = v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true")
         }
         "statement_timeout" => {
-            s.statement_timeout_ms = v
-                .parse()
-                .map_err(|_| SqlError::new("22023", "invalid timeout"))?
+            s.statement_timeout_ms = parse_timeout_setting(v, 0)?;
         }
         "idle_in_transaction_session_timeout" => {
-            s.idle_in_transaction_session_timeout_ms = v
-                .parse()
-                .map_err(|_| SqlError::new("22023", "invalid timeout"))?
+            s.idle_in_transaction_session_timeout_ms = parse_timeout_setting(
+                v,
+                SessionSettings::default().idle_in_transaction_session_timeout_ms,
+            )?;
         }
         "standard_conforming_strings" => {
             s.standard_conforming_strings = !v.eq_ignore_ascii_case("off")
@@ -4498,6 +4658,46 @@ mod tests {
             .execute("SELECT id,name FROM users WHERE id = 1;", &[])
             .unwrap();
         assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    fn statement_timeout_marks_explicit_transaction_failed_until_rollback() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(104);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute("CREATE TABLE timeout_failed (id integer primary key);", &[])
+            .unwrap();
+        session.execute("BEGIN", &[]).unwrap();
+
+        // Use an already-expired internal deadline to make the wall-clock
+        // branch deterministic while still exercising the real timeout error
+        // and transaction-state handling.
+        session.cancellation_checker = Some(Arc::new(StatementCancellation {
+            external: None,
+            deadline: Some(Instant::now()),
+            reason: AtomicU8::new(0),
+        }));
+        let error = session
+            .execute("INSERT INTO timeout_failed VALUES (1)", &[])
+            .expect_err("expired statement timeout must fail the explicit transaction");
+        assert_eq!(error.code, "57014");
+        assert_eq!(
+            error.message,
+            "canceling statement due to statement timeout"
+        );
+        assert_eq!(session.transaction_status(), TransactionStatus::Failed);
+
+        session.cancellation_checker = None;
+        let failed = session
+            .execute("SELECT 1", &[])
+            .expect_err("a failed explicit transaction must reject further work");
+        assert_eq!(failed.code, "25P02");
+        session.execute("ROLLBACK", &[]).unwrap();
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
     }
 
     #[test]

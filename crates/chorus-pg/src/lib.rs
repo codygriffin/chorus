@@ -29,7 +29,6 @@ const MAX_NAMED_PREPARED: usize = 256;
 const MAX_NAMED_PORTALS: usize = 256;
 const MAX_RETAINED_EXTENDED_QUERY_BYTES: usize = 16 * 1024 * 1024;
 const PROTOCOL_VERSION_3_0: u32 = 196_608;
-const PROTOCOL_VERSION_3_2: u32 = 196_610;
 const SSL_REQUEST_CODE: u32 = 80_877_103;
 const CANCEL_REQUEST_CODE: u32 = 80_877_102;
 const GSSENC_REQUEST_CODE: u32 = 80_877_104;
@@ -671,12 +670,14 @@ struct Portal {
 
 struct StartupParams {
     values: HashMap<String, String>,
+    unsupported_protocol_options: Vec<String>,
 }
 
 impl StartupParams {
     fn parse(body: &[u8]) -> Result<Self, SqlError> {
         let mut p = 0usize;
         let mut values = HashMap::new();
+        let mut unsupported_protocol_options = Vec::new();
         loop {
             let key = startup_cstr(body, &mut p)?;
             if key.is_empty() {
@@ -689,9 +690,15 @@ impl StartupParams {
             if key.len() > 256 || value.len() > 4096 {
                 return Err(SqlError::new("54000", "startup parameter is too long"));
             }
+            if key.starts_with("_pq_.") {
+                unsupported_protocol_options.push(key.clone());
+            }
             values.insert(key, value);
         }
-        Ok(Self { values })
+        Ok(Self {
+            values,
+            unsupported_protocol_options,
+        })
     }
 
     fn get(&self, key: &str) -> Option<String> {
@@ -920,7 +927,9 @@ impl Connection {
                 }
                 return Ok(false);
             }
-            if code != PROTOCOL_VERSION_3_0 && code != PROTOCOL_VERSION_3_2 {
+            let protocol_major = code >> 16;
+            let protocol_minor = code & 0xffff;
+            if protocol_major != 3 {
                 self.startup_error("unsupported frontend protocol version")?;
                 return Ok(false);
             }
@@ -932,6 +941,9 @@ impl Connection {
                     return Ok(false);
                 }
             };
+            if protocol_minor > 0 || !params.unsupported_protocol_options.is_empty() {
+                self.negotiate_protocol_version(&params.unsupported_protocol_options)?;
+            }
             let app = params.get("application_name").unwrap_or_default();
             let user = params.get("user").unwrap_or_default();
             if user.is_empty() {
@@ -1584,6 +1596,24 @@ impl Connection {
     }
     fn send_authentication_ok(&mut self) -> std::io::Result<()> {
         self.write_message(b'R', &0u32.to_be_bytes())
+    }
+    fn negotiate_protocol_version(
+        &mut self,
+        unsupported_options: &[String],
+    ) -> std::io::Result<()> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&PROTOCOL_VERSION_3_0.to_be_bytes());
+        let count = u32::try_from(unsupported_options.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "too many unrecognized protocol options",
+            )
+        })?;
+        body.extend_from_slice(&count.to_be_bytes());
+        for option in unsupported_options {
+            cstr_put(&mut body, option);
+        }
+        self.write_message(b'v', &body)
     }
     fn parameter(&mut self, k: &str, v: &str) -> std::io::Result<()> {
         let mut b = Vec::new();

@@ -51,6 +51,16 @@ fn rpc_payload_codec_is_bounded_domain_separated_and_exact() {
     assert_eq!(probe, decoded);
     assert!(decode_rpc_payload::<CodecProbe>(RpcPayloadDomain::VoteResponse, &encoded).is_err());
 
+    let control = encode_rpc_payload(RpcPayloadDomain::MembershipStatusRequest, &probe).unwrap();
+    assert_eq!(
+        probe,
+        decode_rpc_payload(RpcPayloadDomain::MembershipStatusRequest, &control).unwrap()
+    );
+    assert!(
+        decode_rpc_payload::<CodecProbe>(RpcPayloadDomain::ChangeMembershipRequest, &control)
+            .is_err()
+    );
+
     let mut trailing = encoded.clone();
     trailing.push(0);
     assert!(decode_rpc_payload::<CodecProbe>(RpcPayloadDomain::VoteRequest, &trailing).is_err());
@@ -185,6 +195,24 @@ impl OpenRaftTransport for GateService {
     async fn read_barrier(&self, request: Request<Envelope>) -> Result<Response<Envelope>, Status> {
         self.handle(request, RpcMethod::ReadBarrier)
     }
+
+    async fn membership_status(
+        &self,
+        _request: Request<Envelope>,
+    ) -> Result<Response<Envelope>, Status> {
+        Err(Status::unimplemented(
+            "control RPC not used by gate service",
+        ))
+    }
+
+    async fn change_membership(
+        &self,
+        _request: Request<Envelope>,
+    ) -> Result<Response<Envelope>, Status> {
+        Err(Status::unimplemented(
+            "control RPC not used by gate service",
+        ))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -294,6 +322,24 @@ impl OpenRaftTransport for FactoryService {
     ) -> Result<Response<Envelope>, Status> {
         Err(Status::unimplemented(
             "gateway RPC not used by factory test",
+        ))
+    }
+
+    async fn membership_status(
+        &self,
+        _request: Request<Envelope>,
+    ) -> Result<Response<Envelope>, Status> {
+        Err(Status::unimplemented(
+            "control RPC not used by factory test",
+        ))
+    }
+
+    async fn change_membership(
+        &self,
+        _request: Request<Envelope>,
+    ) -> Result<Response<Envelope>, Status> {
+        Err(Status::unimplemented(
+            "control RPC not used by factory test",
         ))
     }
 }

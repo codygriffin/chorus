@@ -33,9 +33,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 
 use crate::openraft_transport::{
-    AuthenticatedNetworkFactory, AuthenticatedRaftService, ClientWriteGatewayResponse,
-    ReadBarrierGatewayResponse, TransportTlsIdentity, authenticated_server_builder,
-    bounded_transport_server,
+    AuthenticatedNetworkFactory, AuthenticatedRaftService, ChangeMembershipIntent,
+    ClientWriteGatewayResponse, ReadBarrierGatewayResponse, TransportTlsIdentity,
+    authenticated_server_builder, bounded_transport_server,
 };
 use crate::{Consensus, ConsensusStatus};
 
@@ -571,7 +571,7 @@ async fn run_runtime(
             initial_voters,
             options,
         } => {
-            let authorized_nodes = identity
+            let authorized_nodes: BTreeMap<u64, BasicNode> = identity
                 .peers
                 .iter()
                 .map(|(peer_id, peer)| (*peer_id, BasicNode::new(&peer.endpoint)))
@@ -611,7 +611,12 @@ async fn run_runtime(
                         return;
                     }
                 };
-            let service = match AuthenticatedRaftService::new(raft.clone(), Arc::clone(&identity)) {
+            let service = match AuthenticatedRaftService::new_with_control(
+                raft.clone(),
+                Arc::clone(&identity),
+                authorized_nodes.clone(),
+                Some(gateway.clone()),
+            ) {
                 Ok(service) => service,
                 Err(error) => {
                     let _ = startup.send(Err(error.to_string()));
@@ -899,11 +904,22 @@ async fn checkpoint_runtime(raft: &ChorusRaft) -> Result<()> {
 /// learner while retaining the former voter as a learner, or remove exactly
 /// one already-demoted learner. Voter removal, multi-node changes, leader
 /// demotion and peer-directory rotation fail closed.
-async fn apply_bounded_membership_change(
+pub(crate) async fn apply_bounded_membership_change(
     raft: &ChorusRaft,
     authorized_nodes: &BTreeMap<u64, BasicNode>,
     voters: Vec<u64>,
     learners: Vec<u64>,
+) -> Result<()> {
+    apply_bounded_membership_change_with_intent(raft, authorized_nodes, voters, learners, None)
+        .await
+}
+
+pub(crate) async fn apply_bounded_membership_change_with_intent(
+    raft: &ChorusRaft,
+    authorized_nodes: &BTreeMap<u64, BasicNode>,
+    voters: Vec<u64>,
+    learners: Vec<u64>,
+    intent: Option<&ChangeMembershipIntent>,
 ) -> Result<()> {
     if voters.iter().chain(&learners).any(|node_id| *node_id == 0) {
         return Err(ChorusError::Consensus(
@@ -949,6 +965,37 @@ async fn apply_bounded_membership_change(
         return Err(ChorusError::Consensus(
             "OpenRaft membership is still joint; wait for recovery before another change".into(),
         ));
+    }
+
+    if let Some(intent) = intent {
+        validate_membership_intent(
+            intent,
+            &current_voters,
+            &current_learners,
+            &requested_voters,
+            &requested_learners,
+        )?;
+        if requested_voters == current_voters && requested_learners == current_learners {
+            match intent {
+                ChangeMembershipIntent::AddLearner { node_id } => {
+                    let node = authorized_nodes.get(node_id).cloned().ok_or_else(|| {
+                        ChorusError::Consensus(format!(
+                            "learner {node_id} is absent from the signed peer manifest"
+                        ))
+                    })?;
+                    raft.add_learner(*node_id, node, true)
+                        .await
+                        .map_err(|error| {
+                            ChorusError::Consensus(format!(
+                                "OpenRaft learner {node_id} catch-up retry failed: {error}"
+                            ))
+                        })?;
+                }
+                ChangeMembershipIntent::ReplaceVoter { .. }
+                | ChangeMembershipIntent::RemoveLearner { .. } => {}
+            }
+            return verify_uniform_membership(raft, &requested_voters, &requested_learners);
+        }
     }
 
     if requested_voters != current_voters {
@@ -1021,6 +1068,79 @@ async fn apply_bounded_membership_change(
         .await
         .map_err(|error| ChorusError::Consensus(format!("OpenRaft add learner failed: {error}")))?;
     verify_uniform_membership(raft, &requested_voters, &requested_learners)
+}
+
+fn validate_membership_intent(
+    intent: &ChangeMembershipIntent,
+    current_voters: &BTreeSet<u64>,
+    current_learners: &BTreeSet<u64>,
+    requested_voters: &BTreeSet<u64>,
+    requested_learners: &BTreeSet<u64>,
+) -> Result<()> {
+    match intent {
+        ChangeMembershipIntent::AddLearner { node_id } => {
+            if current_voters.contains(node_id) {
+                return Err(ChorusError::Consensus(format!(
+                    "learner {node_id} is already a voter"
+                )));
+            }
+            let mut expected = current_learners.clone();
+            expected.insert(*node_id);
+            if requested_voters != current_voters
+                || (requested_learners != &expected
+                    && !(current_learners.contains(node_id)
+                        && requested_learners == current_learners))
+            {
+                return Err(ChorusError::Consensus(
+                    "add-learner intent does not match the requested one-node delta".into(),
+                ));
+            }
+        }
+        ChangeMembershipIntent::ReplaceVoter { promoted, demoted } => {
+            if *promoted == 0 || *demoted == 0 || promoted == demoted {
+                return Err(ChorusError::Consensus(
+                    "voter replacement intent has invalid node ids".into(),
+                ));
+            }
+            let already_applied = current_voters.contains(promoted)
+                && !current_voters.contains(demoted)
+                && current_learners.contains(demoted)
+                && !current_learners.contains(promoted)
+                && requested_voters == current_voters
+                && requested_learners == current_learners;
+            let mut expected_voters = current_voters.clone();
+            expected_voters.remove(demoted);
+            expected_voters.insert(*promoted);
+            let mut expected_learners = current_learners.clone();
+            expected_learners.remove(promoted);
+            expected_learners.insert(*demoted);
+            if !already_applied
+                && (requested_voters != &expected_voters
+                    || requested_learners != &expected_learners)
+            {
+                return Err(ChorusError::Consensus(
+                    "voter replacement intent does not match the requested one-for-one delta"
+                        .into(),
+                ));
+            }
+        }
+        ChangeMembershipIntent::RemoveLearner { node_id } => {
+            let already_applied = !current_voters.contains(node_id)
+                && !current_learners.contains(node_id)
+                && requested_voters == current_voters
+                && requested_learners == current_learners;
+            let mut expected_learners = current_learners.clone();
+            expected_learners.remove(node_id);
+            if !already_applied
+                && (requested_voters != current_voters || requested_learners != &expected_learners)
+            {
+                return Err(ChorusError::Consensus(
+                    "learner removal intent does not match the requested one-node delta".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn remove_one_learner(

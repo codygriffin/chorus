@@ -6,7 +6,11 @@ use chorus_admin::{
 };
 use chorus_codec::{LogicalSnapshot, ReplicatedCommandV1};
 use chorus_common::{LogId, OriginId};
-use chorus_consensus::openraft_transport::{PeerTlsConfig, TransportTlsIdentity, leaf_fingerprint};
+use chorus_consensus::openraft_transport::{
+    AuthenticatedNetworkFactory, ChangeMembershipGatewayRequest, ChangeMembershipGatewayResponse,
+    ChangeMembershipIntent, MembershipStatusGatewayRequest, MembershipStatusGatewayResponse,
+    MembershipStatusView, PeerTlsConfig, TransportTlsIdentity, leaf_fingerprint,
+};
 use chorus_consensus::{
     Consensus, ConsensusCommitter, NetworkConsensus, OpenRaftConsensus, OpenRaftRuntimeOptions,
     StandaloneConsensus,
@@ -617,7 +621,11 @@ fn restore_command(args: &[String], config_path: &str) -> Result<(), String> {
 }
 
 fn member_command(args: &[String], config_path: &str) -> Result<(), String> {
+    if has_flag(args, "--openraft-mtls") {
+        return live_member_command(args, config_path);
+    }
     let cfg = load_command_config(args, config_path, false)?;
+    reject_legacy_membership_on_openraft_artifacts(&cfg)?;
     let store = open_store(&cfg).map_err(|e| e.to_string())?;
     let snapshot = store.snapshot().map_err(|e| e.to_string())?;
     match args.get(1).map(String::as_str).unwrap_or("list") {
@@ -635,7 +643,7 @@ fn member_command(args: &[String], config_path: &str) -> Result<(), String> {
         "add-learner" | "promote" | "demote" | "remove" => {
             if !has_flag(args, "--confirm") || !has_flag(args, "--offline") {
                 return Err(
-                    "offline membership edits require --confirm and --offline; live consensus membership changes are not implemented".into(),
+                    "offline membership edits require --confirm and --offline; use --openraft-mtls --manifest-key PATH for live authenticated membership RPCs".into(),
                 );
             }
             require_cluster_confirmation(args, &cfg)?;
@@ -716,6 +724,360 @@ fn member_command(args: &[String], config_path: &str) -> Result<(), String> {
         }
         _ => Err("usage: chorus member list|add-learner|promote|demote|remove".into()),
     }
+}
+
+/// Execute a live membership operation through the authenticated OpenRaft
+/// control plane. This path deliberately never opens the legacy
+/// `FileStateStore`; legacy/unbound state may use the explicit `--offline`
+/// path above, while an OpenRaft installation must use a running leader
+/// endpoint.
+fn live_member_command(args: &[String], config_path: &str) -> Result<(), String> {
+    if has_flag(args, "--offline") {
+        return Err(
+            "--openraft-mtls membership commands are live RPCs; remove --offline (legacy store edits require the explicit offline mode)".into(),
+        );
+    }
+    let operation = args.get(1).map(String::as_str).unwrap_or("list");
+    if !matches!(
+        operation,
+        "list" | "add-learner" | "promote" | "demote" | "remove"
+    ) {
+        return Err(
+            "usage: chorus member list|add-learner|promote|demote|remove [--openraft-mtls --manifest-key PATH]".into(),
+        );
+    }
+    let cfg = load_command_config(args, config_path, true)?;
+    cfg.validate_openraft_mtls()
+        .map_err(|error| error.to_string())?;
+    if operation != "list" {
+        if !has_flag(args, "--confirm") {
+            return Err(
+                "live membership changes require --confirm after inspecting leader-authoritative member list".into(),
+            );
+        }
+        require_cluster_confirmation(args, &cfg)?;
+    }
+    let identity = openraft_transport_identity(&cfg)?;
+    let factory = AuthenticatedNetworkFactory::new(Arc::clone(&identity))
+        .map_err(|error| error.to_string())?;
+    let targets = live_membership_targets(args, &cfg)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not create live membership runtime: {error}"))?;
+    let mut selected = None;
+    let mut last_status_error = None;
+    for candidate in targets {
+        let status = runtime.block_on(factory.membership_status(
+            candidate,
+            MembershipStatusGatewayRequest {
+                requester_node_id: cfg.node_id,
+                hops_remaining: 1,
+            },
+            Duration::from_secs(8),
+        ));
+        match status {
+            Ok(MembershipStatusGatewayResponse::Current(view)) => {
+                selected = Some((candidate, view));
+                break;
+            }
+            Ok(MembershipStatusGatewayResponse::ForwardToLeader { leader_id }) => {
+                last_status_error = Some(format!(
+                    "status endpoint returned a leader hint without a usable forward path (leader_id={leader_id:?})"
+                ));
+            }
+            Ok(MembershipStatusGatewayResponse::Failed(error)) => {
+                last_status_error = Some(format!("status endpoint failed: {error}"));
+            }
+            Err(error) => {
+                last_status_error = Some(error.to_string());
+            }
+        }
+    }
+    let (target, view) = selected.ok_or_else(|| {
+        format!(
+            "live membership status failed on every manifest peer: {}",
+            last_status_error.unwrap_or_else(|| "no usable peer".into())
+        )
+    })?;
+
+    match operation {
+        "list" => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "node_id": view.node_id,
+                    "leader_id": view.leader_id,
+                    "term": view.term,
+                    "commit_index": view.commit_index,
+                    "applied_index": view.applied_index,
+                    "quorum": view.quorum,
+                    "voters": view.voters,
+                    "learners": view.learners,
+                })
+            );
+            Ok(())
+        }
+        "add-learner" | "promote" | "demote" | "remove" => {
+            let node_id = arg_value(args, "--node-id")
+                .ok_or_else(|| "membership operation requires --node-id N".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "invalid --node-id".to_string())?;
+            if node_id == 0 {
+                return Err("membership node id must be nonzero".into());
+            }
+            if !cfg.initial_nodes.iter().any(|node| node.node_id == node_id) {
+                return Err(format!(
+                    "membership node {node_id} is absent from the signed peer manifest"
+                ));
+            }
+            let (voters, learners, intent) =
+                live_membership_request(args, &view, operation, node_id)?;
+            let request = ChangeMembershipGatewayRequest {
+                requester_node_id: cfg.node_id,
+                voters,
+                learners,
+                intent: Some(intent),
+                hops_remaining: 1,
+            };
+            let response = runtime
+                .block_on(factory.change_membership(target, request, Duration::from_secs(8)))
+                .map_err(|error| format!("live membership change failed: {error}"))?;
+            match response {
+                ChangeMembershipGatewayResponse::Applied { voters, learners } => {
+                    log_event(
+                        "membership_updated_live",
+                        serde_json::json!({
+                            "operation": operation,
+                            "node_id": node_id,
+                            "voters": voters,
+                            "learners": learners,
+                        }),
+                    );
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "operation": operation,
+                            "node_id": node_id,
+                            "voters": voters,
+                            "learners": learners,
+                        })
+                    );
+                    Ok(())
+                }
+                ChangeMembershipGatewayResponse::ForwardToLeader { leader_id } => Err(format!(
+                    "live membership change needs a leader retry (leader_id={leader_id:?})"
+                )),
+                ChangeMembershipGatewayResponse::Failed(error) => {
+                    Err(format!("live membership change failed: {error}"))
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn live_membership_targets(args: &[String], cfg: &Config) -> Result<Vec<u64>, String> {
+    if let Some(value) = arg_value(args, "--target-node-id") {
+        let target = value
+            .parse::<u64>()
+            .map_err(|_| "invalid --target-node-id".to_string())?;
+        if target == 0 || target == cfg.node_id {
+            return Err("--target-node-id must name a remote nonzero peer".into());
+        }
+        if !cfg.initial_nodes.iter().any(|node| node.node_id == target) {
+            return Err(format!(
+                "target node {target} is absent from the signed peer manifest"
+            ));
+        }
+        return Ok(vec![target]);
+    }
+    let targets: Vec<_> = cfg
+        .initial_nodes
+        .iter()
+        .filter(|node| node.node_id != cfg.node_id && node.voter)
+        .map(|node| node.node_id)
+        .chain(
+            cfg.initial_nodes
+                .iter()
+                .filter(|node| node.node_id != cfg.node_id && !node.voter)
+                .map(|node| node.node_id),
+        )
+        .collect();
+    if targets.is_empty() {
+        return Err(
+            "live membership requires at least one remote manifest peer; a single-node cluster has no control endpoint".into(),
+        );
+    }
+    Ok(targets)
+}
+
+fn reject_legacy_membership_on_openraft_artifacts(cfg: &Config) -> Result<(), String> {
+    if cfg.bootstrap_manifest.is_some() {
+        return Err(
+            "legacy membership commands refuse a signed OpenRaft configuration; use --openraft-mtls with --manifest-key for live RPCs".into(),
+        );
+    }
+    let (raft_path, state_path) = openraft_paths(cfg);
+    for (path, label) in [(raft_path, "raft.redb"), (state_path, "state/active.redb")] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(format!(
+                    "legacy membership commands refuse an OpenRaft data directory ({label}); use --openraft-mtls with --manifest-key for live RPCs"
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect OpenRaft artifact {label}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn live_membership_request(
+    args: &[String],
+    view: &MembershipStatusView,
+    operation: &str,
+    node_id: u64,
+) -> Result<(Vec<u64>, Vec<u64>, ChangeMembershipIntent), String> {
+    let mut voters = view.voters.clone();
+    let mut learners = view.learners.clone();
+    let replacement = arg_value(args, "--replace-node-id")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| "invalid --replace-node-id".to_string())
+        })
+        .transpose()?;
+    if replacement == Some(node_id) {
+        return Err("--replace-node-id must differ from --node-id".into());
+    }
+    match operation {
+        "add-learner" => {
+            if replacement.is_some() {
+                return Err("--replace-node-id is valid only for promote/demote".into());
+            }
+            if voters.contains(&node_id) {
+                return Err(format!("node {node_id} is already a voter"));
+            }
+            if !learners.contains(&node_id) {
+                learners.push(node_id);
+            }
+        }
+        "promote" => {
+            let demoted = replacement.ok_or_else(|| {
+                "standalone promotion is disabled; pass --replace-node-id VOTER for a bounded one-for-one replacement".to_string()
+            })?;
+            if !learners.contains(&node_id) {
+                if voters.contains(&node_id)
+                    && !voters.contains(&demoted)
+                    && learners.contains(&demoted)
+                {
+                    // The exact replacement already committed before the
+                    // caller lost its response; return the observed final
+                    // shape so a CLI retry is idempotent.
+                    return Ok((
+                        voters,
+                        learners,
+                        ChangeMembershipIntent::ReplaceVoter {
+                            promoted: node_id,
+                            demoted,
+                        },
+                    ));
+                }
+                return Err(format!("node {node_id} is not a current learner"));
+            }
+            if !voters.contains(&demoted) {
+                return Err(format!("replacement node {demoted} is not a current voter"));
+            }
+            if view.leader_id == Some(demoted) {
+                return Err("bounded replacement cannot demote the current leader".into());
+            }
+            learners.retain(|id| *id != node_id);
+            voters.retain(|id| *id != demoted);
+            voters.push(node_id);
+            learners.push(demoted);
+        }
+        "demote" => {
+            let promoted = replacement.ok_or_else(|| {
+                "standalone demotion is disabled; pass --replace-node-id LEARNER for a bounded one-for-one replacement".to_string()
+            })?;
+            if !voters.contains(&node_id) {
+                if learners.contains(&node_id)
+                    && voters.contains(&promoted)
+                    && !learners.contains(&promoted)
+                {
+                    return Ok((
+                        voters,
+                        learners,
+                        ChangeMembershipIntent::ReplaceVoter {
+                            promoted,
+                            demoted: node_id,
+                        },
+                    ));
+                }
+                return Err(format!("node {node_id} is not a current voter"));
+            }
+            if !learners.contains(&promoted) {
+                return Err(format!(
+                    "replacement node {promoted} is not a current learner"
+                ));
+            }
+            if view.leader_id == Some(node_id) {
+                return Err("bounded replacement cannot demote the current leader".into());
+            }
+            voters.retain(|id| *id != node_id);
+            learners.retain(|id| *id != promoted);
+            voters.push(promoted);
+            learners.push(node_id);
+        }
+        "remove" => {
+            if replacement.is_some() {
+                return Err("--replace-node-id is valid only for promote/demote".into());
+            }
+            if voters.contains(&node_id) {
+                return Err(
+                    "voter removal is disabled; remove only an already-demoted learner".into(),
+                );
+            }
+            if !learners.contains(&node_id) {
+                if !voters.contains(&node_id) {
+                    // Removing an already-removed learner is a safe no-op
+                    // after an outcome-unknown response.
+                    return Ok((
+                        voters,
+                        learners,
+                        ChangeMembershipIntent::RemoveLearner { node_id },
+                    ));
+                }
+                return Err(format!("node {node_id} is not a current learner"));
+            }
+            learners.retain(|id| *id != node_id);
+        }
+        _ => unreachable!(),
+    }
+    voters.sort_unstable();
+    learners.sort_unstable();
+    if voters.is_empty() || voters.iter().any(|id| learners.binary_search(id).is_ok()) {
+        return Err("live membership request would leave an invalid voter/learner set".into());
+    }
+    let intent = match operation {
+        "add-learner" => ChangeMembershipIntent::AddLearner { node_id },
+        "promote" => ChangeMembershipIntent::ReplaceVoter {
+            promoted: node_id,
+            demoted: replacement.expect("promotion replacement was validated"),
+        },
+        "demote" => ChangeMembershipIntent::ReplaceVoter {
+            promoted: replacement.expect("demotion replacement was validated"),
+            demoted: node_id,
+        },
+        "remove" => ChangeMembershipIntent::RemoveLearner { node_id },
+        _ => unreachable!(),
+    };
+    Ok((voters, learners, intent))
 }
 
 fn validate_openraft_single_node(cfg: &Config) -> Result<(), String> {
@@ -990,7 +1352,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 fn print_help() {
     println!(
-        "Chorus MVP\n\nUSAGE:\n  chorus run --config PATH [--allow-insecure-dev | --openraft-single-node | --openraft-mtls --manifest-key PATH]\n  chorus bootstrap [--config PATH] [--data-dir PATH] [--node-id N] [--confirm] [--openraft-single-node | --openraft-mtls --manifest-key PATH]\n  chorus status|check|metrics|state-hash --config PATH [--manifest-key PATH]\n  chorus member list [--config PATH] [--manifest-key PATH]\n  chorus member add-learner|promote|demote|remove --node-id N --config PATH --cluster-id ID --confirm --offline [--manifest-key PATH]\n  chorus snapshot create|export --config PATH --output PATH --offline [--manifest-key PATH]\n  chorus snapshot inspect --input PATH\n  chorus restore --input PATH --config PATH --cluster-id ID --confirm --force-new-cluster [--manifest-key PATH]"
+        "Chorus MVP\n\nUSAGE:\n  chorus run --config PATH [--allow-insecure-dev | --openraft-single-node | --openraft-mtls --manifest-key PATH]\n  chorus bootstrap [--config PATH] [--data-dir PATH] [--node-id N] [--confirm] [--openraft-single-node | --openraft-mtls --manifest-key PATH]\n  chorus status|check|metrics|state-hash --config PATH [--manifest-key PATH]\n  chorus member list [--config PATH] [--openraft-mtls --manifest-key PATH] [--target-node-id N]\n  chorus member add-learner|remove --node-id N --config PATH --cluster-id ID --confirm --openraft-mtls --manifest-key PATH [--target-node-id N]\n  chorus member promote|demote --node-id N --replace-node-id N --config PATH --cluster-id ID --confirm --openraft-mtls --manifest-key PATH [--target-node-id N]\n  chorus member add-learner|promote|demote|remove --node-id N --config PATH --cluster-id ID --confirm --offline\n  chorus snapshot create|export --config PATH --output PATH --offline [--manifest-key PATH]\n  chorus snapshot inspect --input PATH\n  chorus restore --input PATH --config PATH --cluster-id ID --confirm --force-new-cluster [--manifest-key PATH]"
     );
 }
 
@@ -1317,6 +1679,278 @@ mod tests {
         assert!(!config.identity_path().exists());
         assert!(!config.data_dir.join("raft.redb").exists());
         assert!(!config.data_dir.join("state").join("active.redb").exists());
+    }
+
+    #[test]
+    fn live_member_requires_signed_manifest_before_opening_legacy_state() {
+        let root = tempfile::tempdir().unwrap();
+        let config = authenticated_test_config(root.path());
+        let config_path = root.path().join("chorus.toml");
+        config.save(&config_path).unwrap();
+
+        let error = member_command(
+            &["member".into(), "list".into(), "--openraft-mtls".into()],
+            &config_path.display().to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("--manifest-key"));
+        assert!(!config.data_dir.exists());
+        assert!(!config.identity_path().exists());
+
+        let mixed_error = member_command(
+            &[
+                "member".into(),
+                "list".into(),
+                "--openraft-mtls".into(),
+                "--offline".into(),
+            ],
+            &config_path.display().to_string(),
+        )
+        .unwrap_err();
+        assert!(mixed_error.contains("live RPCs"));
+    }
+
+    #[test]
+    fn live_member_rejects_unsafe_standalone_voter_changes() {
+        let view = MembershipStatusView {
+            node_id: 1,
+            leader_id: Some(1),
+            term: 3,
+            commit_index: 8,
+            applied_index: 8,
+            quorum: true,
+            voters: vec![1, 2, 3],
+            learners: vec![4],
+        };
+        let promote = live_membership_request(
+            &[
+                "member".into(),
+                "promote".into(),
+                "--node-id".into(),
+                "4".into(),
+            ],
+            &view,
+            "promote",
+            4,
+        )
+        .unwrap_err();
+        assert!(promote.contains("standalone promotion is disabled"));
+
+        let remove_voter = live_membership_request(
+            &[
+                "member".into(),
+                "remove".into(),
+                "--node-id".into(),
+                "2".into(),
+            ],
+            &view,
+            "remove",
+            2,
+        )
+        .unwrap_err();
+        assert!(remove_voter.contains("voter removal is disabled"));
+
+        let replacement = live_membership_request(
+            &[
+                "member".into(),
+                "promote".into(),
+                "--node-id".into(),
+                "4".into(),
+                "--replace-node-id".into(),
+                "2".into(),
+            ],
+            &view,
+            "promote",
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                vec![1, 3, 4],
+                vec![2],
+                ChangeMembershipIntent::ReplaceVoter {
+                    promoted: 4,
+                    demoted: 2,
+                }
+            ),
+            replacement
+        );
+
+        let idempotent_add = live_membership_request(
+            &[
+                "member".into(),
+                "add-learner".into(),
+                "--node-id".into(),
+                "4".into(),
+            ],
+            &view,
+            "add-learner",
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                vec![1, 2, 3],
+                vec![4],
+                ChangeMembershipIntent::AddLearner { node_id: 4 }
+            ),
+            idempotent_add
+        );
+
+        let demotion = live_membership_request(
+            &[
+                "member".into(),
+                "demote".into(),
+                "--node-id".into(),
+                "2".into(),
+                "--replace-node-id".into(),
+                "4".into(),
+            ],
+            &view,
+            "demote",
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                vec![1, 3, 4],
+                vec![2],
+                ChangeMembershipIntent::ReplaceVoter {
+                    promoted: 4,
+                    demoted: 2,
+                }
+            ),
+            demotion
+        );
+
+        let final_view = MembershipStatusView {
+            node_id: 1,
+            leader_id: Some(1),
+            term: 3,
+            commit_index: 9,
+            applied_index: 9,
+            quorum: true,
+            voters: vec![1, 3, 4],
+            learners: vec![2],
+        };
+        assert_eq!(
+            live_membership_request(
+                &[
+                    "member".into(),
+                    "promote".into(),
+                    "--node-id".into(),
+                    "4".into(),
+                    "--replace-node-id".into(),
+                    "2".into(),
+                ],
+                &final_view,
+                "promote",
+                4,
+            )
+            .unwrap(),
+            (
+                vec![1, 3, 4],
+                vec![2],
+                ChangeMembershipIntent::ReplaceVoter {
+                    promoted: 4,
+                    demoted: 2,
+                }
+            )
+        );
+        assert_eq!(
+            live_membership_request(
+                &[
+                    "member".into(),
+                    "demote".into(),
+                    "--node-id".into(),
+                    "2".into(),
+                    "--replace-node-id".into(),
+                    "4".into(),
+                ],
+                &final_view,
+                "demote",
+                2,
+            )
+            .unwrap(),
+            (
+                vec![1, 3, 4],
+                vec![2],
+                ChangeMembershipIntent::ReplaceVoter {
+                    promoted: 4,
+                    demoted: 2,
+                }
+            )
+        );
+        let removed_view = MembershipStatusView {
+            learners: Vec::new(),
+            ..final_view
+        };
+        assert_eq!(
+            live_membership_request(
+                &[
+                    "member".into(),
+                    "remove".into(),
+                    "--node-id".into(),
+                    "2".into()
+                ],
+                &removed_view,
+                "remove",
+                2,
+            )
+            .unwrap(),
+            (
+                vec![1, 3, 4],
+                Vec::new(),
+                ChangeMembershipIntent::RemoveLearner { node_id: 2 }
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_membership_path_refuses_openraft_artifacts_before_store_open() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::defaults(root.path().join("data"), 1);
+        let config_path = root.path().join("chorus.toml");
+        config.save(&config_path).unwrap();
+        fs::create_dir_all(config.data_dir.join("state")).unwrap();
+        fs::write(config.data_dir.join("raft.redb"), b"marker").unwrap();
+        let error = member_command(
+            &["member".into(), "list".into(), "--offline".into()],
+            &config_path.display().to_string(),
+        )
+        .unwrap_err();
+        assert!(error.contains("refuse an OpenRaft data directory"));
+        assert!(!config.data_dir.join("active.json").exists());
+    }
+
+    #[test]
+    fn legacy_membership_path_refuses_signed_config_before_store_open() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::defaults(root.path().join("data"), 1);
+        config.bootstrap_manifest = Some(chorus_admin::BootstrapManifestSignature {
+            format_version: 1,
+            algorithm: "ed25519".into(),
+            generation: 1,
+            key_id: "00".repeat(32),
+            ca_sha256: "00".repeat(32),
+            signature: "00".repeat(64),
+        });
+        let error = reject_legacy_membership_on_openraft_artifacts(&config).unwrap_err();
+        assert!(error.contains("signed OpenRaft configuration"));
+        assert!(!config.data_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_membership_path_refuses_dangling_openraft_artifact_link() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::defaults(root.path().join("data"), 1);
+        fs::create_dir_all(&config.data_dir).unwrap();
+        symlink("missing-raft.redb", config.data_dir.join("raft.redb")).unwrap();
+        let error = reject_legacy_membership_on_openraft_artifacts(&config).unwrap_err();
+        assert!(error.contains("raft.redb"));
     }
 
     #[test]

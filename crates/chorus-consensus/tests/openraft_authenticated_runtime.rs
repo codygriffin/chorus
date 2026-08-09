@@ -10,7 +10,9 @@ use chorus_codec::{
 };
 use chorus_common::{OriginId, RequestId};
 use chorus_consensus::openraft_transport::{
-    AuthenticatedNetworkFactory, PeerTlsConfig, TransportTlsIdentity, leaf_fingerprint,
+    AuthenticatedNetworkFactory, ChangeMembershipGatewayRequest, ChangeMembershipGatewayResponse,
+    ChangeMembershipIntent, MembershipStatusGatewayRequest, MembershipStatusGatewayResponse,
+    PeerTlsConfig, TransportTlsIdentity, leaf_fingerprint,
 };
 use chorus_consensus::{Consensus, OpenRaftConsensus, OpenRaftRuntimeOptions};
 use chorus_redb::RedbStateMachine;
@@ -384,6 +386,39 @@ fn authenticated_leader_adds_promotes_and_removes_one_preprovisioned_learner() {
             .to_string()
             .contains("not a current Raft member")
     );
+    let prospective_status_error = client_runtime
+        .block_on(prospective_factory.membership_status(
+            2,
+            MembershipStatusGatewayRequest {
+                requester_node_id: 4,
+                hops_remaining: 1,
+            },
+            Duration::from_secs(2),
+        ))
+        .unwrap_err();
+    assert!(
+        prospective_status_error
+            .to_string()
+            .contains("not a current Raft voter")
+    );
+    let prospective_change_error = client_runtime
+        .block_on(prospective_factory.change_membership(
+            2,
+            ChangeMembershipGatewayRequest {
+                requester_node_id: 4,
+                voters: vec![1, 2, 3],
+                learners: vec![4],
+                intent: Some(ChangeMembershipIntent::AddLearner { node_id: 4 }),
+                hops_remaining: 1,
+            },
+            Duration::from_secs(2),
+        ))
+        .unwrap_err();
+    assert!(
+        prospective_change_error
+            .to_string()
+            .contains("not a current Raft voter")
+    );
     let follower_error = node2.change_membership(vec![1, 2, 3], vec![4]).unwrap_err();
     assert!(
         follower_error
@@ -394,9 +429,52 @@ fn authenticated_leader_adds_promotes_and_removes_one_preprovisioned_learner() {
         .change_membership(vec![1, 2, 3], vec![99])
         .unwrap_err();
     assert!(unknown.to_string().contains("signed peer manifest"));
-    node1.change_membership(vec![1, 2, 3], vec![4]).unwrap();
+    // Control-plane status and mutation may start at a follower. The
+    // authenticated service forwards each request once to the leader while
+    // retaining the original voter identity for authorization.
+    let control_factory = AuthenticatedNetworkFactory::new(Arc::clone(&identities[0])).unwrap();
+    let status = client_runtime
+        .block_on(control_factory.membership_status(
+            2,
+            MembershipStatusGatewayRequest {
+                requester_node_id: 1,
+                hops_remaining: 1,
+            },
+            Duration::from_secs(2),
+        ))
+        .unwrap();
+    match status {
+        MembershipStatusGatewayResponse::Current(view) => {
+            assert_eq!(view.voters, vec![1, 2, 3]);
+            assert!(view.learners.is_empty());
+        }
+        other => panic!("expected leader-authoritative membership status, got {other:?}"),
+    }
+    let add_request = ChangeMembershipGatewayRequest {
+        requester_node_id: 1,
+        voters: vec![1, 2, 3],
+        learners: vec![4],
+        intent: Some(ChangeMembershipIntent::AddLearner { node_id: 4 }),
+        hops_remaining: 1,
+    };
+    let added = client_runtime
+        .block_on(control_factory.change_membership(2, add_request.clone(), Duration::from_secs(2)))
+        .unwrap();
+    assert!(matches!(
+        added,
+        ChangeMembershipGatewayResponse::Applied {
+            voters,
+            learners
+        } if voters == vec![1, 2, 3] && learners == vec![4]
+    ));
     // An ambiguous caller retry re-establishes the blocking catch-up gate.
-    node1.change_membership(vec![1, 2, 3], vec![4]).unwrap();
+    let retried = client_runtime
+        .block_on(control_factory.change_membership(2, add_request, Duration::from_secs(2)))
+        .unwrap();
+    assert!(matches!(
+        retried,
+        ChangeMembershipGatewayResponse::Applied { .. }
+    ));
     wait_for(Duration::from_secs(5), || {
         let leader = node1.status();
         let learner = node4.status();
@@ -441,8 +519,36 @@ fn authenticated_leader_adds_promotes_and_removes_one_preprovisioned_learner() {
     // Replace nonleader voter 3 with the caught-up learner. OpenRaft first
     // commits a joint config and then a uniform [1,2,4] voter set, retaining
     // node 3 as a learner. An exact retry is safe after an ambiguous reply.
-    node1.change_membership(vec![1, 2, 4], vec![3]).unwrap();
-    node1.change_membership(vec![1, 2, 4], vec![3]).unwrap();
+    let replacement_request = ChangeMembershipGatewayRequest {
+        requester_node_id: 1,
+        voters: vec![1, 2, 4],
+        learners: vec![3],
+        intent: Some(ChangeMembershipIntent::ReplaceVoter {
+            promoted: 4,
+            demoted: 3,
+        }),
+        hops_remaining: 1,
+    };
+    assert!(matches!(
+        client_runtime
+            .block_on(control_factory.change_membership(
+                2,
+                replacement_request.clone(),
+                Duration::from_secs(2),
+            ))
+            .unwrap(),
+        ChangeMembershipGatewayResponse::Applied { .. }
+    ));
+    assert!(matches!(
+        client_runtime
+            .block_on(control_factory.change_membership(
+                2,
+                replacement_request,
+                Duration::from_secs(2),
+            ))
+            .unwrap(),
+        ChangeMembershipGatewayResponse::Applied { .. }
+    ));
     wait_for(Duration::from_secs(5), || {
         [&node1, &node2, &node3, &node4].into_iter().all(|node| {
             let status = node.status();
@@ -533,8 +639,31 @@ fn authenticated_leader_adds_promotes_and_removes_one_preprovisioned_learner() {
     // and authenticated gateway authority to disappear with the membership.
     let removed_origin = OriginId::new(3);
     restarted_demoted.activate_origin(removed_origin).unwrap();
-    node1.change_membership(vec![1, 2, 4], Vec::new()).unwrap();
-    node1.change_membership(vec![1, 2, 4], Vec::new()).unwrap();
+    let removal_request = ChangeMembershipGatewayRequest {
+        requester_node_id: 1,
+        voters: vec![1, 2, 4],
+        learners: Vec::new(),
+        intent: Some(ChangeMembershipIntent::RemoveLearner { node_id: 3 }),
+        hops_remaining: 1,
+    };
+    assert!(matches!(
+        client_runtime
+            .block_on(control_factory.change_membership(
+                2,
+                removal_request.clone(),
+                Duration::from_secs(2),
+            ))
+            .unwrap(),
+        ChangeMembershipGatewayResponse::Applied { .. }
+    ));
+    assert!(matches!(
+        client_runtime
+            .block_on(
+                control_factory.change_membership(2, removal_request, Duration::from_secs(2),)
+            )
+            .unwrap(),
+        ChangeMembershipGatewayResponse::Applied { .. }
+    ));
     wait_for(Duration::from_secs(5), || {
         [&node1, &node2, &restarted].into_iter().all(|node| {
             let status = node.status();
@@ -569,6 +698,39 @@ fn authenticated_leader_adds_promotes_and_removes_one_preprovisioned_learner() {
         removed_read
             .to_string()
             .contains("not a current Raft member")
+    );
+    let removed_status = client_runtime
+        .block_on(removed_factory.membership_status(
+            1,
+            MembershipStatusGatewayRequest {
+                requester_node_id: 3,
+                hops_remaining: 1,
+            },
+            Duration::from_secs(2),
+        ))
+        .unwrap_err();
+    assert!(
+        removed_status
+            .to_string()
+            .contains("not a current Raft voter")
+    );
+    let removed_change = client_runtime
+        .block_on(removed_factory.change_membership(
+            1,
+            ChangeMembershipGatewayRequest {
+                requester_node_id: 3,
+                voters: vec![1, 2, 4],
+                learners: Vec::new(),
+                intent: Some(ChangeMembershipIntent::RemoveLearner { node_id: 3 }),
+                hops_remaining: 1,
+            },
+            Duration::from_secs(2),
+        ))
+        .unwrap_err();
+    assert!(
+        removed_change
+            .to_string()
+            .contains("not a current Raft voter")
     );
 
     drop(restarted_demoted);

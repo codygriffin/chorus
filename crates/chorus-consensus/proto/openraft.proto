@@ -23,4 +23,9 @@ service OpenRaftTransport {
   // SQL/PostgreSQL serving layers.
   rpc ClientWrite(Envelope) returns (Envelope);
   rpc ReadBarrier(Envelope) returns (Envelope);
+  // Authenticated control-plane calls are deliberately separate from
+  // application gateway domains. Membership changes are accepted only from
+  // current voters and are routed through the leader at most once.
+  rpc MembershipStatus(Envelope) returns (Envelope);
+  rpc ChangeMembership(Envelope) returns (Envelope);
 }

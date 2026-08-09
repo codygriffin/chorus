@@ -41,6 +41,8 @@ use tonic::transport::{Certificate, Channel, Endpoint, Identity, Server, ServerT
 use tonic::{Request, Response};
 use tower_service::Service;
 
+use crate::openraft_adapter::apply_bounded_membership_change_with_intent;
+
 pub mod wire {
     tonic::include_proto!("chorus.consensus.openraft");
 }
@@ -50,6 +52,8 @@ pub const MAX_RPC_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RPC_PAYLOAD_BYTES: usize = MAX_RPC_MESSAGE_BYTES - 1024;
 pub const MAX_SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
 pub const MAX_APPEND_ENTRIES: usize = 4096;
+pub const MAX_CONTROL_VOTERS: usize = 5;
+pub const MAX_CONTROL_MEMBERS: usize = 16;
 pub const RPC_QUEUE_CAPACITY: usize = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_PAYLOAD_MAGIC: &[u8; 8] = b"CHRFRPC\0";
@@ -70,6 +74,10 @@ pub enum RpcPayloadDomain {
     ClientWriteResponse = 8,
     ReadBarrierRequest = 9,
     ReadBarrierResponse = 10,
+    MembershipStatusRequest = 11,
+    MembershipStatusResponse = 12,
+    ChangeMembershipRequest = 13,
+    ChangeMembershipResponse = 14,
 }
 
 impl RpcPayloadDomain {
@@ -85,6 +93,10 @@ impl RpcPayloadDomain {
             8 => Some(Self::ClientWriteResponse),
             9 => Some(Self::ReadBarrierRequest),
             10 => Some(Self::ReadBarrierResponse),
+            11 => Some(Self::MembershipStatusRequest),
+            12 => Some(Self::MembershipStatusResponse),
+            13 => Some(Self::ChangeMembershipRequest),
+            14 => Some(Self::ChangeMembershipResponse),
             _ => None,
         }
     }
@@ -300,6 +312,90 @@ pub enum RpcMethod {
     InstallSnapshot,
     ClientWrite,
     ReadBarrier,
+    MembershipStatus,
+    ChangeMembership,
+}
+
+/// Bounded wire representation of the public consensus status. Keeping this
+/// separate from OpenRaft metrics prevents implementation types from leaking
+/// across the authenticated control boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MembershipStatusView {
+    pub node_id: u64,
+    pub leader_id: Option<u64>,
+    pub term: u64,
+    pub commit_index: u64,
+    pub applied_index: u64,
+    pub quorum: bool,
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MembershipStatusGatewayRequest {
+    /// The original authenticated control requester. A forwarding hop may
+    /// change the envelope source, so the leader checks both identities.
+    pub requester_node_id: u64,
+    pub hops_remaining: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MembershipStatusGatewayResponse {
+    Current(MembershipStatusView),
+    ForwardToLeader { leader_id: Option<u64> },
+    Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ChangeMembershipIntent {
+    AddLearner { node_id: u64 },
+    ReplaceVoter { promoted: u64, demoted: u64 },
+    RemoveLearner { node_id: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeMembershipGatewayRequest {
+    /// The original authenticated control requester. A forwarding hop may
+    /// change the envelope source, so the leader checks both identities.
+    pub requester_node_id: u64,
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    /// The bounded operation being requested. The leader uses this to
+    /// distinguish an exact retry from a different membership mutation.
+    #[serde(default)]
+    pub intent: Option<ChangeMembershipIntent>,
+    /// A forwarded request may cross at most one leader hop. This prevents a
+    /// stale leader ring from creating unbounded recursive RPC work.
+    pub hops_remaining: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ChangeMembershipGatewayResponse {
+    Applied {
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+    },
+    ForwardToLeader {
+        leader_id: Option<u64>,
+    },
+    Failed(String),
+}
+
+fn validate_membership_shape(voters: &[u64], learners: &[u64]) -> Result<(), String> {
+    if voters.len() > MAX_CONTROL_VOTERS {
+        return Err(format!(
+            "membership control request exceeds {MAX_CONTROL_VOTERS} voters"
+        ));
+    }
+    if voters.len().saturating_add(learners.len()) > MAX_CONTROL_MEMBERS {
+        return Err(format!(
+            "membership control request exceeds {MAX_CONTROL_MEMBERS} total members"
+        ));
+    }
+    if voters.iter().chain(learners).any(|node_id| *node_id == 0) {
+        return Err("membership control node ids must be nonzero".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -452,6 +548,8 @@ pub struct AuthenticatedRaftService {
     raft: Raft<ChorusRaftConfig>,
     identity: Arc<TransportTlsIdentity>,
     authenticator: PeerAuthenticator,
+    authorized_nodes: Arc<BTreeMap<u64, BasicNode>>,
+    gateway: Option<AuthenticatedNetworkFactory>,
 }
 
 impl AuthenticatedRaftService {
@@ -459,11 +557,24 @@ impl AuthenticatedRaftService {
         raft: Raft<ChorusRaftConfig>,
         identity: Arc<TransportTlsIdentity>,
     ) -> Result<Self, TransportConfigError> {
+        Self::new_with_control(raft, identity, BTreeMap::new(), None)
+    }
+
+    /// Construct the production service with its immutable signed peer map
+    /// and a cached gateway used for one-hop follower control forwarding.
+    pub fn new_with_control(
+        raft: Raft<ChorusRaftConfig>,
+        identity: Arc<TransportTlsIdentity>,
+        authorized_nodes: BTreeMap<u64, BasicNode>,
+        gateway: Option<AuthenticatedNetworkFactory>,
+    ) -> Result<Self, TransportConfigError> {
         let authenticator = PeerAuthenticator::new(Arc::clone(&identity))?;
         Ok(Self {
             raft,
             identity,
             authenticator,
+            authorized_nodes: Arc::new(authorized_nodes),
+            gateway,
         })
     }
 
@@ -493,6 +604,51 @@ impl AuthenticatedRaftService {
             Err(Status::permission_denied(
                 "authenticated source node is not a current Raft member",
             ))
+        }
+    }
+
+    fn require_current_voter(&self, source_node_id: u64) -> Result<(), Status> {
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics
+            .membership_config
+            .voter_ids()
+            .any(|node_id| node_id == source_node_id)
+        {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(
+                "authenticated source node is not a current Raft voter",
+            ))
+        }
+    }
+
+    fn membership_status(&self) -> MembershipStatusView {
+        let metrics = self.raft.metrics().borrow().clone();
+        MembershipStatusView {
+            node_id: metrics.id,
+            leader_id: metrics.current_leader,
+            term: metrics.current_term,
+            // This control service does not own the durable log handle. The
+            // applied cursor is therefore the conservative progress value;
+            // the adapter's public status path reads the durable commit
+            // cursor separately and must be used for strict readiness.
+            commit_index: metrics
+                .last_applied
+                .as_ref()
+                .map(|log_id| log_id.index)
+                .unwrap_or(0),
+            applied_index: metrics
+                .last_applied
+                .as_ref()
+                .map(|log_id| log_id.index)
+                .unwrap_or(0),
+            quorum: metrics.current_leader == Some(metrics.id),
+            voters: metrics.membership_config.voter_ids().collect(),
+            learners: metrics
+                .membership_config
+                .membership()
+                .learner_ids()
+                .collect(),
         }
     }
 }
@@ -619,6 +775,188 @@ impl wire::open_raft_transport_server::OpenRaftTransport for AuthenticatedRaftSe
             Err(error) => ReadBarrierGatewayResponse::Failed(error.to_string()),
         };
         let payload = encode_rpc_payload(RpcPayloadDomain::ReadBarrierResponse, &result)
+            .map_err(codec_status)?;
+        self.response(source, payload)
+    }
+
+    async fn membership_status(
+        &self,
+        request: Request<wire::Envelope>,
+    ) -> Result<Response<wire::Envelope>, Status> {
+        let source = self.authenticator.authenticate(
+            &request,
+            request.get_ref(),
+            RpcMethod::MembershipStatus,
+        )?;
+        self.require_current_voter(source)?;
+        let mut request: MembershipStatusGatewayRequest = decode_rpc_payload(
+            RpcPayloadDomain::MembershipStatusRequest,
+            &request.into_inner().payload,
+        )
+        .map_err(codec_status)?;
+        if request.requester_node_id == 0 {
+            return Err(Status::invalid_argument(
+                "membership status requester node id must be nonzero",
+            ));
+        }
+        if request.hops_remaining > 1 {
+            return Err(Status::invalid_argument(
+                "membership status hop budget must be zero or one",
+            ));
+        }
+        if request.hops_remaining == 1 && request.requester_node_id != source {
+            return Err(Status::permission_denied(
+                "initial membership status requester must match the authenticated source",
+            ));
+        }
+        self.require_current_voter(request.requester_node_id)?;
+
+        let metrics = self.raft.metrics().borrow().clone();
+        let result = if metrics.current_leader == Some(metrics.id) {
+            match tokio::time::timeout(Duration::from_secs(8), self.raft.ensure_linearizable())
+                .await
+            {
+                Ok(Ok(read_log_id)) => {
+                    let mut view = self.membership_status();
+                    // A successful read barrier is the authoritative commit
+                    // cursor for this control response. It also prevents an
+                    // isolated old leader from presenting its local view as
+                    // live membership status.
+                    view.commit_index = read_log_id
+                        .map(|log_id| log_id.index)
+                        .unwrap_or(view.applied_index)
+                        .max(view.applied_index);
+                    MembershipStatusGatewayResponse::Current(view)
+                }
+                Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))) => {
+                    MembershipStatusGatewayResponse::ForwardToLeader {
+                        leader_id: forward.leader_id,
+                    }
+                }
+                Ok(Err(error)) => MembershipStatusGatewayResponse::Failed(error.to_string()),
+                Err(_) => MembershipStatusGatewayResponse::Failed(
+                    "membership status read barrier timed out".into(),
+                ),
+            }
+        } else if request.hops_remaining > 0 {
+            match metrics.current_leader {
+                Some(leader_id) => {
+                    let Some(gateway) = &self.gateway else {
+                        let result = MembershipStatusGatewayResponse::ForwardToLeader {
+                            leader_id: Some(leader_id),
+                        };
+                        let payload =
+                            encode_rpc_payload(RpcPayloadDomain::MembershipStatusResponse, &result)
+                                .map_err(codec_status)?;
+                        return self.response(source, payload);
+                    };
+                    request.hops_remaining -= 1;
+                    match gateway
+                        .membership_status(leader_id, request, Duration::from_secs(8))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => MembershipStatusGatewayResponse::Failed(error.to_string()),
+                    }
+                }
+                None => MembershipStatusGatewayResponse::ForwardToLeader { leader_id: None },
+            }
+        } else {
+            MembershipStatusGatewayResponse::ForwardToLeader {
+                leader_id: metrics.current_leader,
+            }
+        };
+        let payload = encode_rpc_payload(RpcPayloadDomain::MembershipStatusResponse, &result)
+            .map_err(codec_status)?;
+        self.response(source, payload)
+    }
+
+    async fn change_membership(
+        &self,
+        request: Request<wire::Envelope>,
+    ) -> Result<Response<wire::Envelope>, Status> {
+        let source = self.authenticator.authenticate(
+            &request,
+            request.get_ref(),
+            RpcMethod::ChangeMembership,
+        )?;
+        self.require_current_voter(source)?;
+        let mut request: ChangeMembershipGatewayRequest = decode_rpc_payload(
+            RpcPayloadDomain::ChangeMembershipRequest,
+            &request.into_inner().payload,
+        )
+        .map_err(codec_status)?;
+        if request.requester_node_id == 0 {
+            return Err(Status::invalid_argument(
+                "membership control requester node id must be nonzero",
+            ));
+        }
+        if request.hops_remaining == 1 && request.requester_node_id != source {
+            return Err(Status::permission_denied(
+                "initial membership control requester must match the authenticated source",
+            ));
+        }
+        self.require_current_voter(request.requester_node_id)?;
+        if request.hops_remaining > 1 {
+            return Err(Status::invalid_argument(
+                "membership control hop budget must be zero or one",
+            ));
+        }
+        validate_membership_shape(&request.voters, &request.learners)
+            .map_err(Status::invalid_argument)?;
+
+        let metrics = self.raft.metrics().borrow().clone();
+        let result = if metrics.current_leader == Some(metrics.id) {
+            match tokio::time::timeout(
+                Duration::from_secs(8),
+                apply_bounded_membership_change_with_intent(
+                    &self.raft,
+                    self.authorized_nodes.as_ref(),
+                    request.voters.clone(),
+                    request.learners.clone(),
+                    request.intent.as_ref(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => ChangeMembershipGatewayResponse::Applied {
+                    voters: request.voters,
+                    learners: request.learners,
+                },
+                Ok(Err(error)) => ChangeMembershipGatewayResponse::Failed(error.to_string()),
+                Err(_) => ChangeMembershipGatewayResponse::Failed(
+                    "OpenRaft membership change timed out".into(),
+                ),
+            }
+        } else if request.hops_remaining > 0 {
+            match metrics.current_leader {
+                Some(leader_id) => {
+                    let Some(gateway) = &self.gateway else {
+                        let result = ChangeMembershipGatewayResponse::ForwardToLeader {
+                            leader_id: Some(leader_id),
+                        };
+                        let payload =
+                            encode_rpc_payload(RpcPayloadDomain::ChangeMembershipResponse, &result)
+                                .map_err(codec_status)?;
+                        return self.response(source, payload);
+                    };
+                    request.hops_remaining -= 1;
+                    match gateway
+                        .change_membership(leader_id, request, Duration::from_secs(8))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => ChangeMembershipGatewayResponse::Failed(error.to_string()),
+                    }
+                }
+                None => ChangeMembershipGatewayResponse::ForwardToLeader { leader_id: None },
+            }
+        } else {
+            ChangeMembershipGatewayResponse::ForwardToLeader {
+                leader_id: metrics.current_leader,
+            }
+        };
+        let payload = encode_rpc_payload(RpcPayloadDomain::ChangeMembershipResponse, &result)
             .map_err(codec_status)?;
         self.response(source, payload)
     }
@@ -1048,6 +1386,91 @@ impl AuthenticatedNetworkFactory {
         };
         let payload = self.validate_gateway_response(target, response)?;
         decode_rpc_payload(RpcPayloadDomain::ReadBarrierResponse, &payload)
+            .map_err(|error| GatewayCallError::Codec(error.to_string()))
+    }
+
+    /// Read the bounded membership/status view from an authenticated member.
+    pub async fn membership_status(
+        &self,
+        target: u64,
+        request_body: MembershipStatusGatewayRequest,
+        timeout: Duration,
+    ) -> Result<MembershipStatusGatewayResponse, GatewayCallError> {
+        if target == self.identity.node_id || timeout.is_zero() {
+            return Err(GatewayCallError::Configuration(
+                "gateway target must be remote and timeout must be nonzero".into(),
+            ));
+        }
+        if request_body.requester_node_id == 0 {
+            return Err(GatewayCallError::Configuration(
+                "membership status requester node id must be nonzero".into(),
+            ));
+        }
+        if request_body.hops_remaining > 1 {
+            return Err(GatewayCallError::Configuration(
+                "membership status hop budget must be zero or one".into(),
+            ));
+        }
+        let payload = encode_rpc_payload(RpcPayloadDomain::MembershipStatusRequest, &request_body)
+            .map_err(|error| GatewayCallError::Codec(error.to_string()))?;
+        let envelope = envelope(&self.identity, target, payload)
+            .map_err(|error| GatewayCallError::Configuration(error.to_string()))?;
+        let mut request = Request::new(envelope);
+        request.set_timeout(timeout);
+        let mut client = self
+            .client_for(target)
+            .await
+            .map_err(|error| GatewayCallError::Configuration(error.to_string()))?;
+        let response = match tokio::time::timeout(timeout, client.membership_status(request)).await
+        {
+            Err(_) => return Err(GatewayCallError::Timeout(timeout)),
+            Ok(Err(status)) => return Err(GatewayCallError::Transport(status.to_string())),
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        let payload = self.validate_gateway_response(target, response)?;
+        decode_rpc_payload(RpcPayloadDomain::MembershipStatusResponse, &payload)
+            .map_err(|error| GatewayCallError::Codec(error.to_string()))
+    }
+
+    /// Submit one bounded live membership request to an authenticated member.
+    /// The request carries a one-hop budget so a stale follower cannot create
+    /// an unbounded forwarding loop.
+    pub async fn change_membership(
+        &self,
+        target: u64,
+        request_body: ChangeMembershipGatewayRequest,
+        timeout: Duration,
+    ) -> Result<ChangeMembershipGatewayResponse, GatewayCallError> {
+        if target == self.identity.node_id || timeout.is_zero() {
+            return Err(GatewayCallError::Configuration(
+                "gateway target must be remote and timeout must be nonzero".into(),
+            ));
+        }
+        if request_body.hops_remaining > 1 {
+            return Err(GatewayCallError::Configuration(
+                "membership control hop budget must be zero or one".into(),
+            ));
+        }
+        validate_membership_shape(&request_body.voters, &request_body.learners)
+            .map_err(GatewayCallError::Configuration)?;
+        let payload = encode_rpc_payload(RpcPayloadDomain::ChangeMembershipRequest, &request_body)
+            .map_err(|error| GatewayCallError::Codec(error.to_string()))?;
+        let envelope = envelope(&self.identity, target, payload)
+            .map_err(|error| GatewayCallError::Configuration(error.to_string()))?;
+        let mut request = Request::new(envelope);
+        request.set_timeout(timeout);
+        let mut client = self
+            .client_for(target)
+            .await
+            .map_err(|error| GatewayCallError::Configuration(error.to_string()))?;
+        let response = match tokio::time::timeout(timeout, client.change_membership(request)).await
+        {
+            Err(_) => return Err(GatewayCallError::Timeout(timeout)),
+            Ok(Err(status)) => return Err(GatewayCallError::Transport(status.to_string())),
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        let payload = self.validate_gateway_response(target, response)?;
+        decode_rpc_payload(RpcPayloadDomain::ChangeMembershipResponse, &payload)
             .map_err(|error| GatewayCallError::Codec(error.to_string()))
     }
 

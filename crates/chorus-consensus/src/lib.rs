@@ -7,6 +7,8 @@
 pub mod openraft_adapter;
 pub use openraft_adapter::OpenRaftConsensus;
 
+pub mod openraft_transport;
+
 use chorus_codec::{
     ApplyResult, CommitTransactionV1, LogicalSnapshot, ReplicatedCommandV1, SchemaCommandV1,
 };

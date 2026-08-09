@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package chorus.consensus.openraft;
+
+// Every RPC carries this versioned, identity-bound envelope.  The payload is
+// currently bounded JSON (see openraft_transport.rs); a canonical binary
+// codec remains a release gap.
+message Envelope {
+  uint32 version = 1;
+  bytes cluster_id = 2;
+  uint64 cluster_incarnation = 3;
+  uint64 source_node_id = 4;
+  uint64 target_node_id = 5;
+  bytes payload = 6;
+}
+
+service OpenRaftTransport {
+  rpc Vote(Envelope) returns (Envelope);
+  rpc AppendEntries(Envelope) returns (Envelope);
+  rpc InstallSnapshot(Envelope) returns (Envelope);
+}

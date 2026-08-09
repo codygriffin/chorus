@@ -27,7 +27,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::storage::RaftLogStorage;
-use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy, metrics::Metric};
+use openraft::{BasicNode, Config, Raft, SnapshotPolicy, metrics::Metric};
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -41,10 +41,20 @@ use crate::{Consensus, ConsensusStatus};
 
 const REQUEST_QUEUE_CAPACITY: usize = 128;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
+const STATUS_METADATA_TIMEOUT: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_GATEWAY_REDIRECTS: usize = 3;
 
 type ChorusRaft = Raft<ChorusRaftConfig>;
+
+/// Convert the durable OpenRaft commit cursor into the public status index.
+///
+/// This intentionally does not clamp to `applied_index`: commit and apply
+/// are distinct progress points, and a healthy runtime may briefly expose a
+/// committed entry while its local state machine is still catching up.
+fn durable_commit_index(committed: Option<openraft::LogId<u64>>) -> u64 {
+    committed.map_or(0, |log_id| log_id.index)
+}
 
 #[derive(Clone, Debug)]
 pub struct OpenRaftRuntimeOptions {
@@ -244,6 +254,11 @@ impl OpenRaftConsensus {
         let read_store = Arc::new(RedbReadStore {
             inner: state_machine.clone(),
         });
+        // OpenRaft owns the primary log-store handle after startup, but the
+        // status path must read the durable commit cursor independently of
+        // the in-memory last-applied metric.  RedbRaftLogStore is a cheap
+        // handle clone over the same durable database.
+        let status_log_store = log_store.clone();
         let (sender, receiver) = mpsc::channel(REQUEST_QUEUE_CAPACITY);
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
         let thread_state = state_machine;
@@ -266,6 +281,7 @@ impl OpenRaftConsensus {
                 runtime.block_on(run_runtime(
                     node_id,
                     log_store,
+                    status_log_store,
                     thread_state,
                     initialize,
                     state_initialized,
@@ -455,6 +471,7 @@ enum RuntimeRequest {
 async fn run_runtime(
     node_id: u64,
     log_store: RedbRaftLogStore<ChorusRaftConfig>,
+    mut status_log_store: RedbRaftLogStore<ChorusRaftConfig>,
     state_machine: RedbStateMachine,
     initialize: bool,
     state_initialized: bool,
@@ -725,6 +742,41 @@ async fn run_runtime(
                 let _ = response.send(result);
             }
             RuntimeRequest::Status { response } => {
+                // Status is deliberately diagnostic: a failed or timed-out
+                // barrier must not make the whole status request fail.  Probe
+                // the current barrier first, so the durable commit cursor is
+                // read only after any local follower catch-up it requires.
+                let quorum = tokio::time::timeout_at(
+                    tokio::time::Instant::now() + OPERATION_TIMEOUT,
+                    read_barrier_with_forwarding(&raft, gateway.as_ref(), &state_machine),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok());
+                // The metadata read gets its own short local bound.  If it
+                // fails, return an error so the public status fallback stays
+                // conservative rather than fabricating a commit cursor.
+                let committed = tokio::time::timeout(
+                    STATUS_METADATA_TIMEOUT,
+                    status_log_store.read_committed(),
+                )
+                .await
+                .map_err(|_| {
+                    ChorusError::Consensus("OpenRaft durable status read timed out".into())
+                })
+                .and_then(|result| {
+                    result.map_err(|error| {
+                        ChorusError::Storage(format!(
+                            "could not read durable OpenRaft status: {error}"
+                        ))
+                    })
+                });
+                let committed = match committed {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                        continue;
+                    }
+                };
                 let metrics = raft.metrics().borrow().clone();
                 let voters = metrics.membership_config.voter_ids().collect();
                 let learners = metrics
@@ -741,10 +793,9 @@ async fn run_runtime(
                     node_id,
                     leader_id: metrics.current_leader,
                     term: metrics.current_term,
-                    commit_index: applied_index,
+                    commit_index: durable_commit_index(committed),
                     applied_index,
-                    quorum: metrics.current_leader == Some(node_id)
-                        && metrics.state == ServerState::Leader,
+                    quorum,
                     voters,
                     learners,
                 }));
@@ -1037,6 +1088,24 @@ where
         format!("no authenticated OpenRaft transport for node {target}"),
     );
     RPCError::Unreachable(Unreachable::new(&error))
+}
+
+#[cfg(test)]
+mod tests {
+    use openraft::{CommittedLeaderId, LogId};
+
+    use super::durable_commit_index;
+
+    #[test]
+    fn durable_commit_index_is_not_fabricated_from_applied_index() {
+        let committed = Some(LogId::new(CommittedLeaderId::new(7, 1), 9));
+        let applied_index = 3;
+
+        let commit_index = durable_commit_index(committed);
+        assert_eq!(9, commit_index);
+        assert!(commit_index > applied_index);
+        assert_eq!(0, durable_commit_index(None));
+    }
 }
 
 /// Read-only `StateStore` view over the same durable state machine that

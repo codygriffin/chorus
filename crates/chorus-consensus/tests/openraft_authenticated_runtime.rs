@@ -173,6 +173,7 @@ fn authenticated_three_node_runtime_bootstraps_replicates_and_restarts() {
         &addresses,
     );
     assert_eq!(None, inert_bootstrap.status().leader_id);
+    assert!(!inert_bootstrap.status().quorum);
     drop(inert_bootstrap);
 
     // Empty non-bootstrap followers expose only their authenticated Raft
@@ -195,6 +196,8 @@ fn authenticated_three_node_runtime_bootstraps_replicates_and_restarts() {
     );
     assert_eq!(None, node2.status().leader_id);
     assert_eq!(None, node3.status().leader_id);
+    assert!(!node2.status().quorum);
+    assert!(!node3.status().quorum);
 
     let node1 = open_node(
         root.path(),
@@ -205,6 +208,19 @@ fn authenticated_three_node_runtime_bootstraps_replicates_and_restarts() {
         &addresses,
     );
     assert_eq!(Some(1), node1.status().leader_id);
+
+    // A follower is strict-read ready only after it can authenticate a
+    // current leader barrier and catch its local state machine up to that
+    // cursor.  Leadership alone is not used as a quorum signal.
+    wait_for(Duration::from_secs(5), || {
+        node2.status().quorum && node3.status().quorum
+    });
+    let node2_status = node2.status();
+    let node3_status = node3.status();
+    assert!(node2_status.quorum);
+    assert!(node3_status.quorum);
+    assert!(node2_status.commit_index >= node2_status.applied_index);
+    assert!(node3_status.commit_index >= node3_status.applied_index);
 
     let origin = OriginId::new(1);
     node1.activate_origin(origin).unwrap();

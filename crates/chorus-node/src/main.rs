@@ -412,25 +412,27 @@ fn wait_for_shutdown_signal(shutdown: Arc<AtomicBool>, ready: mpsc::SyncSender<b
     let _ = ready.send(true);
     runtime.block_on(async move {
         let mut poll = tokio::time::interval(Duration::from_millis(25));
-        #[cfg(unix)]
-        {
-            tokio::select! {
-                _ = interrupt.recv() => {}
-                _ = terminate.recv() => {}
-                _ = poll.tick() => {
-                    if shutdown.load(Ordering::Acquire) {
-                        return;
+        loop {
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    _ = interrupt.recv() => break,
+                    _ = terminate.recv() => break,
+                    _ = poll.tick() => {
+                        if shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
                     }
                 }
             }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = poll.tick() => {
-                    if shutdown.load(Ordering::Acquire) {
-                        return;
+            #[cfg(not(unix))]
+            {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    _ = poll.tick() => {
+                        if shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
                     }
                 }
             }
@@ -1191,5 +1193,18 @@ mod tests {
         assert_eq!(ready_rx.recv_timeout(Duration::from_secs(1)).unwrap(), true);
         watcher.join().expect("signal watcher thread");
         assert!(shutdown.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_signal_watcher_does_not_stop_without_a_signal() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let watcher_shutdown = Arc::clone(&shutdown);
+        let watcher = thread::spawn(move || wait_for_shutdown_signal(watcher_shutdown, ready_tx));
+        assert_eq!(ready_rx.recv_timeout(Duration::from_secs(1)).unwrap(), true);
+        thread::sleep(Duration::from_millis(80));
+        assert!(!shutdown.load(Ordering::Acquire));
+        shutdown.store(true, Ordering::Release);
+        watcher.join().expect("signal watcher thread");
     }
 }

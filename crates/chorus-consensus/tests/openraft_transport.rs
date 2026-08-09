@@ -448,6 +448,56 @@ async fn mtls_binds_peer_leaf_and_envelope_before_handler() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outbound_factory_rejects_same_ca_dns_with_wrong_manifest_leaf() {
+    let ca = test_ca();
+    let actual_server_leaf = test_leaf(&ca, "node-1.chorus.test");
+    let manifest_server_leaf = test_leaf(&ca, "node-1.chorus.test");
+    let client_leaf = test_leaf(&ca, "node-2.chorus.test");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_identity = identity(
+        &ca,
+        1,
+        &actual_server_leaf,
+        vec![peer(
+            2,
+            "https://127.0.0.1:1".into(),
+            "node-2.chorus.test",
+            &client_leaf,
+        )],
+    );
+    let (address, shutdown, task) = start_factory_server(
+        server_identity,
+        Arc::clone(&calls),
+        FactoryVoteBehavior::Grant,
+    )
+    .await;
+    let manifest_peer = peer(
+        1,
+        format!("https://{address}"),
+        "node-1.chorus.test",
+        &manifest_server_leaf,
+    );
+    let client_identity = identity(&ca, 2, &client_leaf, vec![manifest_peer.clone()]);
+    let mut factory = AuthenticatedNetworkFactory::new(client_identity).unwrap();
+    let mut network = factory
+        .new_client(1, &BasicNode::new(&manifest_peer.endpoint))
+        .await;
+    let error = network
+        .vote(
+            VoteRequest::new(Vote::new(1, 2), None),
+            RPCOption::new(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, RPCError::Unreachable(_)));
+    assert_eq!(0, calls.load(Ordering::SeqCst));
+    assert_eq!(1, factory.cached_peer_count().await);
+
+    let _ = shutdown.send(());
+    task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn untrusted_client_and_oversized_payloads_fail_closed() {
     let ca = test_ca();
     let other_ca = test_ca();

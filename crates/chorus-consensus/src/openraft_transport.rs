@@ -6,12 +6,17 @@
 //! depend on that future codec change.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io::{self, Write};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use chorus_codec::{ApplyResult, MAX_COMMAND_BYTES, ReplicatedCommandV1, encode_command};
 use chorus_redb::ChorusRaftConfig;
+use http::Uri;
+use hyper_util::rt::TokioIo;
 use openraft::error::{
     CheckIsLeaderError, ClientWriteError, Fatal, InstallSnapshotError, NetworkError,
     PayloadTooLarge, RPCError, RaftError, RemoteError, Timeout, Unreachable,
@@ -25,13 +30,16 @@ use openraft::{BasicNode, EntryPayload, LogId, RPCTypes, Raft};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::{TlsConnector as RustlsConnector, client::TlsStream};
 use tonic::Status;
 use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
-use tonic::transport::{
-    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
-};
+use tonic::transport::{Certificate, Channel, Endpoint, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response};
+use tower_service::Service;
 
 pub mod wire {
     tonic::include_proto!("chorus.consensus.openraft");
@@ -372,25 +380,6 @@ impl TransportTlsIdentity {
             ))
             .client_ca_root(Certificate::from_pem(self.ca_pem.clone()))
             .client_auth_optional(false))
-    }
-
-    pub fn client_tls_config(
-        &self,
-        peer: &PeerTlsConfig,
-    ) -> Result<ClientTlsConfig, TransportConfigError> {
-        self.validate()?;
-        if self.peers.get(&peer.node_id) != Some(peer) {
-            return Err(TransportConfigError::Invalid(
-                "peer is not present in the authenticated manifest".into(),
-            ));
-        }
-        Ok(ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(self.ca_pem.clone()))
-            .identity(Identity::from_pem(
-                self.certificate_pem.clone(),
-                self.private_key_pem.clone(),
-            ))
-            .domain_name(peer.dns_name.clone()))
     }
 }
 
@@ -736,18 +725,160 @@ pub fn authenticated_server_builder() -> Server {
         .timeout(Duration::from_secs(30))
 }
 
+type BoxConnectError = Box<dyn std::error::Error + Send + Sync>;
+type PinnedTlsIo = TokioIo<TlsStream<TcpStream>>;
+
+/// Fixed-peer connector that completes ordinary WebPKI CA/DNS/mTLS
+/// validation, then verifies the manifest leaf fingerprint and HTTP/2 ALPN
+/// before returning the stream to Hyper. Each cached Tonic channel owns one
+/// immutable connector and may invoke it again when reconnecting.
+#[derive(Clone)]
+struct PinnedTlsConnector {
+    authority: Arc<str>,
+    server_name: ServerName<'static>,
+    config: Arc<ClientConfig>,
+    expected_leaf_sha256: [u8; 32],
+}
+
+impl Service<Uri> for PinnedTlsConnector {
+    type Response = PinnedTlsIo;
+    type Error = BoxConnectError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let authority = Arc::clone(&self.authority);
+        let server_name = self.server_name.clone();
+        let config = Arc::clone(&self.config);
+        let expected_leaf_sha256 = self.expected_leaf_sha256;
+        Box::pin(async move {
+            if uri.authority().map(|value| value.as_str()) != Some(authority.as_ref()) {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cached peer connector received a different authority",
+                )) as BoxConnectError);
+            }
+            let tcp = TcpStream::connect(authority.as_ref()).await?;
+            tcp.set_nodelay(true)?;
+            let tls = RustlsConnector::from(config)
+                .connect(server_name, tcp)
+                .await?;
+            let (_, session) = tls.get_ref();
+            if session.alpn_protocol() != Some(b"h2") {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "authenticated peer did not negotiate HTTP/2 ALPN",
+                )) as BoxConnectError);
+            }
+            let leaf = session
+                .peer_certificates()
+                .and_then(|certificates| certificates.first())
+                .ok_or_else(|| {
+                    Box::new(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "authenticated peer did not present a leaf certificate",
+                    )) as BoxConnectError
+                })?;
+            if leaf_fingerprint(leaf.as_ref()) != expected_leaf_sha256 {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "authenticated peer leaf does not match the manifest fingerprint",
+                )) as BoxConnectError);
+            }
+            Ok(TokioIo::new(tls))
+        })
+    }
+}
+
+fn pinned_client_config(
+    identity: &TransportTlsIdentity,
+) -> Result<Arc<ClientConfig>, TransportConfigError> {
+    let mut ca_reader = io::Cursor::new(identity.ca_pem.as_slice());
+    let ca_certificates = rustls_pemfile::certs(&mut ca_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| TransportConfigError::Tls(error.to_string()))?;
+    if ca_certificates.is_empty() {
+        return Err(TransportConfigError::Tls(
+            "CA PEM contains no certificates".into(),
+        ));
+    }
+    let mut roots = RootCertStore::empty();
+    for certificate in ca_certificates {
+        roots
+            .add(certificate)
+            .map_err(|error| TransportConfigError::Tls(error.to_string()))?;
+    }
+
+    let mut certificate_reader = io::Cursor::new(identity.certificate_pem.as_slice());
+    let certificate_chain = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| TransportConfigError::Tls(error.to_string()))?;
+    if certificate_chain.is_empty() {
+        return Err(TransportConfigError::Tls(
+            "client certificate PEM contains no certificates".into(),
+        ));
+    }
+    let mut key_reader = io::Cursor::new(identity.private_key_pem.as_slice());
+    let private_key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|error| TransportConfigError::Tls(error.to_string()))?
+        .ok_or_else(|| TransportConfigError::Tls("client private key PEM is empty".into()))?;
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certificate_chain, private_key)
+        .map_err(|error| TransportConfigError::Tls(error.to_string()))?;
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(Arc::new(config))
+}
+
 fn authenticated_endpoint(
     identity: &TransportTlsIdentity,
     peer: &PeerTlsConfig,
-) -> Result<Endpoint, TransportConfigError> {
-    let tls = identity.client_tls_config(peer)?;
-    Endpoint::from_shared(peer.endpoint.clone())
+) -> Result<(Endpoint, PinnedTlsConnector), TransportConfigError> {
+    identity.validate()?;
+    if identity.peers.get(&peer.node_id) != Some(peer) {
+        return Err(TransportConfigError::Invalid(
+            "peer is not present in the authenticated manifest".into(),
+        ));
+    }
+    let origin: Uri = peer
+        .endpoint
+        .parse()
+        .map_err(|error: http::uri::InvalidUri| {
+            TransportConfigError::Endpoint(error.to_string())
+        })?;
+    if origin.scheme_str() != Some("https")
+        || origin
+            .path_and_query()
+            .is_some_and(|path| path.as_str() != "/")
+    {
+        return Err(TransportConfigError::Endpoint(
+            "peer endpoint must be an HTTPS authority without a path or query".into(),
+        ));
+    }
+    let authority = origin
+        .authority()
+        .ok_or_else(|| TransportConfigError::Endpoint("peer endpoint has no authority".into()))?
+        .as_str()
+        .to_owned();
+    let connector_uri = format!("http://{authority}");
+    let endpoint = Endpoint::from_shared(connector_uri)
         .map_err(|error| TransportConfigError::Endpoint(error.to_string()))?
+        .origin(origin)
         .connect_timeout(CONNECT_TIMEOUT)
         .concurrency_limit(RPC_QUEUE_CAPACITY)
-        .buffer_size(RPC_QUEUE_CAPACITY)
-        .tls_config(tls)
-        .map_err(|error| TransportConfigError::Tls(error.to_string()))
+        .buffer_size(RPC_QUEUE_CAPACITY);
+    let server_name = ServerName::try_from(peer.dns_name.clone())
+        .map_err(|error| TransportConfigError::Tls(error.to_string()))?;
+    let connector = PinnedTlsConnector {
+        authority: Arc::from(authority),
+        server_name,
+        config: pinned_client_config(identity)?,
+        expected_leaf_sha256: peer.leaf_sha256,
+    };
+    Ok((endpoint, connector))
 }
 
 pub async fn connect_authenticated(
@@ -755,9 +886,9 @@ pub async fn connect_authenticated(
     peer: &PeerTlsConfig,
 ) -> Result<wire::open_raft_transport_client::OpenRaftTransportClient<Channel>, TransportConfigError>
 {
-    let endpoint = authenticated_endpoint(identity, peer)?;
+    let (endpoint, connector) = authenticated_endpoint(identity, peer)?;
     let channel = endpoint
-        .connect()
+        .connect_with_connector(connector)
         .await
         .map_err(|error| TransportConfigError::Endpoint(error.to_string()))?;
     Ok(
@@ -802,7 +933,8 @@ impl AuthenticatedNetworkFactory {
                 "target node {target} is not present in the authenticated manifest"
             ))
         })?;
-        let channel = authenticated_endpoint(&self.identity, peer)?.connect_lazy();
+        let (endpoint, connector) = authenticated_endpoint(&self.identity, peer)?;
+        let channel = endpoint.connect_with_connector_lazy(connector);
         channels.insert(target, channel.clone());
         Ok(channel)
     }

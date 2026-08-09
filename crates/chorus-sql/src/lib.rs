@@ -109,6 +109,7 @@ pub struct SqlEngine {
     committer: Arc<dyn Committer>,
     limits: Limits,
     sequencer: Arc<CommitSequencer>,
+    drain_token: Arc<AtomicBool>,
 }
 impl SqlEngine {
     pub fn new(
@@ -116,12 +117,24 @@ impl SqlEngine {
         committer: Arc<dyn Committer>,
         limits: Limits,
     ) -> Arc<Self> {
+        Self::new_with_drain_token(store, committer, limits, Arc::new(AtomicBool::new(false)))
+    }
+    /// Construct an engine whose shutdown token is shared with the protocol
+    /// server.  Once set, no new transaction may be started; transactions
+    /// already in progress can still commit or roll back.
+    pub fn new_with_drain_token(
+        store: Arc<dyn StateStore>,
+        committer: Arc<dyn Committer>,
+        limits: Limits,
+        drain_token: Arc<AtomicBool>,
+    ) -> Arc<Self> {
         let sequencer = Arc::new(CommitSequencer::new(committer.origin()));
         Arc::new(Self {
             store,
             committer,
             limits,
             sequencer,
+            drain_token,
         })
     }
     pub fn session(self: &Arc<Self>) -> SqlSession {
@@ -1391,7 +1404,8 @@ impl SqlSession {
         }
         let implicit = self.txn.is_none()
             && !statements.iter().any(Statement::txn_control)
-            && !statements.iter().any(Statement::is_ddl);
+            && !statements.iter().any(Statement::is_ddl)
+            && !statements.iter().all(Statement::session_control);
         if implicit {
             self.start_txn()?;
         }
@@ -1510,7 +1524,18 @@ impl SqlSession {
     fn check_cancelled(&self) -> std::result::Result<(), SqlError> {
         check_cancelled(self.cancellation_checker())
     }
+    fn check_draining(&self) -> std::result::Result<(), SqlError> {
+        if self.engine.drain_token.load(Ordering::Acquire) {
+            Err(SqlError::new(
+                "57P01",
+                "server is shutting down; no new transaction may start",
+            ))
+        } else {
+            Ok(())
+        }
+    }
     fn start_txn(&mut self) -> std::result::Result<(), SqlError> {
+        self.check_draining()?;
         let snapshot = self.engine.committer.read_barrier().map_err(to_sql)?;
         let transaction = Transaction::begin(snapshot, self.engine.limits.clone());
         self.transaction_timestamp_us = Some(transaction.transaction_timestamp_us);
@@ -1616,6 +1641,7 @@ impl SqlSession {
                 "DDL cannot run inside an explicit transaction",
             ));
         }
+        self.check_draining()?;
         let snap = self.engine.committer.read_barrier().map_err(to_sql)?;
         // IF [NOT] EXISTS branches are true no-ops.  They must not consume a
         // catalog epoch or manufacture a fake schema command, because doing
@@ -2808,6 +2834,9 @@ impl Statement {
     }
     fn txn_control(&self) -> bool {
         matches!(self, Self::Begin { .. } | Self::Commit | Self::Rollback)
+    }
+    fn session_control(&self) -> bool {
+        matches!(self, Self::Set(..) | Self::Show(..) | Self::Prepare { .. })
     }
 }
 
@@ -4322,8 +4351,63 @@ fn bind_ddl(
 mod tests {
     use super::*;
     use chorus_storage::MemoryStateStore;
-    use chorus_txn::LocalCommitter;
+    use chorus_txn::{Committer, LocalCommitter};
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+
+    struct CountingCommitter {
+        inner: LocalCommitter,
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+        schema: AtomicUsize,
+    }
+
+    impl CountingCommitter {
+        fn new(inner: LocalCommitter) -> Self {
+            Self {
+                inner,
+                reads: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+                schema: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> (usize, usize, usize) {
+            (
+                self.reads.load(Ordering::Acquire),
+                self.writes.load(Ordering::Acquire),
+                self.schema.load(Ordering::Acquire),
+            )
+        }
+    }
+
+    impl Committer for CountingCommitter {
+        fn read_barrier(&self) -> chorus_common::Result<StateSnapshot> {
+            self.reads.fetch_add(1, Ordering::AcqRel);
+            self.inner.read_barrier()
+        }
+
+        fn submit(
+            &self,
+            command: chorus_codec::CommitTransactionV1,
+        ) -> chorus_common::Result<ApplyResult> {
+            self.writes.fetch_add(1, Ordering::AcqRel);
+            self.inner.submit(command)
+        }
+
+        fn submit_schema(
+            &self,
+            command: chorus_codec::SchemaCommandV1,
+        ) -> chorus_common::Result<ApplyResult> {
+            self.schema.fetch_add(1, Ordering::AcqRel);
+            self.inner.submit_schema(command)
+        }
+
+        fn origin(&self) -> OriginId {
+            self.inner.origin()
+        }
+    }
+
     #[test]
     fn crud() {
         let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
@@ -4342,6 +4426,84 @@ mod tests {
             .execute("SELECT id,name FROM users WHERE id = 1;", &[])
             .unwrap();
         assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    fn drain_rejects_new_work_before_committer_but_allows_existing_transactions() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(101);
+        let counting = Arc::new(CountingCommitter::new(
+            LocalCommitter::new(store.clone(), origin).unwrap(),
+        ));
+        let committer: Arc<dyn Committer> = counting.clone();
+        let drain = Arc::new(AtomicBool::new(false));
+        let engine = SqlEngine::new_with_drain_token(
+            store,
+            committer,
+            Limits::default(),
+            Arc::clone(&drain),
+        );
+        let mut first = engine.session();
+        let mut second = engine.session();
+        first
+            .execute("CREATE TABLE drain_test (id integer primary key);", &[])
+            .unwrap();
+        first.execute("BEGIN", &[]).unwrap();
+        first
+            .execute("INSERT INTO drain_test VALUES (1);", &[])
+            .unwrap();
+        second.execute("BEGIN", &[]).unwrap();
+        second
+            .execute("INSERT INTO drain_test VALUES (2);", &[])
+            .unwrap();
+
+        drain.store(true, Ordering::Release);
+        let before_rejected = counting.calls();
+        let mut blocked = engine.session();
+        for sql in [
+            "BEGIN",
+            "SELECT 1",
+            "INSERT INTO drain_test VALUES (3)",
+            "CREATE TABLE rejected_during_drain (id integer)",
+        ] {
+            assert_eq!(
+                blocked.execute(sql, &[]).unwrap_err().code,
+                "57P01",
+                "new work must be rejected during drain: {sql}"
+            );
+        }
+        blocked
+            .prepare("prepared_during_drain", "SELECT 1")
+            .unwrap();
+        assert_eq!(
+            blocked
+                .execute_prepared("prepared_during_drain", &[])
+                .unwrap_err()
+                .code,
+            "57P01"
+        );
+        blocked.execute("SET timezone = 'UTC'", &[]).unwrap();
+        blocked.execute("SHOW timezone", &[]).unwrap();
+        assert_eq!(counting.calls(), before_rejected);
+
+        // These transactions began before drain and are allowed to resolve.
+        first.execute("COMMIT", &[]).unwrap();
+        second.execute("ROLLBACK", &[]).unwrap();
+        assert_eq!(counting.calls().1, before_rejected.1 + 1);
+    }
+
+    #[test]
+    fn legacy_engine_constructor_has_no_drain_gate() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let origin = OriginId::new(102);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        assert_eq!(session.execute("SELECT 1", &[]).unwrap().rows.len(), 1);
+        let result = session.execute("SHOW timezone; SELECT 1", &[]).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
     }
     #[test]
     fn parser_values() {

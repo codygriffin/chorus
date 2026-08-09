@@ -314,7 +314,16 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
         };
         (store, committer)
     };
-    let engine = SqlEngine::new(store.clone(), committer, cfg.limits.clone());
+    // The SQL engine and PostgreSQL server share one drain token.  The signal
+    // watcher flips it before the server stops accepting connections, so new
+    // transactions fail closed while already-open transactions can finish.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let engine = SqlEngine::new_with_drain_token(
+        store.clone(),
+        committer,
+        cfg.limits.clone(),
+        Arc::clone(&shutdown),
+    );
     let socket = cfg.postgres.unix_socket_dir.as_ref().map(|dir| {
         let _ = fs::create_dir_all(dir);
         harden_directory(dir);
@@ -328,7 +337,6 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
             max_connections: cfg.postgres.max_connections,
         },
     );
-    let shutdown = Arc::new(AtomicBool::new(false));
     let (signal_ready_tx, signal_ready_rx) = mpsc::sync_channel(1);
     let signal_shutdown = Arc::clone(&shutdown);
     let signal_thread =

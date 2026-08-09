@@ -1541,6 +1541,88 @@ impl SqlSession {
     pub fn prepared_sql(&self, name: &str) -> Option<&str> {
         self.prepared.get(name).map(String::as_str)
     }
+
+    /// Bind one statement against a stable catalog snapshot and return its
+    /// result shape without executing it or changing transaction state.
+    ///
+    /// An active transaction uses its existing snapshot. An idle session
+    /// obtains a linearizable read snapshot, but never opens a transaction or
+    /// submits a replicated command.
+    pub fn describe_sql(
+        &self,
+        sql: &str,
+        parameter_types: &[SqlType],
+    ) -> std::result::Result<Option<Vec<ResultColumn>>, SqlError> {
+        let statements = Parser::batch(sql)?;
+        if statements.len() != 1 {
+            return Err(SqlError::new(
+                "42601",
+                "Describe requires exactly one SQL statement",
+            ));
+        }
+        let snapshot = match self.txn.as_ref() {
+            Some(transaction) => transaction.snapshot.clone(),
+            None => self.engine.committer.read_barrier().map_err(to_sql)?,
+        };
+        self.describe_statement(&statements[0], snapshot.catalog(), parameter_types, 0)
+    }
+
+    fn describe_statement(
+        &self,
+        statement: &Statement,
+        catalog: &Catalog,
+        parameter_types: &[SqlType],
+        depth: usize,
+    ) -> std::result::Result<Option<Vec<ResultColumn>>, SqlError> {
+        const MAX_NESTED_PREPARED_DESCRIBE: usize = 16;
+        match statement {
+            Statement::Select(query) => {
+                describe_select_columns(query, catalog, parameter_types).map(Some)
+            }
+            Statement::Show(name) => self.show(name).map(|result| Some(result.columns)),
+            Statement::Insert(query) => {
+                describe_returning_columns(catalog, &query.table, &query.returning, parameter_types)
+            }
+            Statement::Update(query) => {
+                describe_returning_columns(catalog, &query.table, &query.returning, parameter_types)
+            }
+            Statement::Delete(query) => {
+                describe_returning_columns(catalog, &query.table, &query.returning, parameter_types)
+            }
+            Statement::Execute { name, .. } => {
+                if depth >= MAX_NESTED_PREPARED_DESCRIBE {
+                    return Err(SqlError::new(
+                        "54000",
+                        "nested prepared statement depth exceeds configured limit",
+                    ));
+                }
+                let sql = self
+                    .prepared
+                    .get(name)
+                    .ok_or_else(|| SqlError::new("26000", "prepared statement does not exist"))?;
+                let statements = Parser::batch(sql)?;
+                if statements.len() != 1 {
+                    return Err(SqlError::new(
+                        "42601",
+                        "prepared statements must contain exactly one SQL statement",
+                    ));
+                }
+                self.describe_statement(&statements[0], catalog, parameter_types, depth + 1)
+            }
+            Statement::Unsupported(message) => Err(SqlError::unsupported(message.clone())),
+            Statement::Begin { .. }
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::Set(..)
+            | Statement::Prepare { .. }
+            | Statement::CreateTable { .. }
+            | Statement::DropTable { .. }
+            | Statement::AlterTable { .. }
+            | Statement::CreateIndex { .. }
+            | Statement::DropIndex { .. } => Ok(None),
+        }
+    }
+
     pub fn close_prepared(&mut self, name: &str) {
         self.prepared.remove(name);
     }
@@ -3278,10 +3360,15 @@ impl Statement {
     }
 }
 
+struct BoundResultColumn {
+    qualifier: String,
+    column: ResultColumn,
+}
+
 #[derive(Default)]
 struct SelectBindingScope {
     qualifiers: Vec<String>,
-    columns: Vec<(String, String)>,
+    columns: Vec<BoundResultColumn>,
 }
 
 impl SelectBindingScope {
@@ -3320,7 +3407,15 @@ impl SelectBindingScope {
                 .columns
                 .iter()
                 .filter(|column| column.state == ColumnState::Live)
-                .map(|column| (qualifier.to_string(), column.name.clone())),
+                .map(|column| BoundResultColumn {
+                    qualifier: qualifier.to_string(),
+                    column: ResultColumn {
+                        name: column.name.clone(),
+                        data_type: column.data_type,
+                        table_oid: table.oid,
+                        column_oid: column.id,
+                    },
+                }),
         );
         Ok(())
     }
@@ -3385,44 +3480,55 @@ impl SelectBindingScope {
     }
 
     fn resolve_unqualified(&self, name: &str) -> std::result::Result<(), SqlError> {
-        let matches = self
+        self.resolve_unqualified_column(name).map(|_| ())
+    }
+
+    fn resolve_unqualified_column(
+        &self,
+        name: &str,
+    ) -> std::result::Result<&ResultColumn, SqlError> {
+        let mut matches = self
             .columns
             .iter()
-            .filter(|(_, column)| column == name)
-            .take(2)
-            .count();
-        match matches {
-            0 => Err(SqlError::new(
+            .filter(|bound| bound.column.name == name);
+        let Some(column) = matches.next() else {
+            return Err(SqlError::new(
                 "42703",
                 format!("column \"{name}\" does not exist"),
-            )),
-            1 => Ok(()),
-            _ => Err(SqlError::new(
+            ));
+        };
+        if matches.next().is_some() {
+            Err(SqlError::new(
                 "42702",
                 format!("column reference \"{name}\" is ambiguous"),
-            )),
+            ))
+        } else {
+            Ok(&column.column)
         }
     }
 
     fn resolve_qualified(&self, qualifier: &str, name: &str) -> std::result::Result<(), SqlError> {
+        self.resolve_qualified_column(qualifier, name).map(|_| ())
+    }
+
+    fn resolve_qualified_column(
+        &self,
+        qualifier: &str,
+        name: &str,
+    ) -> std::result::Result<&ResultColumn, SqlError> {
         if !self.qualifiers.iter().any(|old| old == qualifier) {
             return Err(SqlError::new(
                 "42P01",
                 format!("missing FROM-clause entry for table \"{qualifier}\""),
             ));
         }
-        if self
-            .columns
+        self.columns
             .iter()
-            .any(|(relation, column)| relation == qualifier && column == name)
-        {
-            Ok(())
-        } else {
-            Err(SqlError::new(
-                "42703",
-                format!("column {qualifier}.{name} does not exist"),
-            ))
-        }
+            .find(|bound| bound.qualifier == qualifier && bound.column.name == name)
+            .map(|bound| &bound.column)
+            .ok_or_else(|| {
+                SqlError::new("42703", format!("column {qualifier}.{name} does not exist"))
+            })
     }
 }
 
@@ -4121,6 +4227,207 @@ fn index_entries(
         out.push((key, unique));
     }
     Ok(out)
+}
+
+fn describe_select_columns(
+    query: &Select,
+    catalog: &Catalog,
+    parameter_types: &[SqlType],
+) -> std::result::Result<Vec<ResultColumn>, SqlError> {
+    let base = match query.from.as_deref() {
+        Some(relation) => match virtual_relation(relation, catalog) {
+            Some((columns, _)) => virtual_table(relation, &columns),
+            None => find_table(catalog, relation)?.clone(),
+        },
+        None => virtual_table("", &[]),
+    };
+    let scope = if query.from.is_some() {
+        SelectBindingScope::for_query(catalog, &base, query)?
+    } else {
+        let scope = SelectBindingScope::default();
+        scope.validate_query_expressions(query)?;
+        scope
+    };
+    if query.projection.len() == 1 && matches!(query.projection[0], Expr::Star) {
+        return Ok(base
+            .columns
+            .iter()
+            .filter(|column| column.state == ColumnState::Live)
+            .map(|column| ResultColumn {
+                name: column.name.clone(),
+                data_type: column.data_type,
+                table_oid: base.oid,
+                column_oid: column.id,
+            })
+            .collect());
+    }
+    query
+        .projection
+        .iter()
+        .map(|expression| described_result_column(expression, &scope, parameter_types))
+        .collect()
+}
+
+fn describe_returning_columns(
+    catalog: &Catalog,
+    relation: &str,
+    returning: &[Expr],
+    parameter_types: &[SqlType],
+) -> std::result::Result<Option<Vec<ResultColumn>>, SqlError> {
+    let table = find_table(catalog, relation)?;
+    if returning.is_empty() {
+        return Ok(None);
+    }
+    let mut scope = SelectBindingScope::default();
+    scope.add_table(table, &table.name)?;
+    let mut columns = Vec::new();
+    for expression in returning {
+        scope.validate_expr(expression)?;
+        if matches!(expression, Expr::Star) {
+            columns.extend(
+                table
+                    .columns
+                    .iter()
+                    .filter(|column| column.state == ColumnState::Live)
+                    .map(|column| ResultColumn {
+                        name: column.name.clone(),
+                        data_type: column.data_type,
+                        table_oid: table.oid,
+                        column_oid: column.id,
+                    }),
+            );
+        } else {
+            columns.push(described_result_column(
+                expression,
+                &scope,
+                parameter_types,
+            )?);
+        }
+    }
+    Ok(Some(columns))
+}
+
+fn described_result_column(
+    expression: &Expr,
+    scope: &SelectBindingScope,
+    parameter_types: &[SqlType],
+) -> std::result::Result<ResultColumn, SqlError> {
+    let mut column = match expression {
+        Expr::Column(name) => scope.resolve_unqualified_column(name)?.clone(),
+        Expr::Qualified(qualifier, name) => {
+            scope.resolve_qualified_column(qualifier, name)?.clone()
+        }
+        Expr::Func(name, _) => ResultColumn {
+            name: name.clone(),
+            data_type: SqlType::Text,
+            table_oid: 0,
+            column_oid: 0,
+        },
+        Expr::Star => {
+            return Err(SqlError::new(
+                "42601",
+                "* is only valid as an expanded result expression",
+            ));
+        }
+        _ => ResultColumn {
+            name: "?column?".into(),
+            data_type: SqlType::Text,
+            table_oid: 0,
+            column_oid: 0,
+        },
+    };
+    column.data_type = expression_result_type(expression, scope, parameter_types)?;
+    Ok(column)
+}
+
+fn expression_result_type(
+    expression: &Expr,
+    scope: &SelectBindingScope,
+    parameter_types: &[SqlType],
+) -> std::result::Result<SqlType, SqlError> {
+    match expression {
+        Expr::Literal(value) => Ok(value.sql_type().unwrap_or(SqlType::Text)),
+        Expr::Param(number) => parameter_types
+            .get(number.saturating_sub(1))
+            .copied()
+            .ok_or_else(|| SqlError::new("42P02", format!("parameter ${number} is not defined"))),
+        Expr::Column(name) => Ok(scope.resolve_unqualified_column(name)?.data_type),
+        Expr::Qualified(qualifier, name) => {
+            Ok(scope.resolve_qualified_column(qualifier, name)?.data_type)
+        }
+        Expr::Star => Err(SqlError::new(
+            "42601",
+            "* is only valid as an expanded result expression",
+        )),
+        Expr::Unary(Unary::Not, _) | Expr::IsNull(..) | Expr::In(..) | Expr::Between(..) => {
+            Ok(SqlType::Boolean)
+        }
+        Expr::Unary(Unary::Neg, value) => {
+            if expression_result_type(value, scope, parameter_types)? == SqlType::Double {
+                Ok(SqlType::Double)
+            } else {
+                Ok(SqlType::BigInt)
+            }
+        }
+        Expr::Like(..) => Ok(SqlType::Boolean),
+        Expr::Binary(left, operator, right) => match operator {
+            BinOp::Or
+            | BinOp::And
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge => Ok(SqlType::Boolean),
+            BinOp::Concat | BinOp::JsonText => Ok(SqlType::Text),
+            BinOp::JsonGet => Ok(SqlType::Jsonb),
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                let left = expression_result_type(left, scope, parameter_types)?;
+                let right = expression_result_type(right, scope, parameter_types)?;
+                if left == SqlType::Double || right == SqlType::Double {
+                    Ok(SqlType::Double)
+                } else {
+                    Ok(SqlType::BigInt)
+                }
+            }
+        },
+        Expr::Cast(_, data_type) => Ok(*data_type),
+        Expr::Case(branches, otherwise) => branches
+            .first()
+            .map(|(_, value)| expression_result_type(value, scope, parameter_types))
+            .unwrap_or_else(|| expression_result_type(otherwise, scope, parameter_types)),
+        Expr::Func(name, arguments) => {
+            let name = name.to_ascii_lowercase();
+            match name.as_str() {
+                "count" | "sum" => Ok(SqlType::BigInt),
+                "avg" => Ok(SqlType::Double),
+                "now"
+                | "transaction_timestamp"
+                | "statement_timestamp"
+                | "current_timestamp"
+                | "localtimestamp" => Ok(SqlType::Timestamp),
+                "current_date" => Ok(SqlType::Date),
+                "pg_backend_pid" | "length" | "octet_length" => Ok(SqlType::Integer),
+                "version" | "current_database" | "current_schema" | "current_user"
+                | "format_type" | "pg_get_userbyid" | "lower" | "upper" => Ok(SqlType::Text),
+                "abs" => arguments
+                    .first()
+                    .map(|argument| expression_result_type(argument, scope, parameter_types))
+                    .transpose()
+                    .map(|data_type| match data_type.unwrap_or(SqlType::Text) {
+                        SqlType::Double => SqlType::Double,
+                        _ => SqlType::BigInt,
+                    }),
+                "min" | "max" | "coalesce" | "greatest" | "least" | "nullif" => arguments
+                    .first()
+                    .map(|argument| expression_result_type(argument, scope, parameter_types))
+                    .unwrap_or(Ok(SqlType::Text)),
+                _ => Err(SqlError::unsupported(format!(
+                    "function {name} is not supported"
+                ))),
+            }
+        }
+    }
 }
 
 fn result_column(e: &Expr, t: &TableDescriptor) -> ResultColumn {
@@ -5954,6 +6261,82 @@ mod tests {
             qualified.rows,
             vec![vec![Datum::Int32(1), Datum::Text("right".into())]]
         );
+    }
+
+    #[test]
+    fn static_describe_binds_empty_results_without_execution_or_state_change() {
+        let origin = OriginId::new(114);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store.clone(), committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE describe_empty (id integer primary key, value text);",
+                &[],
+            )
+            .unwrap();
+        let before = store.snapshot().unwrap();
+
+        let columns = session
+            .describe_sql("SELECT * FROM describe_empty WHERE false", &[])
+            .unwrap()
+            .expect("SELECT has a result shape");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].data_type, SqlType::Integer);
+        assert_ne!(columns[0].table_oid, 0);
+        assert_ne!(columns[0].column_oid, 0);
+        assert_eq!(columns[1].name, "value");
+        assert_eq!(columns[1].data_type, SqlType::Text);
+
+        let expressions = session
+            .describe_sql(
+                "SELECT $1::integer, count(*) FROM describe_empty",
+                &[SqlType::Text],
+            )
+            .unwrap()
+            .expect("expression SELECT has a result shape");
+        assert_eq!(expressions[0].data_type, SqlType::Integer);
+        assert_eq!(expressions[1].data_type, SqlType::BigInt);
+
+        let returning = session
+            .describe_sql(
+                "INSERT INTO describe_empty VALUES (1, 'one') RETURNING id, value",
+                &[],
+            )
+            .unwrap()
+            .expect("RETURNING has a result shape");
+        assert_eq!(returning.len(), 2);
+        assert_eq!(returning[0].table_oid, columns[0].table_oid);
+        assert!(
+            session
+                .describe_sql("INSERT INTO describe_empty VALUES (1, 'one')", &[])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            session
+                .describe_sql("SELECT * FROM missing_describe_relation", &[])
+                .unwrap_err()
+                .code,
+            "42P01"
+        );
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+        assert_eq!(store.snapshot().unwrap().db_epoch(), before.db_epoch());
+
+        session.execute("BEGIN", &[]).unwrap();
+        let active_before = store.snapshot().unwrap().db_epoch();
+        assert!(
+            session
+                .describe_sql("SHOW timezone", &[])
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(session.transaction_status(), TransactionStatus::Active);
+        assert_eq!(store.snapshot().unwrap().db_epoch(), active_before);
+        session.execute("ROLLBACK", &[]).unwrap();
     }
 
     #[test]

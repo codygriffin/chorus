@@ -639,6 +639,10 @@ struct Connection {
 struct Portal {
     sql: String,
     params: Vec<Datum>,
+    parameter_types: Vec<u32>,
+    /// Static result metadata bound before execution. Keeping it with the
+    /// portal makes binary DataRow encoding agree exactly with Describe.
+    description: Option<Vec<ResultColumn>>,
     /// The result format list from Bind.  An empty list means text for all
     /// columns; a one-element list applies to every column.
     result_formats: Vec<u16>,
@@ -1211,9 +1215,9 @@ impl Connection {
             let sql = self
                 .session_sql(&statement)
                 .ok_or_else(|| SqlError::new("26000", "prepared statement does not exist"))?;
-            Ok::<_, SqlError>((portal, sql, params, result_formats))
+            Ok::<_, SqlError>((portal, sql, params, declared, result_formats))
         })();
-        let (portal, sql, params, result_formats) = match parsed {
+        let (portal, sql, params, parameter_types, result_formats) = match parsed {
             Ok(value) => value,
             Err(e) => return self.extended_failure(&e),
         };
@@ -1223,9 +1227,15 @@ impl Connection {
         if named_resource_limit_reached(&self.portals, &portal, MAX_NAMED_PORTALS) {
             return self.extended_failure(&SqlError::new("54000", "too many named portals"));
         }
+        let description = match self.describe_query(&sql, &parameter_types) {
+            Ok(description) => description.map(|result| result.columns),
+            Err(error) => return self.extended_failure(&error),
+        };
         let candidate = Portal {
             sql,
             params,
+            parameter_types,
+            description,
             result_formats,
             pending: None,
         };
@@ -1271,7 +1281,8 @@ impl Connection {
             if let Some(result) = portal.pending {
                 return self.row_description_with_formats(&result, &portal.result_formats);
             }
-            if let Some(result) = infer_result_description(&portal.sql, &self.prepared_types) {
+            if let Some(columns) = portal.description {
+                let result = description_result(columns);
                 return self.row_description_with_formats(&result, &portal.result_formats);
             }
             self.write_message(b'n', &[])
@@ -1282,19 +1293,43 @@ impl Connection {
                     "prepared statement does not exist",
                 ));
             };
+            let description = match self.session_sql(&name) {
+                Some(sql) => match self.describe_query(&sql, &types) {
+                    Ok(description) => description,
+                    Err(error) => return self.extended_failure(&error),
+                },
+                None => {
+                    return self.extended_failure(&SqlError::new(
+                        "26000",
+                        "prepared statement does not exist",
+                    ));
+                }
+            };
             let mut p = Vec::new();
             put_u16_checked(&mut p, types.len())?;
             for oid in types {
                 p.extend_from_slice(&oid.to_be_bytes());
             }
             self.write_message(b't', &p)?;
-            if let Some(sql) = self.session_sql(&name) {
-                if let Some(result) = infer_result_description(&sql, &self.prepared_types) {
-                    return self.row_description_with_formats(&result, &[]);
-                }
+            if let Some(result) = description {
+                return self.row_description_with_formats(&result, &[]);
             }
             self.write_message(b'n', &[])
         }
+    }
+
+    fn describe_query(
+        &self,
+        sql: &str,
+        parameter_oids: &[u32],
+    ) -> Result<Option<QueryResult>, SqlError> {
+        let parameter_types = parameter_oids
+            .iter()
+            .map(|oid| sql_type_for_oid(*oid).unwrap_or(SqlType::Text))
+            .collect::<Vec<_>>();
+        self.session
+            .describe_sql(sql, &parameter_types)
+            .map(|description| description.map(description_result))
     }
     fn execute(&mut self, body: &[u8]) -> std::io::Result<()> {
         let mut decoder = Decoder::new(body);
@@ -1328,6 +1363,14 @@ impl Connection {
             Ok(result) => result,
             Err(e) => return self.extended_failure(&e),
         };
+        if let Some(columns) = &p.description {
+            result.columns.clone_from(columns);
+        } else if !result.columns.is_empty() {
+            return self.extended_failure(&SqlError::new(
+                "XX000",
+                "execution produced rows for a portal described as NoData",
+            ));
+        }
         if max > 0 && result.rows.len() > max {
             let remaining = result.rows.split_off(max);
             let formats = p.result_formats.clone();
@@ -1349,7 +1392,7 @@ impl Connection {
                 }
                 return self.extended_failure(&e);
             }
-            self.result_rows_with_formats(&result, &formats)?;
+            self.data_rows_with_formats(&result, &formats)?;
             return self.write_message(b's', &[]);
         }
         let formats = p.result_formats.clone();
@@ -1360,7 +1403,7 @@ impl Connection {
             }
             return self.extended_failure(&e);
         }
-        self.result_with_formats(&result, &formats)
+        self.extended_result_with_formats(&result, &formats)
     }
     fn close(&mut self, body: &[u8]) -> std::io::Result<()> {
         let Some(kind) = body.first().copied() else {
@@ -1410,6 +1453,17 @@ impl Connection {
         result_formats: &[u16],
     ) -> std::io::Result<()> {
         self.result_rows_with_formats(r, result_formats)?;
+        self.command_complete(r)
+    }
+    fn extended_result_with_formats(
+        &mut self,
+        r: &QueryResult,
+        result_formats: &[u16],
+    ) -> std::io::Result<()> {
+        self.data_rows_with_formats(r, result_formats)?;
+        self.command_complete(r)
+    }
+    fn command_complete(&mut self, r: &QueryResult) -> std::io::Result<()> {
         let mut tag = r.command_tag.clone();
         if tag.eq_ignore_ascii_case("SELECT") {
             tag = format!("SELECT {}", r.affected_rows);
@@ -1431,6 +1485,16 @@ impl Connection {
         validate_result_formats(result_formats, r.columns.len())?;
         if !r.columns.is_empty() {
             self.row_description_with_formats(r, result_formats)?;
+        }
+        self.data_rows_with_formats(r, result_formats)
+    }
+    fn data_rows_with_formats(
+        &mut self,
+        r: &QueryResult,
+        result_formats: &[u16],
+    ) -> std::io::Result<()> {
+        validate_result_formats(result_formats, r.columns.len())?;
+        if !r.columns.is_empty() {
             let mut total_bytes = 0usize;
             for row in &r.rows {
                 if row.len() != r.columns.len() || row.len() > MAX_PROTOCOL_ITEMS {
@@ -1710,14 +1774,19 @@ fn datum_heap_bytes(value: &Datum) -> usize {
     }
 }
 
+fn result_columns_heap_bytes(columns: &Vec<ResultColumn>) -> WireResult<usize> {
+    let mut total = 0usize;
+    charge_retained_items::<ResultColumn>(&mut total, columns.capacity())?;
+    for column in columns {
+        charge_retained(&mut total, column.name.capacity())?;
+    }
+    Ok(total)
+}
+
 /// Heap storage owned by a suspended result.  The inline QueryResult itself
 /// is already part of `Portal`; this charges its nested vectors and strings.
 fn pending_result_heap_bytes(result: &QueryResult) -> WireResult<usize> {
-    let mut total = 0usize;
-    charge_retained_items::<ResultColumn>(&mut total, result.columns.capacity())?;
-    for column in &result.columns {
-        charge_retained(&mut total, column.name.capacity())?;
-    }
+    let mut total = result_columns_heap_bytes(&result.columns)?;
     charge_retained_items::<Vec<Datum>>(&mut total, result.rows.capacity())?;
     for row in &result.rows {
         charge_retained_items::<Datum>(&mut total, row.capacity())?;
@@ -1742,6 +1811,10 @@ fn portal_retained_bytes(name: &str, portal: &Portal) -> WireResult<usize> {
     charge_retained_items::<Datum>(&mut total, portal.params.capacity())?;
     for value in &portal.params {
         charge_retained(&mut total, datum_heap_bytes(value))?;
+    }
+    charge_retained_items::<u32>(&mut total, portal.parameter_types.capacity())?;
+    if let Some(description) = &portal.description {
+        charge_retained(&mut total, result_columns_heap_bytes(description)?)?;
     }
     charge_retained_items::<u16>(&mut total, portal.result_formats.capacity())?;
     if let Some(result) = &portal.pending {
@@ -2075,15 +2148,33 @@ fn infer_parameter_types(sql: &str, supplied: &[u32]) -> WireResult<Vec<u32>> {
     Ok(types)
 }
 
-// The SQL engine owns planning and catalog lookup.  Keeping Describe's
-// fallback as NoData is preferable to executing a statement merely to obtain
-// metadata (which could commit a write); an actual result always carries its
-// authoritative RowDescription.
-fn infer_result_description(
-    _sql: &str,
-    _prepared_types: &HashMap<String, Vec<u32>>,
-) -> Option<QueryResult> {
-    None
+fn sql_type_for_oid(oid: u32) -> Option<SqlType> {
+    Some(match oid {
+        16 => SqlType::Boolean,
+        17 => SqlType::Bytea,
+        20 => SqlType::BigInt,
+        21 => SqlType::SmallInt,
+        23 => SqlType::Integer,
+        25 => SqlType::Text,
+        701 => SqlType::Double,
+        1043 => SqlType::Varchar(None),
+        1082 => SqlType::Date,
+        1114 => SqlType::Timestamp,
+        1184 => SqlType::TimestampTz,
+        2950 => SqlType::Uuid,
+        3802 => SqlType::Jsonb,
+        _ => return None,
+    })
+}
+
+fn description_result(columns: Vec<ResultColumn>) -> QueryResult {
+    QueryResult {
+        columns,
+        rows: Vec::new(),
+        command_tag: "SELECT".into(),
+        affected_rows: 0,
+        notices: Vec::new(),
+    }
 }
 
 fn parse_uuid(text: &str) -> Option<[u8; 16]> {

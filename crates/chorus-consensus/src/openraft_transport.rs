@@ -476,6 +476,25 @@ impl AuthenticatedRaftService {
             .map(Response::new)
             .map_err(|error| Status::internal(error.to_string()))
     }
+
+    /// Manifest authorization permits a prospective learner to receive Raft
+    /// replication, but application gateway traffic is accepted only after
+    /// that source is present in the replicated OpenRaft membership.
+    fn require_current_member(&self, source_node_id: u64) -> Result<(), Status> {
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .any(|(node_id, _)| *node_id == source_node_id)
+        {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(
+                "authenticated source node is not a current Raft member",
+            ))
+        }
+    }
 }
 
 fn fatal_only<T>(result: Result<T, RaftError<u64>>) -> Result<T, Fatal<u64>> {
@@ -553,6 +572,7 @@ impl wire::open_raft_transport_server::OpenRaftTransport for AuthenticatedRaftSe
         let source =
             self.authenticator
                 .authenticate(&request, request.get_ref(), RpcMethod::ClientWrite)?;
+        self.require_current_member(source)?;
         let request: ClientWriteGatewayRequest = decode_rpc_payload(
             RpcPayloadDomain::ClientWriteRequest,
             &request.into_inner().payload,
@@ -583,6 +603,7 @@ impl wire::open_raft_transport_server::OpenRaftTransport for AuthenticatedRaftSe
         let source =
             self.authenticator
                 .authenticate(&request, request.get_ref(), RpcMethod::ReadBarrier)?;
+        self.require_current_member(source)?;
         let _: ReadBarrierGatewayRequest = decode_rpc_payload(
             RpcPayloadDomain::ReadBarrierRequest,
             &request.into_inner().payload,

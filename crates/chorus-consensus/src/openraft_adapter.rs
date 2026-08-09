@@ -136,14 +136,9 @@ impl OpenRaftConsensus {
         identity
             .validate()
             .map_err(|error| ChorusError::Consensus(error.to_string()))?;
-        if initial_voters.len() < 3
-            || initial_voters.len() > 5
-            || initial_voters.len() % 2 == 0
-            || !initial_voters.contains_key(&node_id)
-        {
+        if initial_voters.len() < 3 || initial_voters.len() > 5 || initial_voters.len() % 2 == 0 {
             return Err(ChorusError::Consensus(
-                "authenticated static bootstrap requires 3 or 5 voters including the local node"
-                    .into(),
+                "authenticated static bootstrap requires 3 or 5 voters".into(),
             ));
         }
         if options.listen.port() == 0 {
@@ -151,19 +146,19 @@ impl OpenRaftConsensus {
                 "authenticated OpenRaft listen port must be nonzero".into(),
             ));
         }
-        let peer_ids: Vec<_> = identity.peers.keys().copied().collect();
-        let expected_peers: Vec<_> = initial_voters
+        let unknown_voter = initial_voters
             .keys()
             .copied()
-            .filter(|peer| *peer != node_id)
-            .collect();
-        if peer_ids != expected_peers {
-            return Err(ChorusError::Consensus(
-                "authenticated peer manifest does not exactly match the static voter set".into(),
-            ));
+            .find(|peer| *peer != node_id && !identity.peers.contains_key(peer));
+        if let Some(unknown_voter) = unknown_voter {
+            return Err(ChorusError::Consensus(format!(
+                "authenticated initial voter {unknown_voter} is absent from the signed peer manifest"
+            )));
         }
         if identity.peers.iter().any(|(peer_id, peer)| {
-            initial_voters.get(peer_id).map(String::as_str) != Some(peer.endpoint.as_str())
+            initial_voters
+                .get(peer_id)
+                .is_some_and(|endpoint| endpoint != &peer.endpoint)
         }) {
             return Err(ChorusError::Consensus(
                 "authenticated peer endpoints do not match the static voter directory".into(),
@@ -238,14 +233,23 @@ impl OpenRaftConsensus {
                             .into(),
                     ));
                 }
-                RuntimeMode::Authenticated { initial_voters, .. }
-                    if voters != initial_voters.keys().copied().collect::<Vec<_>>()
-                        || !learners.is_empty() =>
-                {
-                    return Err(ChorusError::Consensus(
-                        "durable membership does not match the authenticated static voter manifest"
-                            .into(),
-                    ));
+                RuntimeMode::Authenticated { identity, .. } => {
+                    let membership = stored_membership.membership();
+                    for (member_id, node) in membership.nodes() {
+                        if *member_id == node_id {
+                            continue;
+                        }
+                        let peer = identity.peers.get(member_id).ok_or_else(|| {
+                            ChorusError::Consensus(format!(
+                                "durable member {member_id} is absent from the signed peer manifest"
+                            ))
+                        })?;
+                        if node.addr != peer.endpoint {
+                            return Err(ChorusError::Consensus(format!(
+                                "durable member {member_id} endpoint does not match the signed peer manifest"
+                            )));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -389,13 +393,11 @@ impl Consensus for OpenRaftConsensus {
     }
 
     fn change_membership(&self, voters: Vec<u64>, learners: Vec<u64>) -> Result<()> {
-        if voters == [self.node_id] && learners.is_empty() {
-            return Ok(());
-        }
-        Err(ChorusError::Consensus(
-            "live OpenRaft membership changes are not implemented by the static bootstrap adapter"
-                .into(),
-        ))
+        self.send(|response| RuntimeRequest::ChangeMembership {
+            voters,
+            learners,
+            response,
+        })
     }
 
     fn wait_applied(&self, log_id: ChorusLogId) -> Result<()> {
@@ -460,6 +462,11 @@ enum RuntimeRequest {
     Status {
         response: std_mpsc::SyncSender<Result<ConsensusStatus>>,
     },
+    ChangeMembership {
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+        response: std_mpsc::SyncSender<Result<()>>,
+    },
     Checkpoint {
         response: std_mpsc::SyncSender<Result<()>>,
     },
@@ -522,7 +529,7 @@ async fn run_runtime(
 
     let mut server_shutdown = None;
     let mut server_task = None;
-    let (raft, initial_members, wait_for_self_leader, gateway) = match mode {
+    let (raft, initial_members, wait_for_self_leader, gateway, authorized_nodes) = match mode {
         RuntimeMode::SingleNode => {
             let config = match single_node_config() {
                 Ok(config) => config,
@@ -551,6 +558,7 @@ async fn run_runtime(
                 BTreeMap::from([(node_id, BasicNode::new(format!("single-node://{node_id}")))]),
                 true,
                 None,
+                BTreeMap::new(),
             )
         }
         RuntimeMode::Authenticated {
@@ -558,6 +566,11 @@ async fn run_runtime(
             initial_voters,
             options,
         } => {
+            let authorized_nodes = identity
+                .peers
+                .iter()
+                .map(|(peer_id, peer)| (*peer_id, BasicNode::new(&peer.endpoint)))
+                .collect();
             let listener = match tokio::net::TcpListener::bind(options.listen).await {
                 Ok(listener) => listener,
                 Err(error) => {
@@ -632,7 +645,13 @@ async fn run_runtime(
             });
             server_shutdown = Some(shutdown_tx);
             server_task = Some(task);
-            (raft, initial_voters, initialize, Some(gateway))
+            (
+                raft,
+                initial_voters,
+                initialize,
+                Some(gateway),
+                authorized_nodes,
+            )
         }
     };
 
@@ -800,6 +819,20 @@ async fn run_runtime(
                     learners,
                 }));
             }
+            RuntimeRequest::ChangeMembership {
+                voters,
+                learners,
+                response,
+            } => {
+                let result = tokio::time::timeout(
+                    OPERATION_TIMEOUT,
+                    add_one_authorized_learner(&raft, &authorized_nodes, voters, learners),
+                )
+                .await
+                .map_err(|_| ChorusError::Consensus("OpenRaft learner addition timed out".into()))
+                .and_then(|result| result);
+                let _ = response.send(result);
+            }
             RuntimeRequest::Checkpoint { response } => {
                 let result = checkpoint_runtime(&raft).await;
                 let _ = response.send(result);
@@ -853,6 +886,96 @@ async fn checkpoint_runtime(raft: &ChorusRaft) -> Result<()> {
     })
     .await
     .map_err(|_| ChorusError::Consensus("OpenRaft checkpoint timed out".into()))??;
+    Ok(())
+}
+
+/// Phase-one live membership support: add one pre-provisioned learner while
+/// leaving the voter set unchanged. Promotion, demotion, removal and peer
+/// directory rotation require separate operator workflows and fail closed.
+async fn add_one_authorized_learner(
+    raft: &ChorusRaft,
+    authorized_nodes: &BTreeMap<u64, BasicNode>,
+    voters: Vec<u64>,
+    learners: Vec<u64>,
+) -> Result<()> {
+    if voters.iter().chain(&learners).any(|node_id| *node_id == 0) {
+        return Err(ChorusError::Consensus(
+            "OpenRaft membership node ids must be nonzero".into(),
+        ));
+    }
+    let requested_voters: BTreeSet<_> = voters.iter().copied().collect();
+    let requested_learners: BTreeSet<_> = learners.iter().copied().collect();
+    if requested_voters.len() != voters.len() || requested_learners.len() != learners.len() {
+        return Err(ChorusError::Consensus(
+            "OpenRaft membership request contains duplicate node ids".into(),
+        ));
+    }
+    if requested_voters.is_empty()
+        || requested_voters
+            .iter()
+            .any(|node_id| requested_learners.contains(node_id))
+    {
+        return Err(ChorusError::Consensus(
+            "OpenRaft voter set must be nonempty and voters/learners must be disjoint".into(),
+        ));
+    }
+
+    let metrics = raft.metrics().borrow().clone();
+    let current_voters: BTreeSet<_> = metrics.membership_config.voter_ids().collect();
+    let current_learners: BTreeSet<_> = metrics
+        .membership_config
+        .membership()
+        .learner_ids()
+        .collect();
+    if requested_voters != current_voters {
+        return Err(ChorusError::Consensus(
+            "phase-one membership supports learner addition only; voter changes are disabled"
+                .into(),
+        ));
+    }
+    if !current_learners.is_subset(&requested_learners) {
+        return Err(ChorusError::Consensus(
+            "phase-one membership does not support learner removal".into(),
+        ));
+    }
+    let added: Vec<_> = requested_learners
+        .difference(&current_learners)
+        .copied()
+        .collect();
+    let target = match added.as_slice() {
+        [target] => *target,
+        [] if requested_learners.is_empty() => return Ok(()),
+        // A retry after an ambiguous response re-adds the sole learner with
+        // `blocking=true`, preserving the catch-up guarantee.
+        [] if requested_learners.len() == 1 => *requested_learners.iter().next().unwrap(),
+        [] => {
+            return Err(ChorusError::Consensus(
+                "phase-one membership cannot revalidate multiple learners".into(),
+            ));
+        }
+        _ => {
+            return Err(ChorusError::Consensus(
+                "phase-one membership adds exactly one learner per request".into(),
+            ));
+        }
+    };
+    let node = authorized_nodes.get(&target).cloned().ok_or_else(|| {
+        ChorusError::Consensus(format!(
+            "learner {target} is absent from the signed peer manifest"
+        ))
+    })?;
+
+    raft.add_learner(target, node, true)
+        .await
+        .map_err(|error| ChorusError::Consensus(format!("OpenRaft add learner failed: {error}")))?;
+    let membership = raft.metrics().borrow().membership_config.clone();
+    let observed_voters: BTreeSet<_> = membership.voter_ids().collect();
+    let observed_learners: BTreeSet<_> = membership.membership().learner_ids().collect();
+    if observed_voters != requested_voters || observed_learners != requested_learners {
+        return Err(ChorusError::Consensus(
+            "OpenRaft learner response did not publish the requested exact membership".into(),
+        ));
+    }
     Ok(())
 }
 

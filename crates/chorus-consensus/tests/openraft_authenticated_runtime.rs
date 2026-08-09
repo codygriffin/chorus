@@ -5,11 +5,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chorus_codec::{
-    ApplyResult, CommitTransactionV1, KvMutationV1, canonical_mutations, payload_hash,
+    ActivateOriginV1, ApplyResult, CommitTransactionV1, KvMutationV1, ReplicatedCommandV1,
+    canonical_mutations, payload_hash,
 };
 use chorus_common::{OriginId, RequestId};
-use chorus_consensus::openraft_transport::{PeerTlsConfig, TransportTlsIdentity, leaf_fingerprint};
+use chorus_consensus::openraft_transport::{
+    AuthenticatedNetworkFactory, PeerTlsConfig, TransportTlsIdentity, leaf_fingerprint,
+};
 use chorus_consensus::{Consensus, OpenRaftConsensus, OpenRaftRuntimeOptions};
+use chorus_redb::RedbStateMachine;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -76,7 +80,7 @@ fn identity(
     leaves: &[TestLeaf],
     endpoints: &BTreeMap<u64, String>,
 ) -> Arc<TransportTlsIdentity> {
-    let peers = (1..=3)
+    let peers = (1..=leaves.len() as u64)
         .filter(|peer| *peer != node_id)
         .map(|peer| {
             let leaf = &leaves[peer as usize - 1];
@@ -296,4 +300,188 @@ fn authenticated_three_node_runtime_bootstraps_replicates_and_restarts() {
     drop(restarted);
     drop(node1);
     drop(node2);
+}
+
+#[test]
+fn authenticated_leader_adds_preprovisioned_learner_and_reopens_exact_membership() {
+    let root = tempfile::tempdir().unwrap();
+    let ca = test_ca();
+    let leaves: Vec<_> = (1..=4)
+        .map(|node_id| test_leaf(&ca, &format!("node-{node_id}.chorus.test")))
+        .collect();
+    let addresses = free_addresses(4);
+    let endpoints: BTreeMap<_, _> = addresses
+        .iter()
+        .enumerate()
+        .map(|(index, address)| (index as u64 + 1, format!("https://{address}")))
+        .collect();
+    let voters: BTreeMap<_, _> = endpoints
+        .iter()
+        .filter(|(node_id, _)| **node_id <= 3)
+        .map(|(node_id, endpoint)| (*node_id, endpoint.clone()))
+        .collect();
+    let identities: Vec<_> = (1..=4)
+        .map(|node_id| identity(&ca, node_id, &leaves, &endpoints))
+        .collect();
+
+    // The prospective learner is authenticated and listening before the
+    // voter set is initialized, but it cannot initialize itself.
+    let node4 = open_node(
+        root.path(),
+        4,
+        false,
+        Arc::clone(&identities[3]),
+        &voters,
+        &addresses,
+    );
+    assert_eq!(None, node4.status().leader_id);
+    let node2 = open_node(
+        root.path(),
+        2,
+        false,
+        Arc::clone(&identities[1]),
+        &voters,
+        &addresses,
+    );
+    let node3 = open_node(
+        root.path(),
+        3,
+        false,
+        Arc::clone(&identities[2]),
+        &voters,
+        &addresses,
+    );
+    let node1 = open_node(
+        root.path(),
+        1,
+        true,
+        Arc::clone(&identities[0]),
+        &voters,
+        &addresses,
+    );
+    wait_for(Duration::from_secs(5), || {
+        let status = node1.status();
+        status.quorum && status.voters == [1, 2, 3]
+    });
+
+    let prospective_origin = OriginId::new(4);
+    let prospective_factory = AuthenticatedNetworkFactory::new(Arc::clone(&identities[3])).unwrap();
+    let client_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pre_membership_error = client_runtime
+        .block_on(prospective_factory.forward_client_write(
+            1,
+            ReplicatedCommandV1::ActivateOrigin(ActivateOriginV1 {
+                origin: prospective_origin,
+            }),
+            Duration::from_secs(2),
+        ))
+        .unwrap_err();
+    assert!(
+        pre_membership_error
+            .to_string()
+            .contains("not a current Raft member")
+    );
+    let follower_error = node2.change_membership(vec![1, 2, 3], vec![4]).unwrap_err();
+    assert!(follower_error.to_string().contains("add learner failed"));
+    let unknown = node1
+        .change_membership(vec![1, 2, 3], vec![99])
+        .unwrap_err();
+    assert!(unknown.to_string().contains("signed peer manifest"));
+    node1.change_membership(vec![1, 2, 3], vec![4]).unwrap();
+    // An ambiguous caller retry re-establishes the blocking catch-up gate.
+    node1.change_membership(vec![1, 2, 3], vec![4]).unwrap();
+    wait_for(Duration::from_secs(5), || {
+        let leader = node1.status();
+        let learner = node4.status();
+        leader.learners == [4] && learner.learners == [4]
+    });
+    node4.activate_origin(prospective_origin).unwrap();
+
+    let origin = OriginId::new(1);
+    node1.activate_origin(origin).unwrap();
+    let request_id = RequestId::new(origin, 1);
+    let mutation = KvMutationV1::Put {
+        key: b"lrn".to_vec(),
+        value: b"learner-value".to_vec(),
+    };
+    let canonical = canonical_mutations(std::slice::from_ref(&mutation)).unwrap();
+    let result = node1
+        .submit(CommitTransactionV1 {
+            request_id,
+            payload_hash: payload_hash(1, &request_id, 0, &canonical),
+            base_epoch: 0,
+            mutations: vec![mutation],
+        })
+        .unwrap();
+    assert!(matches!(result, ApplyResult::Committed { .. }));
+    wait_for(Duration::from_secs(5), || {
+        node4
+            .store()
+            .snapshot()
+            .ok()
+            .is_some_and(|snapshot| snapshot.get(b"lrn") == Some(&b"learner-value"[..]))
+    });
+
+    drop(node4);
+    let learner_state_path = root.path().join("node-4/state/active.redb");
+    let learner_state =
+        RedbStateMachine::open(&learner_state_path, CLUSTER_ID, INCARNATION).unwrap();
+    let exact = learner_state.exact_membership().unwrap();
+    assert_eq!(vec![1, 2, 3], exact.voter_ids().collect::<Vec<_>>());
+    assert_eq!(
+        vec![4],
+        exact.membership().learner_ids().collect::<Vec<_>>()
+    );
+    assert_eq!(endpoints[&4], exact.membership().get_node(&4).unwrap().addr);
+    drop(learner_state);
+
+    let restarted = open_node(
+        root.path(),
+        4,
+        false,
+        Arc::clone(&identities[3]),
+        &voters,
+        &addresses,
+    );
+    wait_for(Duration::from_secs(5), || {
+        let status = restarted.status();
+        status.learners == [4]
+            && restarted
+                .store()
+                .snapshot()
+                .ok()
+                .is_some_and(|snapshot| snapshot.get(b"lrn") == Some(&b"learner-value"[..]))
+    });
+
+    drop(node1);
+    let voter_state_path = root.path().join("node-1/state/active.redb");
+    let voter_state = RedbStateMachine::open(&voter_state_path, CLUSTER_ID, INCARNATION).unwrap();
+    let exact = voter_state.exact_membership().unwrap();
+    assert_eq!(1, exact.membership().get_joint_config().len());
+    assert_eq!(vec![1, 2, 3], exact.voter_ids().collect::<Vec<_>>());
+    assert_eq!(
+        vec![4],
+        exact.membership().learner_ids().collect::<Vec<_>>()
+    );
+    drop(voter_state);
+    let restarted_voter = open_node(
+        root.path(),
+        1,
+        false,
+        Arc::clone(&identities[0]),
+        &voters,
+        &addresses,
+    );
+    wait_for(Duration::from_secs(5), || {
+        let status = restarted_voter.status();
+        status.voters == [1, 2, 3] && status.learners == [4]
+    });
+
+    drop(restarted_voter);
+    drop(restarted);
+    drop(node2);
+    drop(node3);
 }

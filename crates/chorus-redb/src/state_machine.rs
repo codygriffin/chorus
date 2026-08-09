@@ -1,9 +1,9 @@
 //! Concrete Chorus OpenRaft type configuration and durable state machine.
 //!
-//! The adapter persists a whole logical state envelope in one redb value for
-//! the initial correctness milestone. It deliberately does not claim the
-//! final physical `META`/`KV` layout, an OpenRaft runtime, peer transport, or
-//! node serving integration.
+//! The adapter persists fixed system records in `state_meta` and the ordered
+//! logical physical keyspace in `state_kv`. A bounded legacy whole-envelope
+//! image is accepted once and migrated atomically on first reopen; new writes
+//! never recreate that layout.
 
 use std::io::{self, Cursor, SeekFrom};
 use std::path::Path;
@@ -24,7 +24,8 @@ use openraft::{
     StoredMembership,
 };
 use redb::{
-    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    Database, Durability, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition, WriteTransaction,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -158,6 +159,9 @@ openraft::declare_raft_types!(
 
 const STATE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STATE_ENVELOPE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_STATE_META_VALUE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STATE_VALUE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_STATE_KV_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SNAPSHOT_META_BYTES: usize = 1024 * 1024;
 const MAX_APPLY_ENTRIES: usize = 4096;
@@ -166,6 +170,16 @@ const STATE_FORMAT_VERSION: u16 = 1;
 const SNAPSHOT_FORMAT_VERSION: u16 = 1;
 
 const STATE_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state_meta");
+const STATE_KV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state_kv");
+const KEY_FORMAT: &[u8] = b"format_version";
+const KEY_CLUSTER_ID: &[u8] = b"cluster_id";
+const KEY_CLUSTER_INCARNATION: &[u8] = b"cluster_incarnation";
+const KEY_DB_EPOCH: &[u8] = b"db_epoch";
+const KEY_CATALOG_EPOCH: &[u8] = b"catalog_epoch";
+const KEY_LAST_APPLIED: &[u8] = b"last_applied";
+const KEY_CATALOG: &[u8] = b"catalog";
+const KEY_ORIGINS: &[u8] = b"origins";
+const KEY_MEMBERSHIP: &[u8] = b"membership";
 const KEY_STATE: &[u8] = b"state_envelope";
 const KEY_SNAPSHOT_META: &[u8] = b"snapshot_meta";
 const KEY_SNAPSHOT_DATA: &[u8] = b"snapshot_data";
@@ -700,63 +714,93 @@ fn initialize_or_validate(
     transaction
         .set_durability(Durability::Immediate)
         .map_err(state_redb_error)?;
-    let created = {
-        let mut table = transaction
+
+    let (legacy, has_physical, has_snapshot) = {
+        let table = transaction
             .open_table(STATE_META)
             .map_err(state_redb_error)?;
         for record in table.iter().map_err(state_redb_error)? {
             let (key, _) = record.map_err(state_redb_error)?;
-            let key = key.value();
-            if key != KEY_STATE
-                && key != KEY_SNAPSHOT_META
-                && key != KEY_SNAPSHOT_DATA
-                && key != KEY_SNAPSHOT_PUBLICATION
-            {
+            if !is_known_state_meta_key(key.value()) {
                 return Err(RedbStateMachineError::Corrupt(
                     "state storage contains an unknown metadata key".into(),
                 ));
             }
         }
-        let stored = table
+        let legacy = table
             .get(KEY_STATE)
             .map_err(state_redb_error)?
             .map(|value| value.value().to_vec());
-        match stored {
-            Some(bytes) => {
-                let envelope: DurableStateEnvelope =
-                    decode_bounded(&bytes, MAX_STATE_ENVELOPE_BYTES)
-                        .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
-                if envelope.cluster_id != cluster_id
-                    || envelope.cluster_incarnation != cluster_incarnation
-                {
-                    return Err(RedbStateMachineError::InvalidIdentity(
-                        "stored state-machine identity does not match requested cluster".into(),
-                    ));
-                }
-                validate_envelope(&envelope, cluster_id, cluster_incarnation)
-                    .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
-                false
-            }
-            None => {
-                if table.len().map_err(state_redb_error)? != 0 {
-                    return Err(RedbStateMachineError::Corrupt(
-                        "state envelope is missing from nonempty state storage".into(),
-                    ));
-                }
-                let envelope = initial_envelope(cluster_id, cluster_incarnation);
-                let bytes = encode_bounded(&envelope, MAX_STATE_ENVELOPE_BYTES)
-                    .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
-                table
-                    .insert(KEY_STATE, bytes.as_slice())
-                    .map_err(state_redb_error)?;
-                true
-            }
-        }
+        let has_physical = table
+            .iter()
+            .map_err(state_redb_error)?
+            .filter_map(|record| record.ok())
+            .any(|(key, _)| is_physical_state_meta_key(key.value()));
+        let has_snapshot = table
+            .iter()
+            .map_err(state_redb_error)?
+            .filter_map(|record| record.ok())
+            .any(|(key, _)| {
+                matches!(
+                    key.value(),
+                    KEY_SNAPSHOT_META | KEY_SNAPSHOT_DATA | KEY_SNAPSHOT_PUBLICATION
+                )
+            });
+        (legacy, has_physical, has_snapshot)
     };
-    if created {
-        transaction.commit().map_err(state_redb_error)
-    } else {
-        transaction.abort().map_err(state_redb_error)
+    let kv_len = {
+        let table = transaction.open_table(STATE_KV).map_err(state_redb_error)?;
+        table.len().map_err(state_redb_error)?
+    };
+
+    match legacy {
+        Some(bytes) => {
+            if has_physical || kv_len != 0 {
+                return Err(RedbStateMachineError::Corrupt(
+                    "legacy state envelope is mixed with physical state records".into(),
+                ));
+            }
+            let envelope: DurableStateEnvelope =
+                decode_bounded(&bytes, MAX_STATE_ENVELOPE_BYTES)
+                    .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
+            if envelope.cluster_id != cluster_id
+                || envelope.cluster_incarnation != cluster_incarnation
+            {
+                return Err(RedbStateMachineError::InvalidIdentity(
+                    "stored state-machine identity does not match requested cluster".into(),
+                ));
+            }
+            validate_envelope(&envelope, cluster_id, cluster_incarnation)
+                .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
+            write_state_records(&mut transaction, &envelope)
+                .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
+            transaction.commit().map_err(state_redb_error)
+        }
+        None if has_physical || kv_len != 0 => {
+            transaction.abort().map_err(state_redb_error)?;
+            let envelope = read_envelope(db)
+                .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
+            if envelope.cluster_id != cluster_id
+                || envelope.cluster_incarnation != cluster_incarnation
+            {
+                return Err(RedbStateMachineError::InvalidIdentity(
+                    "stored state-machine identity does not match requested cluster".into(),
+                ));
+            }
+            validate_envelope(&envelope, cluster_id, cluster_incarnation)
+                .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))
+        }
+        None => {
+            if has_snapshot {
+                return Err(RedbStateMachineError::Corrupt(
+                    "state snapshot metadata exists without a state image".into(),
+                ));
+            }
+            let envelope = initial_envelope(cluster_id, cluster_incarnation);
+            write_state_records(&mut transaction, &envelope)
+                .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
+            transaction.commit().map_err(state_redb_error)
+        }
     }
 }
 
@@ -778,27 +822,242 @@ fn initial_envelope(cluster_id: [u8; 16], cluster_incarnation: u64) -> DurableSt
     }
 }
 
-fn read_envelope(db: &Database) -> io::Result<DurableStateEnvelope> {
-    let transaction = db.begin_read().map_err(to_io)?;
+fn is_physical_state_meta_key(key: &[u8]) -> bool {
+    matches!(
+        key,
+        KEY_FORMAT
+            | KEY_CLUSTER_ID
+            | KEY_CLUSTER_INCARNATION
+            | KEY_DB_EPOCH
+            | KEY_CATALOG_EPOCH
+            | KEY_LAST_APPLIED
+            | KEY_CATALOG
+            | KEY_ORIGINS
+            | KEY_MEMBERSHIP
+    )
+}
+
+fn is_known_state_meta_key(key: &[u8]) -> bool {
+    is_physical_state_meta_key(key)
+        || matches!(
+            key,
+            KEY_STATE | KEY_SNAPSHOT_META | KEY_SNAPSHOT_DATA | KEY_SNAPSHOT_PUBLICATION
+        )
+}
+
+fn state_meta_records(
+    envelope: &DurableStateEnvelope,
+) -> io::Result<Vec<(&'static [u8], Vec<u8>)>> {
+    validate_envelope(envelope, envelope.cluster_id, envelope.cluster_incarnation)?;
+    let records = vec![
+        (
+            KEY_FORMAT,
+            encode_bounded(&STATE_FORMAT_VERSION, MAX_STATE_META_VALUE_BYTES)?,
+        ),
+        (
+            KEY_CLUSTER_ID,
+            encode_bounded(&envelope.cluster_id, MAX_STATE_META_VALUE_BYTES)?,
+        ),
+        (
+            KEY_CLUSTER_INCARNATION,
+            encode_bounded(&envelope.cluster_incarnation, MAX_STATE_META_VALUE_BYTES)?,
+        ),
+        (
+            KEY_DB_EPOCH,
+            encode_bounded(&envelope.state.db_epoch, MAX_STATE_META_VALUE_BYTES)?,
+        ),
+        (
+            KEY_CATALOG_EPOCH,
+            encode_bounded(&envelope.state.catalog_epoch, MAX_STATE_META_VALUE_BYTES)?,
+        ),
+        (
+            KEY_LAST_APPLIED,
+            encode_bounded(&envelope.last_applied, MAX_STATE_META_VALUE_BYTES)?,
+        ),
+        (
+            KEY_CATALOG,
+            encode_bounded(&envelope.state.catalog, MAX_STATE_META_VALUE_BYTES)?,
+        ),
+        (
+            KEY_ORIGINS,
+            encode_bounded(&envelope.state.origins, MAX_STATE_META_VALUE_BYTES)?,
+        ),
+        (
+            KEY_MEMBERSHIP,
+            encode_bounded(&envelope.membership, MAX_STATE_META_VALUE_BYTES)?,
+        ),
+    ];
+    Ok(records)
+}
+
+fn read_meta_record<T: DeserializeOwned>(
+    transaction: &ReadTransaction,
+    key: &[u8],
+) -> io::Result<T> {
     let table = transaction.open_table(STATE_META).map_err(to_io)?;
     let bytes = table
+        .get(key)
+        .map_err(to_io)?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| io_other(format!("state metadata record {:?} is missing", key)))?;
+    decode_bounded(&bytes, MAX_STATE_META_VALUE_BYTES)
+}
+
+fn read_state_records(transaction: &ReadTransaction) -> io::Result<DurableStateEnvelope> {
+    let table = transaction.open_table(STATE_META).map_err(to_io)?;
+    for record in table.iter().map_err(to_io)? {
+        let (key, _) = record.map_err(to_io)?;
+        if !is_known_state_meta_key(key.value()) {
+            return Err(io_other(format!(
+                "state storage contains unknown metadata key {:?}",
+                String::from_utf8_lossy(key.value())
+            )));
+        }
+    }
+    if let Some(bytes) = table
         .get(KEY_STATE)
         .map_err(to_io)?
         .map(|value| value.value().to_vec())
-        .ok_or_else(|| io_other("durable state envelope is missing"))?;
-    decode_bounded(&bytes, MAX_STATE_ENVELOPE_BYTES)
+    {
+        return decode_bounded(&bytes, MAX_STATE_ENVELOPE_BYTES);
+    }
+    drop(table);
+
+    let format_version: u16 = read_meta_record(transaction, KEY_FORMAT)?;
+    let cluster_id: [u8; 16] = read_meta_record(transaction, KEY_CLUSTER_ID)?;
+    let cluster_incarnation: u64 = read_meta_record(transaction, KEY_CLUSTER_INCARNATION)?;
+    let db_epoch: u64 = read_meta_record(transaction, KEY_DB_EPOCH)?;
+    let catalog_epoch: u64 = read_meta_record(transaction, KEY_CATALOG_EPOCH)?;
+    let last_applied: Option<LogId<u64>> = read_meta_record(transaction, KEY_LAST_APPLIED)?;
+    let catalog = read_meta_record(transaction, KEY_CATALOG)?;
+    let origins = read_meta_record(transaction, KEY_ORIGINS)?;
+    let membership: StoredMembership<u64, BasicNode> =
+        read_meta_record(transaction, KEY_MEMBERSHIP)?;
+
+    let mut kv = std::collections::BTreeMap::new();
+    let mut total_bytes = 0usize;
+    let table = transaction.open_table(STATE_KV).map_err(to_io)?;
+    for record in table.iter().map_err(to_io)? {
+        let (key, value) = record.map_err(to_io)?;
+        let key = key.value();
+        let value = value.value();
+        if key.is_empty() || key.len() > chorus_common::MAX_KEY_BYTES {
+            return Err(io_other("state KV key exceeds configured bound"));
+        }
+        if value.len() > MAX_STATE_VALUE_BYTES {
+            return Err(io_other("state KV value exceeds configured bound"));
+        }
+        total_bytes = total_bytes
+            .checked_add(key.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .ok_or_else(|| io_other("state KV byte count overflow"))?;
+        if total_bytes > MAX_STATE_KV_BYTES {
+            return Err(io_other("state KV exceeds configured logical bound"));
+        }
+        if kv.insert(key.to_vec(), value.to_vec()).is_some() {
+            return Err(io_other("state KV contains a duplicate key"));
+        }
+    }
+    drop(table);
+
+    let last_applied_chorus = last_applied
+        .as_ref()
+        .map(to_chorus_log_id)
+        .unwrap_or(ChorusLogId::ZERO);
+    let (voters, learners) = match membership.log_id() {
+        Some(_) => flat_membership(membership.membership()),
+        None => (Vec::new(), Vec::new()),
+    };
+    let membership_log_id = membership
+        .log_id()
+        .as_ref()
+        .map(to_chorus_log_id)
+        .unwrap_or(ChorusLogId::ZERO);
+    Ok(DurableStateEnvelope {
+        format_version,
+        cluster_id,
+        cluster_incarnation,
+        state: StateData {
+            format_version: 1,
+            cluster_id,
+            cluster_incarnation,
+            db_epoch,
+            catalog_epoch,
+            last_applied: last_applied_chorus,
+            catalog,
+            kv,
+            origins,
+            membership: ChorusMembership {
+                log_id: membership_log_id,
+                voters,
+                learners,
+            },
+        },
+        last_applied,
+        membership,
+    })
+}
+
+fn write_state_records(
+    transaction: &mut WriteTransaction,
+    envelope: &DurableStateEnvelope,
+) -> io::Result<()> {
+    let records = state_meta_records(envelope)?;
+    let mut total_bytes = 0usize;
+    for (key, value) in &envelope.state.kv {
+        if key.is_empty() || key.len() > chorus_common::MAX_KEY_BYTES {
+            return Err(io_other("state KV key exceeds configured bound"));
+        }
+        if value.len() > MAX_STATE_VALUE_BYTES {
+            return Err(io_other("state KV value exceeds configured bound"));
+        }
+        total_bytes = total_bytes
+            .checked_add(key.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .ok_or_else(|| io_other("state KV byte count overflow"))?;
+        if total_bytes > MAX_STATE_KV_BYTES {
+            return Err(io_other("state KV exceeds configured logical bound"));
+        }
+    }
+    {
+        let mut table = transaction.open_table(STATE_META).map_err(to_io)?;
+        for (key, value) in records {
+            table.insert(key, value.as_slice()).map_err(to_io)?;
+        }
+        // This key is accepted solely for one-time migration and must never
+        // remain authoritative after a physical image is published.
+        table.remove(KEY_STATE).map_err(to_io)?;
+    }
+    {
+        let mut table = transaction.open_table(STATE_KV).map_err(to_io)?;
+        let old_keys: Vec<Vec<u8>> = table
+            .iter()
+            .map_err(to_io)?
+            .map(|record| record.map(|(key, _)| key.value().to_vec()).map_err(to_io))
+            .collect::<io::Result<Vec<_>>>()?;
+        for key in old_keys {
+            table.remove(key.as_slice()).map_err(to_io)?;
+        }
+        for (key, value) in &envelope.state.kv {
+            table
+                .insert(key.as_slice(), value.as_slice())
+                .map_err(to_io)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_envelope(db: &Database) -> io::Result<DurableStateEnvelope> {
+    let transaction = db.begin_read().map_err(to_io)?;
+    read_state_records(&transaction)
 }
 
 fn write_envelope(db: &Database, envelope: &DurableStateEnvelope) -> io::Result<()> {
-    let bytes = encode_bounded(envelope, MAX_STATE_ENVELOPE_BYTES)?;
     let mut transaction = db.begin_write().map_err(to_io)?;
     transaction
         .set_durability(Durability::Immediate)
         .map_err(to_io)?;
-    {
-        let mut table = transaction.open_table(STATE_META).map_err(to_io)?;
-        table.insert(KEY_STATE, bytes.as_slice()).map_err(to_io)?;
-    }
+    write_state_records(&mut transaction, envelope)?;
     transaction.commit().map_err(to_io)
 }
 
@@ -865,7 +1124,6 @@ fn write_envelope_and_snapshot(
     envelope: &DurableStateEnvelope,
     snapshot: &CachedSnapshot,
 ) -> io::Result<()> {
-    let state = encode_bounded(envelope, MAX_STATE_ENVELOPE_BYTES)?;
     let meta = encode_bounded(&snapshot.meta, MAX_SNAPSHOT_META_BYTES)?;
     let publication = encode_bounded(&snapshot.publication, MAX_SNAPSHOT_META_BYTES)?;
     if snapshot.bytes.is_empty() || snapshot.bytes.len() > MAX_SNAPSHOT_BYTES {
@@ -875,9 +1133,9 @@ fn write_envelope_and_snapshot(
     transaction
         .set_durability(Durability::Immediate)
         .map_err(to_io)?;
+    write_state_records(&mut transaction, envelope)?;
     {
         let mut table = transaction.open_table(STATE_META).map_err(to_io)?;
-        table.insert(KEY_STATE, state.as_slice()).map_err(to_io)?;
         table
             .insert(KEY_SNAPSHOT_META, meta.as_slice())
             .map_err(to_io)?;
@@ -1398,6 +1656,97 @@ mod tests {
             RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION),
             Err(RedbStateMachineError::Corrupt(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn state_uses_versioned_meta_and_ordered_kv_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let state_machine = RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION).unwrap();
+        drop(state_machine);
+
+        {
+            let db = redb::Builder::new()
+                .set_cache_size(STATE_CACHE_BYTES)
+                .open(&path)
+                .unwrap();
+            let tx = db.begin_read().unwrap();
+            let meta = tx.open_table(STATE_META).unwrap();
+            assert!(meta.get(KEY_STATE).unwrap().is_none());
+            for key in [
+                KEY_FORMAT,
+                KEY_CLUSTER_ID,
+                KEY_CLUSTER_INCARNATION,
+                KEY_DB_EPOCH,
+                KEY_CATALOG_EPOCH,
+                KEY_LAST_APPLIED,
+                KEY_CATALOG,
+                KEY_ORIGINS,
+                KEY_MEMBERSHIP,
+            ] {
+                assert!(meta.get(key).unwrap().is_some(), "missing {:?}", key);
+            }
+            let kv = tx.open_table(STATE_KV).unwrap();
+            assert_eq!(0, kv.len().unwrap());
+        }
+
+        // Simulate an already-published physical KV record and ensure the
+        // reader reconstructs it without falling back to a monolithic value.
+        {
+            let db = redb::Builder::new()
+                .set_cache_size(STATE_CACHE_BYTES)
+                .open(&path)
+                .unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.set_durability(Durability::Immediate).unwrap();
+            {
+                let mut kv = tx.open_table(STATE_KV).unwrap();
+                kv.insert(&[0x30, 0x01][..], b"value".as_slice()).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let reopened = RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION).unwrap();
+        assert_eq!(
+            Some(&b"value"[..]),
+            reopened.state_snapshot().unwrap().get(&[0x30, 0x01])
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_state_envelope_migrates_atomically_to_physical_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.redb");
+        let envelope = initial_envelope(CLUSTER_ID, INCARNATION);
+        let encoded = encode_bounded(&envelope, MAX_STATE_ENVELOPE_BYTES).unwrap();
+        {
+            let db = redb::Builder::new()
+                .set_cache_size(STATE_CACHE_BYTES)
+                .create(&path)
+                .unwrap();
+            let mut tx = db.begin_write().unwrap();
+            tx.set_durability(Durability::Immediate).unwrap();
+            {
+                let mut meta = tx.open_table(STATE_META).unwrap();
+                meta.insert(KEY_STATE, encoded.as_slice()).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let migrated = RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION).unwrap();
+        assert_eq!(
+            ChorusLogId::ZERO,
+            migrated.state_snapshot().unwrap().last_applied()
+        );
+        drop(migrated);
+        let db = redb::Builder::new()
+            .set_cache_size(STATE_CACHE_BYTES)
+            .open(&path)
+            .unwrap();
+        let tx = db.begin_read().unwrap();
+        let meta = tx.open_table(STATE_META).unwrap();
+        assert!(meta.get(KEY_STATE).unwrap().is_none());
+        assert!(meta.get(KEY_FORMAT).unwrap().is_some());
+        assert_eq!(0, tx.open_table(STATE_KV).unwrap().len().unwrap());
     }
 
     #[tokio::test]

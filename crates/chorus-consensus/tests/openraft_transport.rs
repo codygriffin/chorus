@@ -7,9 +7,9 @@ use chorus_consensus::openraft_transport::wire::open_raft_transport_client::Open
 use chorus_consensus::openraft_transport::wire::open_raft_transport_server::OpenRaftTransport;
 use chorus_consensus::openraft_transport::{
     MAX_RPC_PAYLOAD_BYTES, MAX_SNAPSHOT_CHUNK_BYTES, PeerAuthenticator, PeerTlsConfig, RpcMethod,
-    TransportTlsIdentity, authenticated_server_builder, bounded_transport_server,
-    connect_authenticated, envelope, leaf_fingerprint, validate_response_envelope,
-    validate_snapshot_chunk_size,
+    RpcPayloadDomain, TransportTlsIdentity, authenticated_server_builder, bounded_transport_server,
+    connect_authenticated, decode_rpc_payload, encode_rpc_payload, envelope, leaf_fingerprint,
+    validate_response_envelope, validate_snapshot_chunk_size,
 };
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -21,8 +21,40 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
+#[derive(Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct CodecProbe {
+    sequence: u64,
+    bytes: Vec<u8>,
+}
+
 const CLUSTER_ID: [u8; 16] = [0x71; 16];
 const INCARNATION: u64 = 9;
+
+#[test]
+fn rpc_payload_codec_is_bounded_domain_separated_and_exact() {
+    let probe = CodecProbe {
+        sequence: 17,
+        bytes: b"deterministic".to_vec(),
+    };
+    let encoded = encode_rpc_payload(RpcPayloadDomain::VoteRequest, &probe).unwrap();
+    let decoded: CodecProbe = decode_rpc_payload(RpcPayloadDomain::VoteRequest, &encoded).unwrap();
+    assert_eq!(probe, decoded);
+    assert!(decode_rpc_payload::<CodecProbe>(RpcPayloadDomain::VoteResponse, &encoded).is_err());
+
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    assert!(decode_rpc_payload::<CodecProbe>(RpcPayloadDomain::VoteRequest, &trailing).is_err());
+    let mut corrupt = encoded;
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 1;
+    assert!(decode_rpc_payload::<CodecProbe>(RpcPayloadDomain::VoteRequest, &corrupt).is_err());
+
+    let oversized = CodecProbe {
+        sequence: 18,
+        bytes: vec![0xff; MAX_RPC_PAYLOAD_BYTES],
+    };
+    assert!(encode_rpc_payload(RpcPayloadDomain::VoteRequest, &oversized).is_err());
+}
 
 struct TestCa {
     certificate: Certificate,

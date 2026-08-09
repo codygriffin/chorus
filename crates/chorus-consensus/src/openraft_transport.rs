@@ -6,16 +6,27 @@
 //! depend on that future codec change.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chorus_codec::{MAX_COMMAND_BYTES, encode_command};
+use chorus_redb::ChorusRaftConfig;
+use openraft::error::{Fatal, InstallSnapshotError, RaftError};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
+use openraft::{EntryPayload, Raft};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
-use tonic::Request;
 use tonic::Status;
 use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tonic::transport::{
     Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
 };
+use tonic::{Request, Response};
 
 pub mod wire {
     tonic::include_proto!("chorus.consensus.openraft");
@@ -25,7 +36,201 @@ pub const TRANSPORT_WIRE_VERSION: u32 = 1;
 pub const MAX_RPC_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RPC_PAYLOAD_BYTES: usize = MAX_RPC_MESSAGE_BYTES - 1024;
 pub const MAX_SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
+pub const MAX_APPEND_ENTRIES: usize = 4096;
 pub const RPC_QUEUE_CAPACITY: usize = 128;
+const RPC_PAYLOAD_MAGIC: &[u8; 8] = b"CHRFRPC\0";
+const RPC_PAYLOAD_VERSION: u8 = 1;
+const RPC_PAYLOAD_HEADER_BYTES: usize = RPC_PAYLOAD_MAGIC.len() + 1 + 1 + 4;
+const RPC_PAYLOAD_DIGEST_BYTES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RpcPayloadDomain {
+    VoteRequest = 1,
+    VoteResponse = 2,
+    AppendEntriesRequest = 3,
+    AppendEntriesResponse = 4,
+    InstallSnapshotRequest = 5,
+    InstallSnapshotResponse = 6,
+}
+
+impl RpcPayloadDomain {
+    fn decode(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::VoteRequest),
+            2 => Some(Self::VoteResponse),
+            3 => Some(Self::AppendEntriesRequest),
+            4 => Some(Self::AppendEntriesResponse),
+            5 => Some(Self::InstallSnapshotRequest),
+            6 => Some(Self::InstallSnapshotResponse),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RpcCodecError {
+    #[error("RPC payload exceeds the configured limit")]
+    Limit,
+    #[error("invalid RPC payload: {0}")]
+    Invalid(String),
+    #[error("RPC payload serialization failed: {0}")]
+    Serialization(String),
+}
+
+struct CappedWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl CappedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(4096)),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for CappedWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let end = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("RPC payload length overflow"))?;
+        if end > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::other("RPC payload exceeds configured limit"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Encode one strongly domain-separated OpenRaft payload without allowing
+/// serde to grow an intermediate allocation beyond the transport limit.
+pub fn encode_rpc_payload<T: Serialize>(
+    domain: RpcPayloadDomain,
+    value: &T,
+) -> Result<Vec<u8>, RpcCodecError> {
+    let body_limit = MAX_RPC_PAYLOAD_BYTES
+        .checked_sub(RPC_PAYLOAD_HEADER_BYTES + RPC_PAYLOAD_DIGEST_BYTES)
+        .ok_or(RpcCodecError::Limit)?;
+    let mut writer = CappedWriter::new(body_limit);
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        return Err(if writer.exceeded {
+            RpcCodecError::Limit
+        } else {
+            RpcCodecError::Serialization(error.to_string())
+        });
+    }
+    let body_len = u32::try_from(writer.bytes.len()).map_err(|_| RpcCodecError::Limit)?;
+    let mut encoded = Vec::with_capacity(
+        RPC_PAYLOAD_HEADER_BYTES + writer.bytes.len() + RPC_PAYLOAD_DIGEST_BYTES,
+    );
+    encoded.extend_from_slice(RPC_PAYLOAD_MAGIC);
+    encoded.push(RPC_PAYLOAD_VERSION);
+    encoded.push(domain as u8);
+    encoded.extend_from_slice(&body_len.to_be_bytes());
+    encoded.extend_from_slice(&writer.bytes);
+    encoded.extend_from_slice(&Sha256::digest(&writer.bytes));
+    debug_assert!(encoded.len() <= MAX_RPC_PAYLOAD_BYTES);
+    Ok(encoded)
+}
+
+/// Decode one bounded frame, rejecting wrong domains, unknown versions,
+/// corrupt lengths/checksums, and trailing JSON tokens.
+pub fn decode_rpc_payload<T: DeserializeOwned>(
+    expected_domain: RpcPayloadDomain,
+    encoded: &[u8],
+) -> Result<T, RpcCodecError> {
+    if encoded.len() > MAX_RPC_PAYLOAD_BYTES {
+        return Err(RpcCodecError::Limit);
+    }
+    let minimum = RPC_PAYLOAD_HEADER_BYTES + RPC_PAYLOAD_DIGEST_BYTES;
+    if encoded.len() < minimum || &encoded[..RPC_PAYLOAD_MAGIC.len()] != RPC_PAYLOAD_MAGIC {
+        return Err(RpcCodecError::Invalid("bad payload magic or length".into()));
+    }
+    let version_offset = RPC_PAYLOAD_MAGIC.len();
+    if encoded[version_offset] != RPC_PAYLOAD_VERSION {
+        return Err(RpcCodecError::Invalid("unsupported payload version".into()));
+    }
+    let domain = RpcPayloadDomain::decode(encoded[version_offset + 1])
+        .ok_or_else(|| RpcCodecError::Invalid("unknown payload domain".into()))?;
+    if domain != expected_domain {
+        return Err(RpcCodecError::Invalid("payload domain mismatch".into()));
+    }
+    let length_offset = version_offset + 2;
+    let body_len = u32::from_be_bytes(
+        encoded[length_offset..length_offset + 4]
+            .try_into()
+            .map_err(|_| RpcCodecError::Invalid("missing payload length".into()))?,
+    ) as usize;
+    let body_start = RPC_PAYLOAD_HEADER_BYTES;
+    let body_end = body_start
+        .checked_add(body_len)
+        .ok_or_else(|| RpcCodecError::Invalid("payload length overflow".into()))?;
+    let expected_len = body_end
+        .checked_add(RPC_PAYLOAD_DIGEST_BYTES)
+        .ok_or_else(|| RpcCodecError::Invalid("payload length overflow".into()))?;
+    if expected_len != encoded.len() {
+        return Err(RpcCodecError::Invalid(
+            "payload length or trailing bytes mismatch".into(),
+        ));
+    }
+    let body = &encoded[body_start..body_end];
+    if Sha256::digest(body).as_slice() != &encoded[body_end..] {
+        return Err(RpcCodecError::Invalid("payload checksum mismatch".into()));
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let value = T::deserialize(&mut deserializer)
+        .map_err(|error| RpcCodecError::Invalid(error.to_string()))?;
+    deserializer
+        .end()
+        .map_err(|error| RpcCodecError::Invalid(format!("trailing JSON: {error}")))?;
+    Ok(value)
+}
+
+type VoteWireResult = Result<VoteResponse<u64>, Fatal<u64>>;
+type AppendWireResult = Result<AppendEntriesResponse<u64>, Fatal<u64>>;
+type SnapshotWireResult =
+    Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>>;
+
+fn validate_append_request(
+    request: &AppendEntriesRequest<ChorusRaftConfig>,
+) -> Result<(), RpcCodecError> {
+    if request.entries.len() > MAX_APPEND_ENTRIES {
+        return Err(RpcCodecError::Limit);
+    }
+    for entry in &request.entries {
+        if let EntryPayload::Normal(command) = &entry.payload {
+            let encoded = encode_command(command).map_err(|error| match error {
+                chorus_codec::CodecError::Limit(_) => RpcCodecError::Limit,
+                other => RpcCodecError::Invalid(other.to_string()),
+            })?;
+            if encoded.len() > MAX_COMMAND_BYTES + 5 {
+                return Err(RpcCodecError::Limit);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn codec_status(error: RpcCodecError) -> Status {
+    match error {
+        RpcCodecError::Limit => Status::resource_exhausted(error.to_string()),
+        RpcCodecError::Invalid(_) | RpcCodecError::Serialization(_) => {
+            Status::invalid_argument(error.to_string())
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RpcMethod {
@@ -189,6 +394,112 @@ impl PeerAuthenticator {
             ));
         }
         Ok(peer.node_id)
+    }
+}
+
+/// Authenticated server-side bridge from the bounded Tonic envelope to one
+/// concrete Chorus OpenRaft instance.
+///
+/// Peer certificate and envelope identity are checked before decoding or
+/// invoking OpenRaft. This type is intentionally not wired into `chorus-node`
+/// until the matching network factory has passed its transport gates.
+#[derive(Clone)]
+pub struct AuthenticatedRaftService {
+    raft: Raft<ChorusRaftConfig>,
+    identity: Arc<TransportTlsIdentity>,
+    authenticator: PeerAuthenticator,
+}
+
+impl AuthenticatedRaftService {
+    pub fn new(
+        raft: Raft<ChorusRaftConfig>,
+        identity: Arc<TransportTlsIdentity>,
+    ) -> Result<Self, TransportConfigError> {
+        let authenticator = PeerAuthenticator::new(Arc::clone(&identity))?;
+        Ok(Self {
+            raft,
+            identity,
+            authenticator,
+        })
+    }
+
+    fn response(
+        &self,
+        target_node_id: u64,
+        payload: Vec<u8>,
+    ) -> Result<Response<wire::Envelope>, Status> {
+        envelope(&self.identity, target_node_id, payload)
+            .map(Response::new)
+            .map_err(|error| Status::internal(error.to_string()))
+    }
+}
+
+fn fatal_only<T>(result: Result<T, RaftError<u64>>) -> Result<T, Fatal<u64>> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(RaftError::Fatal(error)) => Err(error),
+        Err(RaftError::APIError(never)) => match never {},
+    }
+}
+
+#[tonic::async_trait]
+impl wire::open_raft_transport_server::OpenRaftTransport for AuthenticatedRaftService {
+    async fn vote(
+        &self,
+        request: Request<wire::Envelope>,
+    ) -> Result<Response<wire::Envelope>, Status> {
+        let source =
+            self.authenticator
+                .authenticate(&request, request.get_ref(), RpcMethod::Vote)?;
+        let rpc: VoteRequest<u64> =
+            decode_rpc_payload(RpcPayloadDomain::VoteRequest, &request.into_inner().payload)
+                .map_err(codec_status)?;
+        let result: VoteWireResult = fatal_only(self.raft.vote(rpc).await);
+        let payload =
+            encode_rpc_payload(RpcPayloadDomain::VoteResponse, &result).map_err(codec_status)?;
+        self.response(source, payload)
+    }
+
+    async fn append_entries(
+        &self,
+        request: Request<wire::Envelope>,
+    ) -> Result<Response<wire::Envelope>, Status> {
+        let source = self.authenticator.authenticate(
+            &request,
+            request.get_ref(),
+            RpcMethod::AppendEntries,
+        )?;
+        let rpc: AppendEntriesRequest<ChorusRaftConfig> = decode_rpc_payload(
+            RpcPayloadDomain::AppendEntriesRequest,
+            &request.into_inner().payload,
+        )
+        .map_err(codec_status)?;
+        validate_append_request(&rpc).map_err(codec_status)?;
+        let result: AppendWireResult = fatal_only(self.raft.append_entries(rpc).await);
+        let payload = encode_rpc_payload(RpcPayloadDomain::AppendEntriesResponse, &result)
+            .map_err(codec_status)?;
+        self.response(source, payload)
+    }
+
+    async fn install_snapshot(
+        &self,
+        request: Request<wire::Envelope>,
+    ) -> Result<Response<wire::Envelope>, Status> {
+        let source = self.authenticator.authenticate(
+            &request,
+            request.get_ref(),
+            RpcMethod::InstallSnapshot,
+        )?;
+        let rpc: InstallSnapshotRequest<ChorusRaftConfig> = decode_rpc_payload(
+            RpcPayloadDomain::InstallSnapshotRequest,
+            &request.into_inner().payload,
+        )
+        .map_err(codec_status)?;
+        validate_snapshot_chunk_size(rpc.data.len())?;
+        let result: SnapshotWireResult = self.raft.install_snapshot(rpc).await;
+        let payload = encode_rpc_payload(RpcPayloadDomain::InstallSnapshotResponse, &result)
+            .map_err(codec_status)?;
+        self.response(source, payload)
     }
 }
 

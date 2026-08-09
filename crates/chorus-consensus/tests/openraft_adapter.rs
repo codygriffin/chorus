@@ -6,6 +6,8 @@ use chorus_codec::{
 };
 use chorus_common::{LogId, OriginId, RequestId};
 use chorus_consensus::{Consensus, OpenRaftConsensus};
+use chorus_redb::{ChorusRaftConfig, RedbStateMachine};
+use openraft::storage::RaftStateMachine;
 
 const CLUSTER_ID: [u8; 16] = [0x63; 16];
 const INCARNATION: u64 = 7;
@@ -93,7 +95,27 @@ fn committed_state_is_linearizable_read_only_and_durable_across_reopen() {
             .contains("submit the command through OpenRaft")
     );
     drop(store);
+    consensus.checkpoint().unwrap();
     drop(consensus);
+
+    let state_machine =
+        RedbStateMachine::open(root.path().join("state.redb"), CLUSTER_ID, INCARNATION).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let snapshot = runtime.block_on(async move {
+        let mut state_machine = state_machine;
+        <RedbStateMachine as RaftStateMachine<ChorusRaftConfig>>::get_current_snapshot(
+            &mut state_machine,
+        )
+        .await
+        .unwrap()
+    });
+    let snapshot = snapshot.expect("checkpoint must publish a durable snapshot");
+    assert!(snapshot.meta.last_log_id.is_some_and(|log_id| {
+        log_id.index >= first_log.index && log_id.leader_id.term >= first_log.term
+    }));
 
     let reopened = open(root.path(), false).unwrap();
     assert_eq!(Some(&b"v1"[..]), reopened.read_barrier().unwrap().get(b"k"));

@@ -27,7 +27,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::storage::RaftLogStorage;
-use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
+use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy, metrics::Metric};
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -335,6 +335,15 @@ impl OpenRaftConsensus {
     fn status_result(&self) -> Result<ConsensusStatus> {
         self.send(|response| RuntimeRequest::Status { response })
     }
+
+    /// Force a bounded durable state-machine checkpoint before an orderly
+    /// shutdown.  This triggers OpenRaft's snapshot builder and waits until
+    /// the snapshot metadata reaches the last applied cursor.  Leader
+    /// transfer is intentionally not implied: OpenRaft 0.9.25 exposes no
+    /// public transfer-leadership API.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.send(|response| RuntimeRequest::Checkpoint { response })
+    }
 }
 
 impl Consensus for OpenRaftConsensus {
@@ -434,6 +443,9 @@ enum RuntimeRequest {
     },
     Status {
         response: std_mpsc::SyncSender<Result<ConsensusStatus>>,
+    },
+    Checkpoint {
+        response: std_mpsc::SyncSender<Result<()>>,
     },
     Shutdown {
         response: std_mpsc::SyncSender<()>,
@@ -737,7 +749,20 @@ async fn run_runtime(
                     learners,
                 }));
             }
+            RuntimeRequest::Checkpoint { response } => {
+                let result = checkpoint_runtime(&raft).await;
+                let _ = response.send(result);
+            }
             RuntimeRequest::Shutdown { response } => {
+                let checkpoint = tokio::time::timeout(SHUTDOWN_TIMEOUT, checkpoint_runtime(&raft))
+                    .await
+                    .map_err(|_| {
+                        ChorusError::Consensus("OpenRaft shutdown checkpoint timed out".into())
+                    })
+                    .and_then(|result| result);
+                if let Err(error) = checkpoint {
+                    eprintln!("OpenRaft checkpoint before shutdown failed: {error}");
+                }
                 stop_transport_server(&mut server_shutdown, &mut server_task).await;
                 let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, raft.shutdown()).await;
                 let _ = response.send(());
@@ -745,8 +770,39 @@ async fn run_runtime(
             }
         }
     }
+    if let Err(error) = checkpoint_runtime(&raft).await {
+        eprintln!("OpenRaft checkpoint before runtime exit failed: {error}");
+    }
     stop_transport_server(&mut server_shutdown, &mut server_task).await;
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, raft.shutdown()).await;
+}
+
+async fn checkpoint_runtime(raft: &ChorusRaft) -> Result<()> {
+    let target = raft.metrics().borrow().last_applied;
+    let Some(target) = target else {
+        return Ok(());
+    };
+    let current_snapshot = raft.metrics().borrow().snapshot;
+    if current_snapshot.is_some_and(|snapshot| snapshot >= target) {
+        return Ok(());
+    }
+    tokio::time::timeout(OPERATION_TIMEOUT, async {
+        raft.trigger()
+            .snapshot()
+            .await
+            .map_err(|error| ChorusError::Consensus(error.to_string()))?;
+        raft.wait(Some(OPERATION_TIMEOUT))
+            .ge(
+                Metric::Snapshot(Some(target)),
+                "OpenRaft durable checkpoint",
+            )
+            .await
+            .map_err(|error| ChorusError::Consensus(error.to_string()))?;
+        Ok::<(), ChorusError>(())
+    })
+    .await
+    .map_err(|_| ChorusError::Consensus("OpenRaft checkpoint timed out".into()))??;
+    Ok(())
 }
 
 async fn write_with_forwarding(

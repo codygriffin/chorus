@@ -8,6 +8,7 @@
 use std::io::{self, Cursor, SeekFrom};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::task::{Context, Poll};
 
@@ -240,6 +241,7 @@ pub enum RedbStateMachineError {
 pub struct RedbStateMachine {
     db: Arc<Database>,
     write_lock: Arc<Mutex<()>>,
+    healthy: Arc<AtomicBool>,
     current_snapshot: Arc<RwLock<Option<CachedSnapshot>>>,
     purge_fence: Option<PurgeFenceHandle<ChorusRaftConfig>>,
     cluster_id: [u8; 16],
@@ -297,6 +299,7 @@ impl RedbStateMachine {
         let mut state_machine = Self {
             db: Arc::new(db),
             write_lock: Arc::new(Mutex::new(())),
+            healthy: Arc::new(AtomicBool::new(true)),
             current_snapshot: Arc::new(RwLock::new(None)),
             purge_fence,
             cluster_id,
@@ -362,7 +365,31 @@ impl RedbStateMachine {
         self.cluster_incarnation
     }
 
+    /// Returns whether this process-local state-machine instance is still
+    /// usable.  A failed apply is fail-closed: callers must reopen the
+    /// durable database rather than continue serving from a potentially
+    /// divergent in-memory projection.
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    fn mark_unhealthy(&self) {
+        self.healthy.store(false, Ordering::Release);
+    }
+
+    fn require_healthy(&self) -> io::Result<()> {
+        if self.is_healthy() {
+            Ok(())
+        } else {
+            Err(io_other(
+                "state-machine is unhealthy after an apply failure; reopen is required",
+            ))
+        }
+    }
+
     pub fn state_data(&self) -> Result<StateData, RedbStateMachineError> {
+        self.require_healthy()
+            .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
         self.read_envelope()
             .map(|envelope| envelope.state)
             .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))
@@ -378,6 +405,8 @@ impl RedbStateMachine {
     pub fn exact_membership(
         &self,
     ) -> Result<StoredMembership<u64, BasicNode>, RedbStateMachineError> {
+        self.require_healthy()
+            .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))?;
         self.read_envelope()
             .map(|envelope| envelope.membership)
             .map_err(|error| RedbStateMachineError::Corrupt(error.to_string()))
@@ -485,6 +514,7 @@ impl RedbStateMachine {
     }
 
     fn build_snapshot_record(&self) -> io::Result<CachedSnapshot> {
+        self.require_healthy()?;
         let _guard = self.lock_writes()?;
         let envelope = self.read_envelope()?;
         let last_applied = envelope
@@ -545,6 +575,7 @@ impl RedbStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         bytes: Vec<u8>,
     ) -> io::Result<()> {
+        self.require_healthy()?;
         let payload =
             decode_and_validate_snapshot(meta, &bytes, self.cluster_id, self.cluster_incarnation)?;
 
@@ -646,6 +677,7 @@ impl RaftStateMachine<ChorusRaftConfig> for RedbStateMachine {
     async fn applied_state(
         &mut self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
+        self.require_healthy().map_err(state_machine_read_error)?;
         let envelope = self.read_envelope().map_err(state_machine_read_error)?;
         Ok((envelope.last_applied, envelope.membership))
     }
@@ -655,14 +687,23 @@ impl RaftStateMachine<ChorusRaftConfig> for RedbStateMachine {
         I: IntoIterator<Item = openraft::Entry<ChorusRaftConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        if let Err(error) = self.require_healthy() {
+            return Err(state_machine_write_error(error));
+        }
         let mut iterator = entries.into_iter();
         let entries: Vec<_> = iterator.by_ref().take(MAX_APPLY_ENTRIES + 1).collect();
         if entries.len() > MAX_APPLY_ENTRIES {
-            return Err(state_machine_write_error(io_other(
-                "state-machine apply batch exceeds entry-count limit",
-            )));
+            let error = io_other("state-machine apply batch exceeds entry-count limit");
+            self.mark_unhealthy();
+            return Err(state_machine_write_error(error));
         }
-        self.apply_batch(entries).map_err(state_machine_write_error)
+        match self.apply_batch(entries) {
+            Ok(responses) => Ok(responses),
+            Err(error) => {
+                self.mark_unhealthy();
+                Err(state_machine_write_error(error))
+            }
+        }
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -674,6 +715,7 @@ impl RaftStateMachine<ChorusRaftConfig> for RedbStateMachine {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<BoundedSnapshotData>, StorageError<u64>> {
+        self.require_healthy().map_err(state_machine_write_error)?;
         Ok(Box::new(BoundedSnapshotData::empty()))
     }
 
@@ -689,6 +731,7 @@ impl RaftStateMachine<ChorusRaftConfig> for RedbStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<ChorusRaftConfig>>, StorageError<u64>> {
+        self.require_healthy().map_err(state_machine_read_error)?;
         let cached = self
             .current_snapshot
             .read()
@@ -1900,7 +1943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_batch_does_not_publish_staged_state_or_cursor() {
+    async fn failed_batch_latches_unhealthy_without_publishing_state_or_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.redb");
         let origin = OriginId {
@@ -1920,15 +1963,21 @@ mod tests {
             .await
             .is_err()
         );
-        let (last_applied, stored) = applied(&mut state_machine).await;
-        assert_eq!(Some(LogId::default()), last_applied);
-        assert_eq!(&Some(LogId::default()), stored.log_id());
-        assert!(!state_machine.state_data().unwrap().origins.contains_key(&8));
+        assert!(!state_machine.is_healthy());
+        assert!(
+            <RedbStateMachine as RaftStateMachine<ChorusRaftConfig>>::applied_state(
+                &mut state_machine
+            )
+            .await
+            .is_err()
+        );
+        assert!(state_machine.state_data().is_err());
         drop(state_machine);
 
         let mut reopened = RedbStateMachine::open(&path, CLUSTER_ID, INCARNATION).unwrap();
         assert_eq!(Some(LogId::default()), applied(&mut reopened).await.0);
         assert!(!reopened.state_data().unwrap().origins.contains_key(&8));
+        assert!(reopened.is_healthy());
 
         let fresh_path = dir.path().join("fresh.redb");
         let mut fresh = RedbStateMachine::open(&fresh_path, CLUSTER_ID, INCARNATION).unwrap();
@@ -1937,7 +1986,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(None, applied(&mut fresh).await.0);
+        assert!(!fresh.is_healthy());
+        drop(fresh);
+        let mut reopened_fresh =
+            RedbStateMachine::open(&fresh_path, CLUSTER_ID, INCARNATION).unwrap();
+        assert_eq!(None, applied(&mut reopened_fresh).await.0);
+        assert!(reopened_fresh.is_healthy());
     }
 
     #[tokio::test]

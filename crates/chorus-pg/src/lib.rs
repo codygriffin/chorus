@@ -1406,13 +1406,9 @@ impl Connection {
         if max > 0 && result.rows.len() > max {
             let remaining = result.rows.split_off(max);
             let formats = p.result_formats.clone();
-            p.pending = Some(QueryResult {
-                columns: result.columns.clone(),
-                rows: remaining,
-                command_tag: result.command_tag.clone(),
-                affected_rows: result.affected_rows,
-                notices: result.notices.clone(),
-            });
+            let mut pending = result.clone();
+            pending.rows = remaining;
+            p.pending = Some(pending);
             if let Err(e) = self.replace_portal_accounted(&portal, p, old_portal_bytes) {
                 // The query has already executed.  Discard the portal rather
                 // than leave its old executable state available for an
@@ -2219,13 +2215,7 @@ fn sql_type_for_oid(oid: u32) -> Option<SqlType> {
 }
 
 fn description_result(columns: Vec<ResultColumn>) -> QueryResult {
-    QueryResult {
-        columns,
-        rows: Vec::new(),
-        command_tag: "SELECT".into(),
-        affected_rows: 0,
-        notices: Vec::new(),
-    }
+    QueryResult::metadata(columns)
 }
 
 fn parse_uuid(text: &str) -> Option<[u8; 16]> {
@@ -2648,6 +2638,105 @@ mod tests {
         body
     }
 
+    fn execute_body(portal: &str, max_rows: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        cstr_put(&mut body, portal);
+        body.extend_from_slice(&max_rows.to_be_bytes());
+        body
+    }
+
+    fn engine_at_exact_query_work_memory_limit(sql: &str) -> Arc<SqlEngine> {
+        // Find the smallest global budget which admits this query.  Holding
+        // its result at that exact boundary makes a second execution fail if
+        // the first result's lease is still alive, without exposing SQL's
+        // private work-memory counters to this protocol crate.
+        let store = Arc::new(MemoryStateStore::new()) as Arc<dyn StateStore>;
+        let setup_committer = Arc::new(
+            LocalCommitter::new(Arc::clone(&store), OriginId::new(1)).expect("test committer"),
+        ) as Arc<dyn Committer>;
+        let setup_engine = SqlEngine::new(Arc::clone(&store), setup_committer, Limits::default());
+        let mut setup_session = setup_engine.session();
+        setup_session
+            .execute(
+                "CREATE TABLE portal_lease_rows (id integer primary key);",
+                &[],
+            )
+            .expect("create portal test table");
+        setup_session
+            .execute("INSERT INTO portal_lease_rows VALUES (1), (2);", &[])
+            .expect("insert portal test rows");
+
+        for global_work_mem_bytes in 1..=16 * 1024 {
+            let committer = Arc::new(
+                LocalCommitter::new(Arc::clone(&store), OriginId::new(1)).expect("test committer"),
+            ) as Arc<dyn Committer>;
+            let mut limits = Limits::default();
+            limits.global_work_mem_bytes = global_work_mem_bytes;
+            let engine = SqlEngine::new(Arc::clone(&store), committer, limits);
+            let mut session = engine.session();
+            match session.execute(sql, &[]) {
+                Ok(result) => {
+                    assert_eq!(result.rows.len(), 2);
+                    drop(result);
+                    return engine;
+                }
+                Err(error)
+                    if error.code == "54000" && error.message.contains("global work memory") => {}
+                Err(error) => panic!("unexpected query setup error: {error:?}"),
+            }
+        }
+        panic!("query did not fit within the test global work-memory search bound");
+    }
+
+    #[test]
+    fn suspended_portal_result_lease_survives_until_completion_or_close() {
+        let sql = "SELECT id FROM portal_lease_rows ORDER BY id";
+        let engine = engine_at_exact_query_work_memory_limit(sql);
+        let mut connection =
+            Connection::new(Arc::clone(&engine), Box::new(Cursor::new(Vec::new())));
+        connection
+            .parse(&parse_body("statement", sql, &[]))
+            .expect("ParseComplete");
+        connection
+            .bind(&bind_body("portal", "statement", None))
+            .expect("BindComplete");
+
+        connection
+            .execute(&execute_body("portal", 1))
+            .expect("first Execute");
+        assert!(connection.portals["portal"].pending.is_some());
+
+        let blocked = connection
+            .session
+            .execute(sql, &[])
+            .expect_err("suspended result must retain its work-memory lease");
+        assert_eq!(blocked.code, "54000");
+        assert!(blocked.message.contains("global work memory"));
+
+        connection
+            .execute(&execute_body("portal", 0))
+            .expect("complete suspended Execute");
+        assert!(connection.portals["portal"].pending.is_none());
+        let completed = connection
+            .session
+            .execute(sql, &[])
+            .expect("completion must release the result lease");
+        drop(completed);
+
+        connection
+            .execute(&execute_body("portal", 1))
+            .expect("second suspended Execute");
+        assert!(connection.portals["portal"].pending.is_some());
+        connection
+            .close(&close_body(b'P', "portal"))
+            .expect("Close portal");
+        let closed = connection
+            .session
+            .execute(sql, &[])
+            .expect("closing the portal must release its result lease");
+        drop(closed);
+    }
+
     fn recomputed_retained_bytes(connection: &Connection) -> usize {
         let prepared = connection
             .prepared_types
@@ -2674,18 +2763,12 @@ mod tests {
 
     #[test]
     fn row_description_has_exact_postgres_field_layout() {
-        let result = QueryResult {
-            columns: vec![ResultColumn {
-                name: "value".into(),
-                data_type: SqlType::Integer,
-                table_oid: 42,
-                column_oid: 7,
-            }],
-            rows: Vec::new(),
-            command_tag: "SELECT".into(),
-            affected_rows: 0,
-            notices: Vec::new(),
-        };
+        let result = QueryResult::metadata(vec![ResultColumn {
+            name: "value".into(),
+            data_type: SqlType::Integer,
+            table_oid: 42,
+            column_oid: 7,
+        }]);
         let body = row_description_body(&result, &[1]).expect("row description");
         assert_eq!(u16::from_be_bytes([body[0], body[1]]), 1);
         let mut p = 2;

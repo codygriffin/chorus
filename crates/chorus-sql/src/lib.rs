@@ -12,7 +12,6 @@ use chorus_storage::{
     Catalog, ColumnDescriptor, ColumnState, ObjectState, StateSnapshot, StateStore, TableDescriptor,
 };
 use chorus_txn::{CommitSequencer, Committer, Transaction, TransactionStatus};
-use std::cell::Cell as CounterCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -32,6 +31,10 @@ pub struct QueryResult {
     pub command_tag: String,
     pub affected_rows: u64,
     pub notices: Vec<String>,
+    /// The request's work-memory lease.  This is deliberately private: SQL
+    /// execution owns the lease and protocol adapters may only move or clone
+    /// complete results.
+    lease: Option<Arc<QueryMemory>>,
 }
 impl QueryResult {
     pub fn command(tag: impl Into<String>, rows: u64) -> Self {
@@ -41,7 +44,26 @@ impl QueryResult {
             command_tag: tag.into(),
             affected_rows: rows,
             notices: Vec::new(),
+            lease: None,
         }
+    }
+
+    /// Construct a result containing only metadata, for protocol Describe
+    /// responses which do not execute a query and therefore have no lease.
+    pub fn metadata(columns: Vec<ResultColumn>) -> Self {
+        Self {
+            columns,
+            rows: Vec::new(),
+            command_tag: "SELECT".into(),
+            affected_rows: 0,
+            notices: Vec::new(),
+            lease: None,
+        }
+    }
+
+    fn attach_lease(&mut self, lease: Arc<QueryMemory>) {
+        debug_assert!(self.lease.is_none());
+        self.lease = Some(lease);
     }
 }
 
@@ -214,14 +236,16 @@ struct QueryPermit {
 
 /// Shared process budget for executor materialization. Each outer SQL request
 /// owns a [`QueryMemory`] tracker; nested prepared execution reuses it.
+#[derive(Debug)]
 struct WorkMemoryPool {
     used: AtomicUsize,
     maximum: usize,
 }
 
+#[derive(Debug)]
 struct QueryMemory {
     pool: Arc<WorkMemoryPool>,
-    used: CounterCell<usize>,
+    used: AtomicUsize,
     maximum: usize,
 }
 
@@ -294,32 +318,47 @@ impl WorkMemoryPool {
 }
 
 impl QueryMemory {
-    fn new(pool: Arc<WorkMemoryPool>, maximum: usize) -> Self {
-        Self {
+    fn new(pool: Arc<WorkMemoryPool>, maximum: usize) -> Arc<Self> {
+        Arc::new(Self {
             pool,
-            used: CounterCell::new(0),
+            used: AtomicUsize::new(0),
             maximum,
-        }
+        })
     }
 
     fn charge(&self, bytes: usize) -> std::result::Result<(), SqlError> {
-        let next = self
-            .used
-            .get()
-            .checked_add(bytes)
-            .ok_or_else(|| SqlError::new("54000", "query work memory limit exceeded"))?;
-        if next > self.maximum {
-            return Err(SqlError::new("54000", "query work memory limit exceeded"));
+        if bytes == 0 {
+            return Ok(());
         }
-        self.pool.try_charge(bytes)?;
-        self.used.set(next);
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let next = used
+                .checked_add(bytes)
+                .ok_or_else(|| SqlError::new("54000", "query work memory limit exceeded"))?;
+            if next > self.maximum {
+                return Err(SqlError::new("54000", "query work memory limit exceeded"));
+            }
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(observed) => used = observed,
+            }
+        }
+        if let Err(error) = self.pool.try_charge(bytes) {
+            self.used.fetch_sub(bytes, Ordering::AcqRel);
+            return Err(error);
+        }
         Ok(())
     }
 }
 
 impl Drop for QueryMemory {
     fn drop(&mut self) {
-        self.pool.used.fetch_sub(self.used.get(), Ordering::AcqRel);
+        self.pool
+            .used
+            .fetch_sub(self.used.load(Ordering::Acquire), Ordering::AcqRel);
     }
 }
 
@@ -1597,7 +1636,7 @@ pub struct SqlSession {
     transaction_timestamp_us: Option<i64>,
     statement_timestamp_us: Option<i64>,
     query_permit: Option<QueryPermit>,
-    query_memory: Option<QueryMemory>,
+    query_memory: Option<Arc<QueryMemory>>,
     // An uncertain submit keeps the exact transaction overlay available for
     // a byte-for-byte COMMIT retry.  While this latch is set, parse and
     // preflight errors must not convert that retained transaction into an
@@ -1769,9 +1808,17 @@ impl SqlSession {
         // returns an error.  This also composes correctly for EXECUTE of a
         // prepared statement, which nests another call to execute().
         let previous_checker = self.cancellation_checker.clone();
-        let result = self.execute_batch_with_deadline(sql, params, previous_checker.clone());
+        let mut result = self.execute_batch_with_deadline(sql, params, previous_checker.clone());
         self.cancellation_checker = previous_checker;
         if outer_execution {
+            // Keep the request's global work-memory charge alive with every
+            // result that escapes this call.  A result clone shares this Arc,
+            // so the charge is released only after the last result is gone.
+            if let Some(lease) = self.query_memory.as_ref() {
+                for result in &mut result.results {
+                    result.attach_lease(Arc::clone(lease));
+                }
+            }
             self.query_memory.take();
             self.query_permit.take();
         }
@@ -2076,7 +2123,7 @@ impl SqlSession {
     }
 
     fn query_memory(&self) -> std::result::Result<&QueryMemory, SqlError> {
-        self.query_memory.as_ref().ok_or_else(|| {
+        self.query_memory.as_deref().ok_or_else(|| {
             SqlError::new(
                 "XX000",
                 "query work memory tracker is missing during execution",
@@ -2239,6 +2286,7 @@ impl SqlSession {
             command_tag: "SHOW".into(),
             affected_rows: 1,
             notices: Vec::new(),
+            lease: None,
         })
     }
     fn ddl(&mut self, s: Statement) -> std::result::Result<QueryResult, SqlError> {
@@ -2458,6 +2506,7 @@ impl SqlSession {
                 rows: out,
                 command_tag: "SELECT".into(),
                 notices: Vec::new(),
+                lease: None,
             })
         } else {
             SelectBindingScope::default().validate_query_expressions(&q)?;
@@ -2478,6 +2527,7 @@ impl SqlSession {
                 affected_rows: 1,
                 command_tag: "SELECT".into(),
                 notices: Vec::new(),
+                lease: None,
             })
         }
     }
@@ -2547,6 +2597,7 @@ impl SqlSession {
             columns,
             command_tag: "SELECT".into(),
             notices: Vec::new(),
+            lease: None,
         })
     }
 
@@ -2795,6 +2846,7 @@ impl SqlSession {
             rows: out,
             command_tag: "SELECT".into(),
             notices: Vec::new(),
+            lease: None,
         })
     }
     fn insert(
@@ -3013,6 +3065,7 @@ impl SqlSession {
             affected_rows: count,
             command_tag: format!("INSERT 0 {count}"),
             notices: Vec::new(),
+            lease: None,
         })
     }
     fn update(
@@ -3119,6 +3172,7 @@ impl SqlSession {
             affected_rows: count,
             command_tag: format!("UPDATE {count}"),
             notices: Vec::new(),
+            lease: None,
         })
     }
     fn delete(
@@ -3180,6 +3234,7 @@ impl SqlSession {
             affected_rows: count,
             command_tag: format!("DELETE {count}"),
             notices: Vec::new(),
+            lease: None,
         })
     }
 
@@ -5960,7 +6015,7 @@ mod tests {
         assert_eq!(error.code, "54000");
         assert!(error.message.contains("global work memory"));
         assert_eq!(
-            second.used.get(),
+            second.used.load(Ordering::Acquire),
             0,
             "failed charge must not mutate local state"
         );
@@ -5972,6 +6027,43 @@ mod tests {
         assert_eq!(pool.used.load(Ordering::Acquire), 30);
         drop(second);
         assert_eq!(pool.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn query_result_lease_releases_global_work_memory_after_last_clone() {
+        let origin = OriginId::new(114);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+
+        let result = session.execute("SELECT 1", &[]).expect("query result");
+        let charged = engine.work_memory.used.load(Ordering::Acquire);
+        assert!(charged > 0, "scalar result must consume work memory");
+
+        let clone = result.clone();
+        drop(result);
+        assert_eq!(
+            engine.work_memory.used.load(Ordering::Acquire),
+            charged,
+            "a result clone must retain the request lease"
+        );
+        drop(clone);
+        assert_eq!(
+            engine.work_memory.used.load(Ordering::Acquire),
+            0,
+            "the last result must release the request lease"
+        );
+
+        session
+            .execute("SELECT (", &[])
+            .expect_err("parse error has no result");
+        assert_eq!(
+            engine.work_memory.used.load(Ordering::Acquire),
+            0,
+            "an error without a result must release work memory"
+        );
     }
 
     #[test]

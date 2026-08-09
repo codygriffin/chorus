@@ -816,12 +816,6 @@ fn open_authenticated_consensus(
     initialize: bool,
 ) -> Result<Arc<OpenRaftConsensus>, String> {
     let identity = openraft_transport_identity(cfg)?;
-    if cfg.initial_nodes.iter().any(|node| !node.voter) {
-        return Err(
-            "authenticated static bootstrap currently requires every initial node to be a voter; add learners through live membership after bootstrap"
-                .into(),
-        );
-    }
     // Open the compatibility store only to enforce the immutable installation
     // identity and to refuse reinterpretation of legacy state as OpenRaft.
     let legacy_store = open_store(cfg).map_err(|error| error.to_string())?;
@@ -831,11 +825,11 @@ fn open_authenticated_consensus(
     let (raft_path, state_path) = openraft_paths(cfg);
     validate_redb_target(&raft_path, "raft.redb")?;
     validate_redb_target(&state_path, "state/active.redb")?;
-    let initial_voters = cfg
-        .initial_nodes
-        .iter()
-        .map(|node| (node.node_id, node.endpoint.clone()))
-        .collect();
+    // The signed peer manifest intentionally contains both the initial voter
+    // set and prospective learners.  Only voters belong in OpenRaft's
+    // initial membership; learners must start with an empty local group and
+    // be admitted through the live, bounded membership path later.
+    let initial_voters = authenticated_initial_voters(cfg);
     let options = OpenRaftRuntimeOptions {
         listen: cfg
             .raft
@@ -862,6 +856,14 @@ fn open_authenticated_consensus(
     harden_file(&raft_path, false)?;
     harden_file(&state_path, false)?;
     Ok(consensus)
+}
+
+fn authenticated_initial_voters(cfg: &Config) -> std::collections::BTreeMap<u64, String> {
+    cfg.initial_nodes
+        .iter()
+        .filter(|node| node.voter)
+        .map(|node| (node.node_id, node.endpoint.clone()))
+        .collect()
 }
 
 fn ensure_openraft_legacy_state_empty(store: &dyn StateStore) -> Result<(), String> {
@@ -1064,6 +1066,133 @@ mod tests {
             })
             .collect();
         config
+    }
+
+    fn authenticated_mixed_test_config(root: &Path, node_id: u64) -> Config {
+        let (ca, ca_key) = test_ca();
+        let leaves: Vec<_> = (1..=4)
+            .map(|id| test_leaf(&ca, &ca_key, &format!("node-{id}.chorus.test")))
+            .collect();
+        let ca_path = root.join(format!("ca-{node_id}.pem"));
+        let certificate_path = root.join(format!("node-{node_id}.pem"));
+        let key_path = root.join(format!("node-{node_id}-key.pem"));
+        fs::write(&ca_path, ca.pem()).unwrap();
+        fs::write(&certificate_path, &leaves[node_id as usize - 1].0).unwrap();
+        fs::write(&key_path, &leaves[node_id as usize - 1].1).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut config = Config::defaults(root.join(format!("data-{node_id}")), node_id);
+        config.raft.listen = format!("127.0.0.1:{}", 7000 + node_id);
+        config.tls.ca = Some(ca_path);
+        config.tls.certificate = Some(certificate_path);
+        config.tls.private_key = Some(key_path);
+        config.initial_nodes = (1..=4)
+            .map(|id| InitialNode {
+                node_id: id,
+                endpoint: format!("https://127.0.0.1:{}", 7000 + id),
+                voter: id <= 3,
+                tls_dns_name: Some(format!("node-{id}.chorus.test")),
+                tls_leaf_sha256: Some(hex(&leaves[id as usize - 1].2)),
+            })
+            .collect();
+        config
+    }
+
+    #[test]
+    fn authenticated_initial_voters_filter_prospective_learners() {
+        let mut config = Config::defaults("unused", 1);
+        config.initial_nodes = (1..=4)
+            .map(|id| InitialNode {
+                node_id: id,
+                endpoint: format!("https://127.0.0.1:{}", 7000 + id),
+                voter: id <= 3,
+                tls_dns_name: None,
+                tls_leaf_sha256: None,
+            })
+            .collect();
+
+        let initial_voters = authenticated_initial_voters(&config);
+        assert_eq!(
+            vec![1, 2, 3],
+            initial_voters.keys().copied().collect::<Vec<_>>()
+        );
+        assert!(!initial_voters.contains_key(&4));
+        assert_eq!(1, config.openraft_bootstrap_node_id().unwrap());
+    }
+
+    #[test]
+    fn authenticated_bootstrap_selects_lowest_voter_not_learner() {
+        let mut config = Config::defaults("unused", 4);
+        config.initial_nodes = vec![
+            InitialNode {
+                node_id: 4,
+                endpoint: "https://127.0.0.1:7004".into(),
+                voter: false,
+                tls_dns_name: None,
+                tls_leaf_sha256: None,
+            },
+            InitialNode {
+                node_id: 7,
+                endpoint: "https://127.0.0.1:7007".into(),
+                voter: true,
+                tls_dns_name: None,
+                tls_leaf_sha256: None,
+            },
+            InitialNode {
+                node_id: 5,
+                endpoint: "https://127.0.0.1:7005".into(),
+                voter: true,
+                tls_dns_name: None,
+                tls_leaf_sha256: None,
+            },
+        ];
+
+        assert_eq!(5, config.openraft_bootstrap_node_id().unwrap());
+        assert_ne!(config.node_id, config.openraft_bootstrap_node_id().unwrap());
+    }
+
+    #[test]
+    fn authenticated_learner_starts_empty_but_cannot_bootstrap_or_read() {
+        let root = tempfile::tempdir().unwrap();
+        let config = authenticated_mixed_test_config(root.path(), 4);
+        let (raft_path, state_path) = openraft_paths(&config);
+
+        let bootstrap_error = match open_authenticated_consensus(&config, true) {
+            Ok(_) => panic!("prospective learner must not bootstrap"),
+            Err(error) => error,
+        };
+        assert!(bootstrap_error.contains("only deterministic bootstrap voter 1"));
+        assert!(!raft_path.exists());
+        assert!(!state_path.exists());
+
+        let consensus = open_authenticated_consensus(&config, false).unwrap();
+        assert!(consensus.read_barrier().is_err());
+        let status = consensus.status();
+        assert_eq!(None, status.leader_id);
+        assert!(!status.quorum);
+        drop(consensus);
+    }
+
+    #[test]
+    fn authenticated_zero_voters_fail_before_redb_state_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = authenticated_mixed_test_config(root.path(), 1);
+        for node in &mut config.initial_nodes {
+            node.voter = false;
+        }
+        let (raft_path, state_path) = openraft_paths(&config);
+
+        let error = match open_authenticated_consensus(&config, false) {
+            Ok(_) => panic!("zero-voter authenticated config must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("voting membership must have 1, 3, or 5 voters"));
+        assert!(!raft_path.exists());
+        assert!(!state_path.exists());
+        assert!(!config.data_dir.exists());
     }
 
     #[test]

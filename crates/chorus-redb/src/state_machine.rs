@@ -168,6 +168,8 @@ const MAX_APPLY_ENTRIES: usize = 4096;
 const VALUE_VERSION: u8 = 1;
 const STATE_FORMAT_VERSION: u16 = 1;
 const SNAPSHOT_FORMAT_VERSION: u16 = 1;
+const SNAPSHOT_ENVELOPE_VERSION: u8 = 1;
+const SNAPSHOT_ENVELOPE_MAGIC: &[u8; 16] = b"CHORUS-RAFTSNAP2";
 
 const STATE_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state_meta");
 const STATE_KV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state_kv");
@@ -500,7 +502,7 @@ impl RedbStateMachine {
             membership: envelope.membership.clone(),
             logical_state,
         };
-        let bytes = encode_bounded(&payload, MAX_SNAPSHOT_BYTES)?;
+        let bytes = encode_snapshot_payload(&payload)?;
         let digest = payload.logical_state.header.digest;
         let meta = SnapshotMeta {
             last_log_id: Some(last_applied.clone()),
@@ -1155,7 +1157,7 @@ fn decode_and_validate_snapshot(
     cluster_id: [u8; 16],
     cluster_incarnation: u64,
 ) -> io::Result<LogicalRaftSnapshot> {
-    let payload: LogicalRaftSnapshot = decode_bounded(bytes, MAX_SNAPSHOT_BYTES)?;
+    let payload = decode_snapshot_payload(bytes)?;
     if payload.format_version != SNAPSHOT_FORMAT_VERSION
         || payload.cluster_id != cluster_id
         || payload.cluster_incarnation != cluster_incarnation
@@ -1466,6 +1468,154 @@ fn hex_prefix(digest: &[u8; 32]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SnapshotEnvelopeMeta {
+    format_version: u16,
+    cluster_id: [u8; 16],
+    cluster_incarnation: u64,
+    last_applied: LogId<u64>,
+    membership: StoredMembership<u64, BasicNode>,
+}
+
+/// Encode the durable OpenRaft snapshot envelope.  The envelope keeps the
+/// small identity/membership header independently framed, while the logical
+/// state is carried by `LogicalSnapshot`'s block-compressed, per-block
+/// checksummed stream.  The legacy JSON envelope remains readable through the
+/// decoder below so an existing installation can be reopened and rewritten.
+fn encode_snapshot_payload(payload: &LogicalRaftSnapshot) -> io::Result<Vec<u8>> {
+    let metadata = SnapshotEnvelopeMeta {
+        format_version: payload.format_version,
+        cluster_id: payload.cluster_id,
+        cluster_incarnation: payload.cluster_incarnation,
+        last_applied: payload.last_applied.clone(),
+        membership: payload.membership.clone(),
+    };
+    let metadata = serde_json::to_vec(&metadata).map_err(to_io)?;
+    if metadata.is_empty() || metadata.len() > MAX_SNAPSHOT_META_BYTES {
+        return Err(io_other(
+            "snapshot envelope metadata exceeds configured bound",
+        ));
+    }
+    let logical = payload
+        .logical_state
+        .encode()
+        .map_err(|error| io_other(format!("logical snapshot encode failed: {error}")))?;
+    let digest_input_len = metadata
+        .len()
+        .checked_add(logical.len())
+        .ok_or_else(|| io_other("snapshot envelope digest length overflow"))?;
+    let mut digest_input = Vec::with_capacity(digest_input_len);
+    digest_input.extend_from_slice(&metadata);
+    digest_input.extend_from_slice(&logical);
+    let total = SNAPSHOT_ENVELOPE_MAGIC
+        .len()
+        .checked_add(1)
+        .and_then(|size| size.checked_add(4))
+        .and_then(|size| size.checked_add(metadata.len()))
+        .and_then(|size| size.checked_add(4))
+        .and_then(|size| size.checked_add(logical.len()))
+        .and_then(|size| size.checked_add(32))
+        .ok_or_else(|| io_other("snapshot envelope length overflow"))?;
+    if total > MAX_SNAPSHOT_BYTES {
+        return Err(io_other("snapshot envelope exceeds configured bound"));
+    }
+    let mut encoded = Vec::with_capacity(total);
+    encoded.extend_from_slice(SNAPSHOT_ENVELOPE_MAGIC);
+    encoded.push(SNAPSHOT_ENVELOPE_VERSION);
+    append_u32(&mut encoded, metadata.len())?;
+    encoded.extend_from_slice(&metadata);
+    append_u32(&mut encoded, logical.len())?;
+    encoded.extend_from_slice(&logical);
+    encoded.extend_from_slice(&hash32(&digest_input));
+    Ok(encoded)
+}
+
+fn decode_snapshot_payload(bytes: &[u8]) -> io::Result<LogicalRaftSnapshot> {
+    if !bytes.starts_with(SNAPSHOT_ENVELOPE_MAGIC) {
+        // Values written before the block-stream checkpoint used the common
+        // versioned JSON envelope.  Keep this read path during migration;
+        // newly-built snapshots never emit it.
+        return decode_bounded(bytes, MAX_SNAPSHOT_BYTES);
+    }
+    let mut input = &bytes[SNAPSHOT_ENVELOPE_MAGIC.len()..];
+    let version = take_snapshot_u8(&mut input)?;
+    if version != SNAPSHOT_ENVELOPE_VERSION {
+        return Err(io_other(format!(
+            "unsupported snapshot envelope version {version}"
+        )));
+    }
+    let metadata_len = take_snapshot_u32(&mut input)? as usize;
+    if metadata_len == 0 || metadata_len > MAX_SNAPSHOT_META_BYTES {
+        return Err(io_other(
+            "snapshot envelope metadata exceeds configured bound",
+        ));
+    }
+    let metadata_bytes = take_snapshot(&mut input, metadata_len)?;
+    let metadata: SnapshotEnvelopeMeta = serde_json::from_slice(metadata_bytes).map_err(to_io)?;
+    let logical_len = take_snapshot_u32(&mut input)? as usize;
+    if logical_len == 0 || logical_len > MAX_SNAPSHOT_BYTES {
+        return Err(io_other("logical snapshot stream exceeds configured bound"));
+    }
+    let logical_bytes = take_snapshot(&mut input, logical_len)?;
+    let expected_digest = take_snapshot(&mut input, 32)?;
+    if !input.is_empty() {
+        return Err(io_other("trailing snapshot envelope bytes"));
+    }
+    let digest_input_len = metadata_bytes
+        .len()
+        .checked_add(logical_bytes.len())
+        .ok_or_else(|| io_other("snapshot envelope digest length overflow"))?;
+    let mut digest_input = Vec::with_capacity(digest_input_len);
+    digest_input.extend_from_slice(metadata_bytes);
+    digest_input.extend_from_slice(logical_bytes);
+    if expected_digest != hash32(&digest_input) {
+        return Err(io_other("snapshot envelope checksum mismatch"));
+    }
+    let logical_state = LogicalSnapshot::decode(logical_bytes)
+        .map_err(|error| io_other(format!("logical snapshot decode failed: {error}")))?;
+    Ok(LogicalRaftSnapshot {
+        format_version: metadata.format_version,
+        cluster_id: metadata.cluster_id,
+        cluster_incarnation: metadata.cluster_incarnation,
+        last_applied: metadata.last_applied,
+        membership: metadata.membership,
+        logical_state,
+    })
+}
+
+fn append_u32(output: &mut Vec<u8>, value: usize) -> io::Result<()> {
+    output.extend_from_slice(
+        &u32::try_from(value)
+            .map_err(|_| io_other("snapshot envelope field exceeds u32"))?
+            .to_be_bytes(),
+    );
+    Ok(())
+}
+
+fn take_snapshot_u8(input: &mut &[u8]) -> io::Result<u8> {
+    Ok(*take_snapshot(input, 1)?
+        .first()
+        .ok_or_else(|| io_other("truncated snapshot envelope"))?)
+}
+
+fn take_snapshot_u32(input: &mut &[u8]) -> io::Result<u32> {
+    let bytes = take_snapshot(input, 4)?;
+    Ok(u32::from_be_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| io_other("truncated snapshot envelope"))?,
+    ))
+}
+
+fn take_snapshot<'a>(input: &mut &'a [u8], length: usize) -> io::Result<&'a [u8]> {
+    if input.len() < length {
+        return Err(io_other("truncated snapshot envelope"));
+    }
+    let (head, tail) = input.split_at(length);
+    *input = tail;
+    Ok(head)
 }
 
 fn encode_bounded<T: Serialize>(value: &T, maximum: usize) -> io::Result<Vec<u8>> {
@@ -1823,13 +1973,26 @@ mod tests {
             .unwrap();
         assert_eq!(expected_meta, durable.meta);
         assert_eq!(expected_bytes, durable.snapshot.into_inner());
+        assert!(expected_bytes.starts_with(SNAPSHOT_ENVELOPE_MAGIC));
+        let decoded_payload = decode_snapshot_payload(&expected_bytes).unwrap();
+        let legacy_bytes = encode_bounded(&decoded_payload, MAX_SNAPSHOT_BYTES).unwrap();
+        assert_eq!(
+            decoded_payload.logical_state,
+            decode_snapshot_payload(&legacy_bytes)
+                .unwrap()
+                .logical_state
+        );
+        let mut tampered = expected_bytes.clone();
+        let tampered_index = tampered.len() - 1;
+        tampered[tampered_index] ^= 1;
+        assert!(decode_snapshot_payload(&tampered).is_err());
 
         let mut forged_payload: LogicalRaftSnapshot =
-            decode_bounded(&expected_bytes, MAX_SNAPSHOT_BYTES).unwrap();
+            decode_snapshot_payload(&expected_bytes).unwrap();
         let forged_membership = StoredMembership::new(Some(log_id(2, 1)), joint_membership());
         forged_payload.membership = forged_membership.clone();
         forged_payload.logical_state.header.membership_log_id = ChorusLogId { term: 2, index: 1 };
-        let forged_bytes = encode_bounded(&forged_payload, MAX_SNAPSHOT_BYTES).unwrap();
+        let forged_bytes = encode_snapshot_payload(&forged_payload).unwrap();
         let mut forged_meta = expected_meta.clone();
         forged_meta.last_membership = forged_membership;
         assert!(

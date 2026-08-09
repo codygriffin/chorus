@@ -26,6 +26,10 @@ pub const MAX_COMMAND_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_SNAPSHOT_ENTRIES: usize = 10_000_000;
 const SNAPSHOT_BODY_VERSION: u8 = 1;
+const SNAPSHOT_STREAM_VERSION: u8 = 2;
+const SNAPSHOT_BLOCK_BYTES: usize = 1024 * 1024;
+const SNAPSHOT_MAX_BLOCKS: usize = MAX_SNAPSHOT_BYTES / SNAPSHOT_BLOCK_BYTES + 1;
+const SNAPSHOT_HEADER_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct PhysicalKey(pub Vec<u8>);
@@ -763,25 +767,19 @@ impl LogicalSnapshot {
     }
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
         self.validate()?;
-        let encoded = serde_json::to_vec(self).map_err(|e| CodecError::Malformed(e.to_string()))?;
-        if encoded.len() > MAX_SNAPSHOT_BYTES {
-            return Err(CodecError::Limit("snapshot exceeds 256 MiB".into()));
-        }
-        let mut out = b"CHORUS-SNAPSHOT\0".to_vec();
-        put_u32(
-            &mut out,
-            u32::try_from(encoded.len())
-                .map_err(|_| CodecError::Limit("snapshot length exceeds u32".into()))?,
-        );
-        out.extend_from_slice(&encoded);
-        out.extend_from_slice(&hash32(&encoded));
-        Ok(out)
+        encode_snapshot_stream(self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
         if bytes.len() > MAX_SNAPSHOT_BYTES {
             return Err(CodecError::Limit("snapshot exceeds 256 MiB".into()));
         }
-        if bytes.len() < 16 + 4 + 32 || &bytes[..16] != b"CHORUS-SNAPSHOT\0" {
+        if bytes.len() < 16 + 4 + 32 {
+            return Err(CodecError::Malformed("invalid snapshot magic".into()));
+        }
+        if &bytes[..16] == SNAPSHOT_STREAM_MAGIC {
+            return decode_snapshot_stream(bytes);
+        }
+        if &bytes[..16] != SNAPSHOT_MAGIC {
             return Err(CodecError::Malformed("invalid snapshot magic".into()));
         }
         let mut rest = &bytes[16..];
@@ -799,6 +797,142 @@ impl LogicalSnapshot {
         s.validate()?;
         Ok(s)
     }
+}
+
+const SNAPSHOT_MAGIC: &[u8; 16] = b"CHORUS-SNAPSHOT\0";
+const SNAPSHOT_STREAM_MAGIC: &[u8; 16] = b"CHORUS-SNAP2\0\0\0\0";
+
+fn encode_snapshot_stream(snapshot: &LogicalSnapshot) -> Result<Vec<u8>, CodecError> {
+    let body = snapshot_body(&snapshot.meta, &snapshot.entries)?;
+    if body.len() > MAX_SNAPSHOT_BYTES {
+        return Err(CodecError::Limit("snapshot body exceeds 256 MiB".into()));
+    }
+    let header = serde_json::to_vec(&snapshot.header)
+        .map_err(|error| CodecError::Malformed(format!("snapshot header encode: {error}")))?;
+    if header.len() > SNAPSHOT_HEADER_BYTES {
+        return Err(CodecError::Limit(
+            "snapshot header exceeds configured bound".into(),
+        ));
+    }
+    let block_count = body.len().div_ceil(SNAPSHOT_BLOCK_BYTES);
+    if block_count == 0 || block_count > SNAPSHOT_MAX_BLOCKS {
+        return Err(CodecError::Limit(
+            "snapshot block count exceeds configured bound".into(),
+        ));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(SNAPSHOT_STREAM_MAGIC);
+    out.push(SNAPSHOT_STREAM_VERSION);
+    put_u32(
+        &mut out,
+        u32::try_from(header.len())
+            .map_err(|_| CodecError::Limit("snapshot header length exceeds u32".into()))?,
+    );
+    out.extend_from_slice(&header);
+    put_u32(
+        &mut out,
+        u32::try_from(block_count)
+            .map_err(|_| CodecError::Limit("snapshot block count exceeds u32".into()))?,
+    );
+    for chunk in body.chunks(SNAPSHOT_BLOCK_BYTES) {
+        let compressed = zstd::bulk::compress(chunk, 1)
+            .map_err(|error| CodecError::Malformed(format!("snapshot compression: {error}")))?;
+        put_u32(
+            &mut out,
+            u32::try_from(chunk.len())
+                .map_err(|_| CodecError::Limit("snapshot block length exceeds u32".into()))?,
+        );
+        put_u32(
+            &mut out,
+            u32::try_from(compressed.len()).map_err(|_| {
+                CodecError::Limit("compressed snapshot block length exceeds u32".into())
+            })?,
+        );
+        out.extend_from_slice(&hash32(chunk));
+        out.extend_from_slice(&compressed);
+        if out.len() > MAX_SNAPSHOT_BYTES {
+            return Err(CodecError::Limit("snapshot exceeds 256 MiB".into()));
+        }
+    }
+    // The footer is independent of the per-block checksums and proves that
+    // the decoded logical stream is exactly the stream named by the header.
+    out.extend_from_slice(&hash32(&body));
+    if out.len() > MAX_SNAPSHOT_BYTES {
+        return Err(CodecError::Limit("snapshot exceeds 256 MiB".into()));
+    }
+    Ok(out)
+}
+
+fn decode_snapshot_stream(bytes: &[u8]) -> Result<LogicalSnapshot, CodecError> {
+    let mut rest = &bytes[16..];
+    let stream_version = take_u8(&mut rest)?;
+    if stream_version != SNAPSHOT_STREAM_VERSION {
+        return Err(CodecError::InvalidVersion(stream_version as u64));
+    }
+    let header_len = take_u32(&mut rest)? as usize;
+    if header_len == 0 || header_len > SNAPSHOT_HEADER_BYTES {
+        return Err(CodecError::Limit(
+            "snapshot header exceeds configured bound".into(),
+        ));
+    }
+    let header_bytes = take(&mut rest, header_len)?;
+    let header: SnapshotHeader = serde_json::from_slice(header_bytes)
+        .map_err(|error| CodecError::Malformed(format!("snapshot header decode: {error}")))?;
+    let block_count = take_u32(&mut rest)? as usize;
+    if block_count == 0 || block_count > SNAPSHOT_MAX_BLOCKS {
+        return Err(CodecError::Limit(
+            "snapshot block count exceeds configured bound".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    for _ in 0..block_count {
+        let uncompressed_len = take_u32(&mut rest)? as usize;
+        let compressed_len = take_u32(&mut rest)? as usize;
+        if uncompressed_len == 0 || uncompressed_len > SNAPSHOT_BLOCK_BYTES {
+            return Err(CodecError::Limit(
+                "snapshot block has an invalid uncompressed length".into(),
+            ));
+        }
+        if compressed_len == 0 || compressed_len > MAX_SNAPSHOT_BYTES {
+            return Err(CodecError::Limit(
+                "snapshot block has an invalid compressed length".into(),
+            ));
+        }
+        let expected_digest: [u8; 32] = take(&mut rest, 32)?
+            .try_into()
+            .map_err(|_| CodecError::Truncated)?;
+        let compressed = take(&mut rest, compressed_len)?;
+        let decoded = zstd::bulk::decompress(compressed, uncompressed_len)
+            .map_err(|error| CodecError::Malformed(format!("snapshot decompression: {error}")))?;
+        if decoded.len() != uncompressed_len || hash32(&decoded) != expected_digest {
+            return Err(CodecError::Malformed(
+                "snapshot block checksum or length mismatch".into(),
+            ));
+        }
+        body.extend_from_slice(&decoded);
+        if body.len() > MAX_SNAPSHOT_BYTES {
+            return Err(CodecError::Limit("snapshot body exceeds 256 MiB".into()));
+        }
+    }
+    let footer: [u8; 32] = take(&mut rest, 32)?
+        .try_into()
+        .map_err(|_| CodecError::Truncated)?;
+    if !rest.is_empty() {
+        return Err(CodecError::Malformed("trailing snapshot bytes".into()));
+    }
+    if footer != hash32(&body) || footer != header.digest {
+        return Err(CodecError::Malformed(
+            "snapshot logical digest mismatch".into(),
+        ));
+    }
+    let (meta, entries) = decode_snapshot_body(&body)?;
+    let snapshot = LogicalSnapshot {
+        header,
+        meta,
+        entries,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
 }
 
 fn validate_membership(voters: &[u64], learners: &[u64]) -> Result<(), CodecError> {
@@ -849,6 +983,59 @@ fn snapshot_body(
         push_blob(&mut out, value)?;
     }
     Ok(out)
+}
+
+fn decode_snapshot_body(
+    mut input: &[u8],
+) -> Result<(BTreeMap<String, Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>), CodecError> {
+    let body_version = take_u8(&mut input)?;
+    if body_version != SNAPSHOT_BODY_VERSION {
+        return Err(CodecError::InvalidVersion(body_version as u64));
+    }
+    let meta_count = take_u32(&mut input)? as usize;
+    if meta_count > 1_000_000 {
+        return Err(CodecError::Limit(
+            "snapshot metadata record count exceeds configured bound".into(),
+        ));
+    }
+    let mut meta = BTreeMap::new();
+    for _ in 0..meta_count {
+        let key = take_blob(&mut input)?;
+        let key = String::from_utf8(key).map_err(|_| CodecError::InvalidUtf8)?;
+        if key.is_empty() || key.len() > 63 || meta.contains_key(&key) {
+            return Err(CodecError::Malformed(
+                "snapshot metadata key is invalid or duplicated".into(),
+            ));
+        }
+        meta.insert(key, take_blob(&mut input)?);
+    }
+    let entry_count = take_u32(&mut input)? as usize;
+    if entry_count > MAX_SNAPSHOT_ENTRIES {
+        return Err(CodecError::Limit("too many snapshot entries".into()));
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let key = take_blob(&mut input)?;
+        if key.is_empty() || key.len() > MAX_KEY_BYTES {
+            return Err(CodecError::Limit("snapshot key exceeds 8 KiB".into()));
+        }
+        let value = take_blob(&mut input)?;
+        entries.push((key, value));
+    }
+    if !input.is_empty() {
+        return Err(CodecError::Malformed("trailing snapshot body bytes".into()));
+    }
+    Ok((meta, entries))
+}
+
+fn take_blob(input: &mut &[u8]) -> Result<Vec<u8>, CodecError> {
+    let len = take_u32(input)? as usize;
+    if len > MAX_SNAPSHOT_BYTES {
+        return Err(CodecError::Limit(
+            "snapshot field exceeds configured bound".into(),
+        ));
+    }
+    Ok(take(input, len)?.to_vec())
 }
 
 fn push_blob(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CodecError> {
@@ -960,5 +1147,44 @@ mod tests {
                 0xe4, 0x1f, 0x32, 0x62,
             ]
         );
+    }
+
+    #[test]
+    fn snapshot_stream_roundtrip_checks_blocks_and_reads_legacy_format() {
+        let large_meta = vec![0x5a; SNAPSHOT_BLOCK_BYTES + 123];
+        let snapshot = LogicalSnapshot::try_new(
+            [7; 16],
+            3,
+            LogId { term: 2, index: 9 },
+            LogId { term: 2, index: 4 },
+            vec![1, 2, 3],
+            vec![4],
+            11,
+            5,
+            BTreeMap::from([(String::from("state"), large_meta)]),
+            vec![(vec![0x20, 0, 0, 0, 1], b"row".to_vec())],
+        )
+        .unwrap();
+        assert!(
+            snapshot_body(&snapshot.meta, &snapshot.entries)
+                .unwrap()
+                .len()
+                > SNAPSHOT_BLOCK_BYTES
+        );
+        let encoded = snapshot.encode().unwrap();
+        assert_eq!(&encoded[..16], SNAPSHOT_STREAM_MAGIC);
+        assert_eq!(snapshot, LogicalSnapshot::decode(&encoded).unwrap());
+
+        let mut tampered = encoded.clone();
+        let middle = tampered.len() / 2;
+        tampered[middle] ^= 1;
+        assert!(LogicalSnapshot::decode(&tampered).is_err());
+
+        let legacy_json = serde_json::to_vec(&snapshot).unwrap();
+        let mut legacy = SNAPSHOT_MAGIC.to_vec();
+        put_u32(&mut legacy, legacy_json.len() as u32);
+        legacy.extend_from_slice(&legacy_json);
+        legacy.extend_from_slice(&hash32(&legacy_json));
+        assert_eq!(snapshot, LogicalSnapshot::decode(&legacy).unwrap());
     }
 }

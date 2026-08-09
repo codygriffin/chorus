@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::{Arc, Mutex, mpsc as std_mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc as std_mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -44,6 +44,7 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 const STATUS_METADATA_TIMEOUT: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_GATEWAY_REDIRECTS: usize = 3;
+const COALESCED_BARRIER_WAIT_TIMEOUT: Duration = Duration::from_secs(11);
 
 type ChorusRaft = Raft<ChorusRaftConfig>;
 
@@ -74,6 +75,122 @@ enum RuntimeMode {
     },
 }
 
+/// One read-barrier operation shared only while that operation is in flight.
+///
+/// The current flight is removed before its result is published to existing
+/// waiters. A caller which arrives after the underlying operation completes
+/// therefore starts a new barrier instead of observing a cached result.
+struct ReadBarrierCoalescer {
+    current: Mutex<Option<Arc<ReadBarrierFlight>>>,
+}
+
+struct ReadBarrierFlight {
+    outcome: Mutex<Option<Result<StateSnapshot>>>,
+    completed: Condvar,
+    #[cfg(test)]
+    participants: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadBarrierFlight {
+    fn new() -> Self {
+        Self {
+            outcome: Mutex::new(None),
+            completed: Condvar::new(),
+            #[cfg(test)]
+            participants: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ReadBarrierCoalescer {
+    fn new() -> Self {
+        Self {
+            current: Mutex::new(None),
+        }
+    }
+
+    fn run(&self, barrier: impl FnOnce() -> Result<StateSnapshot>) -> Result<StateSnapshot> {
+        let (flight, drives_barrier) = {
+            let mut current = self.current.lock().map_err(|_| {
+                ChorusError::Internal("read-barrier coalescer lock is poisoned".into())
+            })?;
+            if let Some(flight) = current.as_ref() {
+                (Arc::clone(flight), false)
+            } else {
+                let flight = Arc::new(ReadBarrierFlight::new());
+                *current = Some(Arc::clone(&flight));
+                (flight, true)
+            }
+        };
+
+        #[cfg(test)]
+        flight
+            .participants
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+        if drives_barrier {
+            let outcome = barrier();
+
+            // Stop admitting followers to this flight as soon as its actual
+            // barrier operation has completed. Existing followers retain an
+            // Arc and receive the same cloned outcome below.
+            let clear_result = self.current.lock().map(|mut current| {
+                if current
+                    .as_ref()
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &flight))
+                {
+                    *current = None;
+                }
+            });
+
+            let publish_result = flight.outcome.lock().map(|mut published| {
+                *published = Some(outcome.clone());
+            });
+            flight.completed.notify_all();
+
+            clear_result.map_err(|_| {
+                ChorusError::Internal("read-barrier coalescer lock is poisoned".into())
+            })?;
+            publish_result.map_err(|_| {
+                ChorusError::Internal("read-barrier flight lock is poisoned".into())
+            })?;
+            outcome
+        } else {
+            let published = flight.outcome.lock().map_err(|_| {
+                ChorusError::Internal("read-barrier flight lock is poisoned".into())
+            })?;
+            let (published, timeout) = flight
+                .completed
+                .wait_timeout_while(published, COALESCED_BARRIER_WAIT_TIMEOUT, |outcome| {
+                    outcome.is_none()
+                })
+                .map_err(|_| {
+                    ChorusError::Internal("read-barrier flight lock is poisoned".into())
+                })?;
+            if timeout.timed_out() && published.is_none() {
+                return Err(ChorusError::Consensus(
+                    "coalesced read barrier did not complete before its bounded wait".into(),
+                ));
+            }
+            published.clone().ok_or_else(|| {
+                ChorusError::Internal("read-barrier flight completed without an outcome".into())
+            })?
+        }
+    }
+
+    #[cfg(test)]
+    fn current_participants(&self) -> usize {
+        use std::sync::atomic::Ordering;
+
+        self.current
+            .lock()
+            .ok()
+            .and_then(|current| current.as_ref().map(Arc::clone))
+            .map(|flight| flight.participants.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+}
+
 /// A synchronous `Consensus` implementation backed by one real OpenRaft
 /// runtime on a dedicated thread.
 pub struct OpenRaftConsensus {
@@ -81,6 +198,7 @@ pub struct OpenRaftConsensus {
     sender: Mutex<Option<mpsc::Sender<RuntimeRequest>>>,
     runtime_thread: Mutex<Option<thread::JoinHandle<()>>>,
     store: Arc<RedbReadStore>,
+    read_barriers: ReadBarrierCoalescer,
 }
 
 impl OpenRaftConsensus {
@@ -309,6 +427,7 @@ impl OpenRaftConsensus {
                 sender: Mutex::new(Some(sender)),
                 runtime_thread: Mutex::new(Some(runtime_thread)),
                 store: read_store,
+                read_barriers: ReadBarrierCoalescer::new(),
             })),
             Ok(Err(error)) => {
                 let _ = runtime_thread.join();
@@ -380,7 +499,8 @@ impl Consensus for OpenRaftConsensus {
     }
 
     fn read_barrier(&self) -> Result<StateSnapshot> {
-        self.send(|response| RuntimeRequest::ReadBarrier { response })
+        self.read_barriers
+            .run(|| self.send(|response| RuntimeRequest::ReadBarrier { response }))
     }
 
     fn submit(&self, command: CommitTransactionV1) -> Result<ApplyResult> {
@@ -1490,9 +1610,28 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use chorus_common::ChorusError;
+    use chorus_storage::{MemoryStateStore, StateStore};
     use openraft::{CommittedLeaderId, LogId};
 
-    use super::durable_commit_index;
+    use super::{ReadBarrierCoalescer, durable_commit_index};
+
+    fn wait_for_participants(coalescer: &ReadBarrierCoalescer, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while coalescer.current_participants() < expected {
+            assert!(
+                Instant::now() < deadline,
+                "read-barrier callers did not join the in-flight operation"
+            );
+            thread::yield_now();
+        }
+    }
 
     #[test]
     fn durable_commit_index_is_not_fabricated_from_applied_index() {
@@ -1503,6 +1642,103 @@ mod tests {
         assert_eq!(9, commit_index);
         assert!(commit_index > applied_index);
         assert_eq!(0, durable_commit_index(None));
+    }
+
+    #[test]
+    fn read_barriers_share_only_the_overlapping_operation() {
+        let coalescer = Arc::new(ReadBarrierCoalescer::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let snapshot = MemoryStateStore::new().snapshot().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        let leader_coalescer = Arc::clone(&coalescer);
+        let leader_calls = Arc::clone(&calls);
+        let leader_snapshot = snapshot.clone();
+        let leader = thread::spawn(move || {
+            leader_coalescer.run(|| {
+                leader_calls.fetch_add(1, Ordering::AcqRel);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(leader_snapshot)
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let follower_coalescer = Arc::clone(&coalescer);
+        let follower_calls = Arc::clone(&calls);
+        let follower_snapshot = snapshot.clone();
+        let follower = thread::spawn(move || {
+            follower_coalescer.run(|| {
+                follower_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(follower_snapshot)
+            })
+        });
+        wait_for_participants(&coalescer, 2);
+        release_tx.send(()).unwrap();
+
+        let leader_result = leader.join().unwrap().unwrap();
+        let follower_result = follower.join().unwrap().unwrap();
+        assert_eq!(leader_result.last_applied(), follower_result.last_applied());
+        assert_eq!(1, calls.load(Ordering::Acquire));
+
+        // The completed result is not a cache: a later caller drives a new
+        // barrier and obtains that operation's result.
+        let fresh = coalescer
+            .run(|| {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(snapshot)
+            })
+            .unwrap();
+        assert_eq!(leader_result.last_applied(), fresh.last_applied());
+        assert_eq!(2, calls.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn read_barrier_failure_is_shared_and_a_later_call_recovers() {
+        let coalescer = Arc::new(ReadBarrierCoalescer::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        let leader_coalescer = Arc::clone(&coalescer);
+        let leader_calls = Arc::clone(&calls);
+        let leader = thread::spawn(move || {
+            leader_coalescer.run(|| {
+                leader_calls.fetch_add(1, Ordering::AcqRel);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Err(ChorusError::Consensus("injected barrier failure".into()))
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let follower_coalescer = Arc::clone(&coalescer);
+        let follower_calls = Arc::clone(&calls);
+        let follower = thread::spawn(move || {
+            follower_coalescer.run(|| {
+                follower_calls.fetch_add(1, Ordering::AcqRel);
+                Err(ChorusError::Consensus("unexpected second barrier".into()))
+            })
+        });
+        wait_for_participants(&coalescer, 2);
+        release_tx.send(()).unwrap();
+
+        let leader_error = leader.join().unwrap().unwrap_err().to_string();
+        let follower_error = follower.join().unwrap().unwrap_err().to_string();
+        assert_eq!(leader_error, follower_error);
+        assert_eq!(1, calls.load(Ordering::Acquire));
+
+        let snapshot = MemoryStateStore::new().snapshot().unwrap();
+        assert!(
+            coalescer
+                .run(|| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(snapshot)
+                })
+                .is_ok()
+        );
+        assert_eq!(2, calls.load(Ordering::Acquire));
     }
 }
 

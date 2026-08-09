@@ -1002,11 +1002,13 @@ impl Connection {
             return self.ready();
         }
         self.begin_query();
-        let result = self.session.execute(&sql, &[]);
+        let results = self.session.execute_batch(&sql, &[]);
         self.end_query();
-        match result {
-            Ok(r) => {
-                self.result(&r)?;
+        match results {
+            Ok(results) => {
+                for result in &results {
+                    self.result(result)?;
+                }
                 self.ready()
             }
             Err(e) => {

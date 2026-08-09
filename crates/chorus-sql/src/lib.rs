@@ -1507,6 +1507,19 @@ impl SqlSession {
         sql: &str,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
+        let mut results = self.execute_batch(sql, params)?;
+        Ok(results.pop().unwrap_or_else(|| QueryResult::command("", 0)))
+    }
+
+    /// Execute a complete simple-query batch and return one result per AST in
+    /// source order.  Results are retained until all statements and the
+    /// implicit commit have succeeded, so a failed batch cannot expose a
+    /// prefix which the transaction later rolls back.
+    pub fn execute_batch(
+        &mut self,
+        sql: &str,
+        params: &[Datum],
+    ) -> std::result::Result<Vec<QueryResult>, SqlError> {
         // `Statement::Execute` dispatches through this method recursively.
         // Keep one permit for the externally submitted operation so prepared
         // statements cannot consume a second slot or deadlock at a limit of
@@ -1521,7 +1534,7 @@ impl SqlSession {
         // returns an error.  This also composes correctly for EXECUTE of a
         // prepared statement, which nests another call to execute().
         let previous_checker = self.cancellation_checker.clone();
-        let result = self.execute_with_deadline(sql, params, previous_checker.clone());
+        let result = self.execute_batch_with_deadline(sql, params, previous_checker.clone());
         self.cancellation_checker = previous_checker;
         if outer_execution {
             self.query_permit.take();
@@ -1529,12 +1542,12 @@ impl SqlSession {
         result
     }
 
-    fn execute_with_deadline(
+    fn execute_batch_with_deadline(
         &mut self,
         sql: &str,
         params: &[Datum],
         parent_checker: Option<Arc<dyn CancellationChecker>>,
-    ) -> std::result::Result<QueryResult, SqlError> {
+    ) -> std::result::Result<Vec<QueryResult>, SqlError> {
         if sql.len() > self.engine.limits.max_sql_message_bytes {
             return Err(SqlError::new(
                 "54000",
@@ -1543,7 +1556,7 @@ impl SqlSession {
         }
         let statements = Parser::batch(sql)?;
         if statements.is_empty() {
-            return Ok(QueryResult::command("", 0));
+            return Ok(vec![QueryResult::command("", 0)]);
         }
         if statements.iter().any(|s| s.is_ddl()) && statements.len() != 1 {
             return Err(SqlError::new(
@@ -1560,7 +1573,7 @@ impl SqlSession {
             self.install_statement_checker(parent_checker.clone())?;
             self.start_txn()?;
         }
-        let mut last = QueryResult::command("", 0);
+        let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
             if !implicit || !first_statement {
                 // Each AST statement gets a fresh timeout budget.  The
@@ -1572,7 +1585,7 @@ impl SqlSession {
             let result = check_cancelled(self.cancellation_checker())
                 .and_then(|()| self.exec_statement(statement, params));
             match result {
-                Ok(r) => last = r,
+                Ok(r) => results.push(r),
                 Err(e) => {
                     if implicit {
                         self.rollback_internal();
@@ -1606,7 +1619,7 @@ impl SqlSession {
                 return Err(error);
             }
         }
-        Ok(last)
+        Ok(results)
     }
     pub fn prepare(&mut self, name: &str, sql: &str) -> std::result::Result<(), SqlError> {
         if Parser::batch(sql)?.len() != 1 {
@@ -5178,6 +5191,94 @@ mod tests {
         assert_eq!(result.rows.len(), 1);
         assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
     }
+
+    #[test]
+    fn execute_batch_preserves_ordered_select_and_dml_results() {
+        let origin = OriginId::new(107);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE batch_results (id integer primary key, value text);",
+                &[],
+            )
+            .unwrap();
+
+        let results = session
+            .execute_batch(
+                "SELECT 1; INSERT INTO batch_results VALUES (7, 'seven') RETURNING id; SELECT id FROM batch_results ORDER BY id;",
+                &[],
+            )
+            .expect("batch must commit");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].command_tag, "SELECT");
+        assert_eq!(results[1].command_tag, "INSERT 0 1");
+        assert_eq!(results[2].command_tag, "SELECT");
+        assert!(matches!(results[0].rows[0][0], Datum::Int64(1)));
+        assert!(matches!(results[1].rows[0][0], Datum::Int32(7)));
+        assert!(matches!(results[2].rows[0][0], Datum::Int32(7)));
+    }
+
+    #[test]
+    fn execute_batch_discards_implicit_results_when_a_later_statement_fails() {
+        let origin = OriginId::new(108);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute("CREATE TABLE batch_atomic (id integer primary key);", &[])
+            .unwrap();
+
+        let error = session
+            .execute_batch(
+                "INSERT INTO batch_atomic VALUES (1); INSERT INTO missing_batch_table VALUES (2);",
+                &[],
+            )
+            .expect_err("later statement must abort the implicit batch");
+        assert_eq!(error.code, "42P01");
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+
+        let count = session
+            .execute("SELECT count(*) FROM batch_atomic;", &[])
+            .expect("count query");
+        assert!(matches!(count.rows[0][0], Datum::Int64(0)));
+    }
+
+    #[test]
+    fn execute_batch_preserves_explicit_transaction_result_order() {
+        let origin = OriginId::new(109);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute("CREATE TABLE explicit_batch (id integer primary key);", &[])
+            .unwrap();
+
+        let results = session
+            .execute_batch(
+                "BEGIN; INSERT INTO explicit_batch VALUES (3) RETURNING id; SELECT id FROM explicit_batch ORDER BY id; COMMIT;",
+                &[],
+            )
+            .expect("explicit batch must commit");
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.command_tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BEGIN", "INSERT 0 1", "SELECT", "COMMIT"]
+        );
+        assert!(matches!(results[1].rows[0][0], Datum::Int32(3)));
+        assert!(matches!(results[2].rows[0][0], Datum::Int32(3)));
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+    }
+
     #[test]
     fn parser_values() {
         let x = Parser::batch("SELECT 1 + 2").unwrap();

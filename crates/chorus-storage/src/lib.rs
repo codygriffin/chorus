@@ -2096,9 +2096,8 @@ struct CanonicalLogicalStateV1<'a> {
 /// database contents are identical. Likewise, physical bytes retained only
 /// for dropped objects and redundant catalog-key material are excluded.
 ///
-/// `hash32` is the repository's current SHA-256 compatibility fallback. The
-/// MVP specification requires a pinned BLAKE3 implementation before release;
-/// changing that primitive remains an explicit format/version transition.
+/// `hash32` is the pinned BLAKE3 primitive used by the canonical logical-state
+/// projection and persisted command/snapshot digests.
 fn canonical_state_hash(data: &StateData) -> Result<[u8; 32]> {
     const DOMAIN: &[u8] = b"CHORUS-CANONICAL-LOGICAL-STATE-V1\0";
     let kv = data

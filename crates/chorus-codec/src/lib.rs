@@ -9,7 +9,6 @@ use chorus_common::{
     ChorusError, Datum, LogId, MAX_INDEXED_VALUE_BYTES, MAX_KEY_BYTES, OriginId, RequestId, SqlType,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MEMCOMPARABLE_VERSION: u8 = 1;
@@ -93,13 +92,7 @@ impl From<CodecError> for ChorusError {
 }
 
 pub fn hash32(bytes: &[u8]) -> [u8; 32] {
-    // SHA-256 is available in the minimal deployment toolchain and provides a
-    // stable 256-bit command/state digest. The command API leaves this helper
-    // behind a function so a pure BLAKE3 implementation can be swapped in
-    // without changing persisted structures.
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().into()
+    *blake3::hash(bytes).as_bytes()
 }
 
 pub fn payload_hash(
@@ -955,5 +948,17 @@ mod tests {
     fn command_roundtrip() {
         let c = ReplicatedCommandV1::Noop;
         assert_eq!(decode_command(&encode_command(&c).unwrap()).unwrap(), c);
+    }
+
+    #[test]
+    fn hash32_uses_the_pinned_blake3_vector() {
+        assert_eq!(
+            hash32(b""),
+            [
+                0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc,
+                0xc9, 0x49, 0x9b, 0xcb, 0x25, 0xc9, 0xad, 0xc1, 0x12, 0xb7, 0xcc, 0x9a, 0x93, 0xca,
+                0xe4, 0x1f, 0x32, 0x62,
+            ]
+        );
     }
 }

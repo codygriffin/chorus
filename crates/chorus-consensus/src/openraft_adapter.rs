@@ -3,7 +3,7 @@
 //! authenticated constructor owns a bounded Tonic/Rustls server and network
 //! factory on the same dedicated Tokio runtime as OpenRaft.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -18,7 +18,9 @@ use chorus_codec::{
 use chorus_common::{ChorusError, LogId as ChorusLogId, OriginId, Result};
 use chorus_redb::{ChorusRaftConfig, RedbRaftLogStore, RedbStateMachine};
 use chorus_storage::{StateSnapshot, StateStore, StoreStatus};
-use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
+use openraft::error::{
+    CheckIsLeaderError, ClientWriteError, InstallSnapshotError, RPCError, RaftError, Unreachable,
+};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -31,14 +33,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 
 use crate::openraft_transport::{
-    AuthenticatedNetworkFactory, AuthenticatedRaftService, TransportTlsIdentity,
-    authenticated_server_builder, bounded_transport_server,
+    AuthenticatedNetworkFactory, AuthenticatedRaftService, ClientWriteGatewayResponse,
+    ReadBarrierGatewayResponse, TransportTlsIdentity, authenticated_server_builder,
+    bounded_transport_server,
 };
 use crate::{Consensus, ConsensusStatus};
 
 const REQUEST_QUEUE_CAPACITY: usize = 128;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_GATEWAY_REDIRECTS: usize = 3;
 
 type ChorusRaft = Raft<ChorusRaftConfig>;
 
@@ -489,7 +493,7 @@ async fn run_runtime(
 
     let mut server_shutdown = None;
     let mut server_task = None;
-    let (raft, initial_members, wait_for_self_leader) = match mode {
+    let (raft, initial_members, wait_for_self_leader, gateway) = match mode {
         RuntimeMode::SingleNode => {
             let config = match single_node_config() {
                 Ok(config) => config,
@@ -517,6 +521,7 @@ async fn run_runtime(
                 raft,
                 BTreeMap::from([(node_id, BasicNode::new(format!("single-node://{node_id}")))]),
                 true,
+                None,
             )
         }
         RuntimeMode::Authenticated {
@@ -548,6 +553,7 @@ async fn run_runtime(
                     return;
                 }
             };
+            let gateway = network.clone();
             let raft =
                 match ChorusRaft::new(node_id, config, network, log_store, state_machine.clone())
                     .await
@@ -597,7 +603,7 @@ async fn run_runtime(
             });
             server_shutdown = Some(shutdown_tx);
             server_task = Some(task);
-            (raft, initial_voters, initialize)
+            (raft, initial_voters, initialize, Some(gateway))
         }
     };
 
@@ -659,27 +665,29 @@ async fn run_runtime(
         };
         match request {
             RuntimeRequest::Write { command, response } => {
-                let result =
-                    match tokio::time::timeout(OPERATION_TIMEOUT, raft.client_write(command)).await
-                    {
-                        Ok(Ok(result)) => Ok(result.data),
-                        Ok(Err(error)) => Err(ChorusError::Consensus(error.to_string())),
-                        Err(_) => Err(ChorusError::Consensus("OpenRaft write timed out".into())),
-                    };
+                let result = match tokio::time::timeout(
+                    OPERATION_TIMEOUT,
+                    write_with_forwarding(&raft, gateway.as_ref(), &state_machine, command),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(ChorusError::Consensus("OpenRaft write timed out".into())),
+                };
                 let _ = response.send(result);
             }
             RuntimeRequest::ReadBarrier { response } => {
-                let result =
-                    match tokio::time::timeout(OPERATION_TIMEOUT, raft.ensure_linearizable()).await
-                    {
-                        Ok(Ok(_)) => state_machine
-                            .state_snapshot()
-                            .map_err(|error| ChorusError::Storage(error.to_string())),
-                        Ok(Err(error)) => Err(ChorusError::Consensus(error.to_string())),
-                        Err(_) => Err(ChorusError::Consensus(
-                            "OpenRaft read barrier timed out".into(),
-                        )),
-                    };
+                let result = match tokio::time::timeout(
+                    OPERATION_TIMEOUT,
+                    read_barrier_with_forwarding(&raft, gateway.as_ref(), &state_machine),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(ChorusError::Consensus(
+                        "OpenRaft read barrier timed out".into(),
+                    )),
+                };
                 let _ = response.send(result);
             }
             RuntimeRequest::WaitApplied { log_id, response } => {
@@ -739,6 +747,131 @@ async fn run_runtime(
     }
     stop_transport_server(&mut server_shutdown, &mut server_task).await;
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, raft.shutdown()).await;
+}
+
+async fn write_with_forwarding(
+    raft: &ChorusRaft,
+    gateway: Option<&AuthenticatedNetworkFactory>,
+    state_machine: &RedbStateMachine,
+    command: ReplicatedCommandV1,
+) -> Result<ApplyResult> {
+    let mut target = match raft.client_write(command.clone()).await {
+        Ok(response) => return Ok(response.data),
+        Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => forward
+            .leader_id
+            .or_else(|| raft.metrics().borrow().current_leader),
+        Err(error) => return Err(ChorusError::Consensus(error.to_string())),
+    };
+    let gateway = gateway.ok_or_else(|| {
+        ChorusError::Consensus("OpenRaft has no authenticated follower gateway".into())
+    })?;
+    let mut visited = BTreeSet::new();
+    for _ in 0..MAX_GATEWAY_REDIRECTS {
+        let leader = target.ok_or_else(|| {
+            ChorusError::Consensus("OpenRaft follower does not know the current leader".into())
+        })?;
+        if !visited.insert(leader) {
+            return Err(ChorusError::Consensus(
+                "OpenRaft follower gateway detected a redirect loop".into(),
+            ));
+        }
+        match gateway
+            .forward_client_write(leader, command.clone(), OPERATION_TIMEOUT)
+            .await
+            .map_err(|error| ChorusError::Consensus(error.to_string()))?
+        {
+            ClientWriteGatewayResponse::Applied { log_id, result } => {
+                snapshot_after_read_cursor(raft, state_machine, Some(log_id)).await?;
+                return Ok(result);
+            }
+            ClientWriteGatewayResponse::ForwardToLeader { leader_id } => target = leader_id,
+            ClientWriteGatewayResponse::Failed(error) => {
+                return Err(ChorusError::Consensus(format!(
+                    "OpenRaft leader rejected forwarded write: {error}"
+                )));
+            }
+        }
+    }
+    Err(ChorusError::Consensus(
+        "OpenRaft follower gateway exceeded its redirect limit".into(),
+    ))
+}
+
+async fn read_barrier_with_forwarding(
+    raft: &ChorusRaft,
+    gateway: Option<&AuthenticatedNetworkFactory>,
+    state_machine: &RedbStateMachine,
+) -> Result<StateSnapshot> {
+    let mut target = match raft.ensure_linearizable().await {
+        Ok(read_log_id) => {
+            return snapshot_after_read_cursor(raft, state_machine, read_log_id).await;
+        }
+        Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => forward
+            .leader_id
+            .or_else(|| raft.metrics().borrow().current_leader),
+        Err(error) => return Err(ChorusError::Consensus(error.to_string())),
+    };
+    let gateway = gateway.ok_or_else(|| {
+        ChorusError::Consensus("OpenRaft has no authenticated follower gateway".into())
+    })?;
+    let mut visited = BTreeSet::new();
+    for _ in 0..MAX_GATEWAY_REDIRECTS {
+        let leader = target.ok_or_else(|| {
+            ChorusError::Consensus("OpenRaft follower does not know the current leader".into())
+        })?;
+        if !visited.insert(leader) {
+            return Err(ChorusError::Consensus(
+                "OpenRaft follower gateway detected a redirect loop".into(),
+            ));
+        }
+        match gateway
+            .forward_read_barrier(leader, OPERATION_TIMEOUT)
+            .await
+            .map_err(|error| ChorusError::Consensus(error.to_string()))?
+        {
+            ReadBarrierGatewayResponse::Confirmed { read_log_id } => {
+                return snapshot_after_read_cursor(raft, state_machine, read_log_id).await;
+            }
+            ReadBarrierGatewayResponse::ForwardToLeader { leader_id } => target = leader_id,
+            ReadBarrierGatewayResponse::Failed(error) => {
+                return Err(ChorusError::Consensus(format!(
+                    "OpenRaft leader rejected forwarded read barrier: {error}"
+                )));
+            }
+        }
+    }
+    Err(ChorusError::Consensus(
+        "OpenRaft follower gateway exceeded its redirect limit".into(),
+    ))
+}
+
+async fn snapshot_after_read_cursor(
+    raft: &ChorusRaft,
+    state_machine: &RedbStateMachine,
+    read_log_id: Option<openraft::LogId<u64>>,
+) -> Result<StateSnapshot> {
+    if let Some(read_log_id) = read_log_id {
+        raft.wait(Some(OPERATION_TIMEOUT))
+            .applied_index_at_least(Some(read_log_id.index), "Chorus follower read barrier")
+            .await
+            .map_err(|error| ChorusError::Consensus(error.to_string()))?;
+        let snapshot = state_machine
+            .state_snapshot()
+            .map_err(|error| ChorusError::Storage(error.to_string()))?;
+        let applied = snapshot.last_applied();
+        if applied.index < read_log_id.index
+            || (applied.index == read_log_id.index && applied.term != read_log_id.leader_id.term)
+        {
+            return Err(ChorusError::Consensus(
+                "local state does not match the confirmed OpenRaft read cursor".into(),
+            ));
+        }
+        Ok(snapshot)
+    } else {
+        state_machine
+            .state_snapshot()
+            .map_err(|error| ChorusError::Storage(error.to_string()))
+    }
 }
 
 async fn stop_transport_server(

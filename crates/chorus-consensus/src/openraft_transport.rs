@@ -10,20 +10,20 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chorus_codec::{MAX_COMMAND_BYTES, encode_command};
+use chorus_codec::{ApplyResult, MAX_COMMAND_BYTES, ReplicatedCommandV1, encode_command};
 use chorus_redb::ChorusRaftConfig;
 use openraft::error::{
-    Fatal, InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError, RemoteError,
-    Timeout, Unreachable,
+    CheckIsLeaderError, ClientWriteError, Fatal, InstallSnapshotError, NetworkError,
+    PayloadTooLarge, RPCError, RaftError, RemoteError, Timeout, Unreachable,
 };
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, EntryPayload, RPCTypes, Raft};
-use serde::Serialize;
+use openraft::{BasicNode, EntryPayload, LogId, RPCTypes, Raft};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::Status;
@@ -58,6 +58,10 @@ pub enum RpcPayloadDomain {
     AppendEntriesResponse = 4,
     InstallSnapshotRequest = 5,
     InstallSnapshotResponse = 6,
+    ClientWriteRequest = 7,
+    ClientWriteResponse = 8,
+    ReadBarrierRequest = 9,
+    ReadBarrierResponse = 10,
 }
 
 impl RpcPayloadDomain {
@@ -69,9 +73,52 @@ impl RpcPayloadDomain {
             4 => Some(Self::AppendEntriesResponse),
             5 => Some(Self::InstallSnapshotRequest),
             6 => Some(Self::InstallSnapshotResponse),
+            7 => Some(Self::ClientWriteRequest),
+            8 => Some(Self::ClientWriteResponse),
+            9 => Some(Self::ReadBarrierRequest),
+            10 => Some(Self::ReadBarrierResponse),
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClientWriteGatewayRequest {
+    pub command: ReplicatedCommandV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ClientWriteGatewayResponse {
+    Applied {
+        log_id: LogId<u64>,
+        result: ApplyResult,
+    },
+    ForwardToLeader {
+        leader_id: Option<u64>,
+    },
+    Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReadBarrierGatewayRequest;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReadBarrierGatewayResponse {
+    Confirmed { read_log_id: Option<LogId<u64>> },
+    ForwardToLeader { leader_id: Option<u64> },
+    Failed(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayCallError {
+    #[error("gateway configuration error: {0}")]
+    Configuration(String),
+    #[error("gateway request timed out after {0:?}")]
+    Timeout(Duration),
+    #[error("gateway transport error: {0}")]
+    Transport(String),
+    #[error("gateway codec error: {0}")]
+    Codec(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -243,6 +290,8 @@ pub enum RpcMethod {
     Vote,
     AppendEntries,
     InstallSnapshot,
+    ClientWrite,
+    ReadBarrier,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -507,6 +556,90 @@ impl wire::open_raft_transport_server::OpenRaftTransport for AuthenticatedRaftSe
             .map_err(codec_status)?;
         self.response(source, payload)
     }
+
+    async fn client_write(
+        &self,
+        request: Request<wire::Envelope>,
+    ) -> Result<Response<wire::Envelope>, Status> {
+        let source =
+            self.authenticator
+                .authenticate(&request, request.get_ref(), RpcMethod::ClientWrite)?;
+        let request: ClientWriteGatewayRequest = decode_rpc_payload(
+            RpcPayloadDomain::ClientWriteRequest,
+            &request.into_inner().payload,
+        )
+        .map_err(codec_status)?;
+        validate_forwarded_command(source, &request.command)?;
+        let result = match self.raft.client_write(request.command).await {
+            Ok(response) => ClientWriteGatewayResponse::Applied {
+                log_id: response.log_id,
+                result: response.data,
+            },
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
+                ClientWriteGatewayResponse::ForwardToLeader {
+                    leader_id: forward.leader_id,
+                }
+            }
+            Err(error) => ClientWriteGatewayResponse::Failed(error.to_string()),
+        };
+        let payload = encode_rpc_payload(RpcPayloadDomain::ClientWriteResponse, &result)
+            .map_err(codec_status)?;
+        self.response(source, payload)
+    }
+
+    async fn read_barrier(
+        &self,
+        request: Request<wire::Envelope>,
+    ) -> Result<Response<wire::Envelope>, Status> {
+        let source =
+            self.authenticator
+                .authenticate(&request, request.get_ref(), RpcMethod::ReadBarrier)?;
+        let _: ReadBarrierGatewayRequest = decode_rpc_payload(
+            RpcPayloadDomain::ReadBarrierRequest,
+            &request.into_inner().payload,
+        )
+        .map_err(codec_status)?;
+        let result = match self.raft.ensure_linearizable().await {
+            Ok(read_log_id) => ReadBarrierGatewayResponse::Confirmed { read_log_id },
+            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => {
+                ReadBarrierGatewayResponse::ForwardToLeader {
+                    leader_id: forward.leader_id,
+                }
+            }
+            Err(error) => ReadBarrierGatewayResponse::Failed(error.to_string()),
+        };
+        let payload = encode_rpc_payload(RpcPayloadDomain::ReadBarrierResponse, &result)
+            .map_err(codec_status)?;
+        self.response(source, payload)
+    }
+}
+
+fn validate_forwarded_command(
+    source_node_id: u64,
+    command: &ReplicatedCommandV1,
+) -> Result<(), Status> {
+    let origin_node_id = match command {
+        ReplicatedCommandV1::ActivateOrigin(command) => command.origin.node_id,
+        ReplicatedCommandV1::CommitTransaction(command) => command.request_id.origin.node_id,
+        ReplicatedCommandV1::SchemaChange(command) => command.request_id.origin.node_id,
+        ReplicatedCommandV1::Noop | ReplicatedCommandV1::Membership { .. } => {
+            return Err(Status::permission_denied(
+                "only source-bound application commands may be forwarded",
+            ));
+        }
+    };
+    if origin_node_id != source_node_id {
+        return Err(Status::permission_denied(
+            "forwarded command origin does not match the authenticated source node",
+        ));
+    }
+    encode_command(command).map_err(|error| match error {
+        chorus_codec::CodecError::Limit(_) => {
+            Status::resource_exhausted("forwarded command exceeds the configured limit")
+        }
+        other => Status::invalid_argument(other.to_string()),
+    })?;
+    Ok(())
 }
 
 pub fn validate_request_envelope(
@@ -688,6 +821,96 @@ impl AuthenticatedNetworkFactory {
             .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_RPC_MESSAGE_BYTES),
         )
+    }
+
+    /// Forward one source-bound application command to a manifest member.
+    /// The server deliberately does not recursively forward: a stale target
+    /// returns its current leader hint so the caller can make a bounded retry.
+    pub async fn forward_client_write(
+        &self,
+        target: u64,
+        command: ReplicatedCommandV1,
+        timeout: Duration,
+    ) -> Result<ClientWriteGatewayResponse, GatewayCallError> {
+        if target == self.identity.node_id || timeout.is_zero() {
+            return Err(GatewayCallError::Configuration(
+                "gateway target must be remote and timeout must be nonzero".into(),
+            ));
+        }
+        validate_forwarded_command(self.identity.node_id, &command)
+            .map_err(|status| GatewayCallError::Configuration(status.to_string()))?;
+        let payload = encode_rpc_payload(
+            RpcPayloadDomain::ClientWriteRequest,
+            &ClientWriteGatewayRequest { command },
+        )
+        .map_err(|error| GatewayCallError::Codec(error.to_string()))?;
+        let envelope = envelope(&self.identity, target, payload)
+            .map_err(|error| GatewayCallError::Configuration(error.to_string()))?;
+        let mut request = Request::new(envelope);
+        request.set_timeout(timeout);
+        let mut client = self
+            .client_for(target)
+            .await
+            .map_err(|error| GatewayCallError::Configuration(error.to_string()))?;
+        let response = match tokio::time::timeout(timeout, client.client_write(request)).await {
+            Err(_) => return Err(GatewayCallError::Timeout(timeout)),
+            Ok(Err(status)) => return Err(GatewayCallError::Transport(status.to_string())),
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        let payload = self.validate_gateway_response(target, response)?;
+        decode_rpc_payload(RpcPayloadDomain::ClientWriteResponse, &payload)
+            .map_err(|error| GatewayCallError::Codec(error.to_string()))
+    }
+
+    /// Ask a manifest member to establish a leader read barrier. A confirmed
+    /// response includes the exact committed cursor the local follower must
+    /// apply before it may serve its state snapshot.
+    pub async fn forward_read_barrier(
+        &self,
+        target: u64,
+        timeout: Duration,
+    ) -> Result<ReadBarrierGatewayResponse, GatewayCallError> {
+        if target == self.identity.node_id || timeout.is_zero() {
+            return Err(GatewayCallError::Configuration(
+                "gateway target must be remote and timeout must be nonzero".into(),
+            ));
+        }
+        let payload = encode_rpc_payload(
+            RpcPayloadDomain::ReadBarrierRequest,
+            &ReadBarrierGatewayRequest,
+        )
+        .map_err(|error| GatewayCallError::Codec(error.to_string()))?;
+        let envelope = envelope(&self.identity, target, payload)
+            .map_err(|error| GatewayCallError::Configuration(error.to_string()))?;
+        let mut request = Request::new(envelope);
+        request.set_timeout(timeout);
+        let mut client = self
+            .client_for(target)
+            .await
+            .map_err(|error| GatewayCallError::Configuration(error.to_string()))?;
+        let response = match tokio::time::timeout(timeout, client.read_barrier(request)).await {
+            Err(_) => return Err(GatewayCallError::Timeout(timeout)),
+            Ok(Err(status)) => return Err(GatewayCallError::Transport(status.to_string())),
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        let payload = self.validate_gateway_response(target, response)?;
+        decode_rpc_payload(RpcPayloadDomain::ReadBarrierResponse, &payload)
+            .map_err(|error| GatewayCallError::Codec(error.to_string()))
+    }
+
+    fn validate_gateway_response(
+        &self,
+        target: u64,
+        response: wire::Envelope,
+    ) -> Result<Vec<u8>, GatewayCallError> {
+        let peer = self.identity.peers.get(&target).ok_or_else(|| {
+            GatewayCallError::Configuration(format!(
+                "target node {target} is not present in the authenticated manifest"
+            ))
+        })?;
+        validate_response_envelope(&self.identity, peer, &response)
+            .map_err(|error| GatewayCallError::Transport(error.to_string()))?;
+        Ok(response.payload)
     }
 }
 

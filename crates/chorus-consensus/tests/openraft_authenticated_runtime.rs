@@ -233,6 +233,34 @@ fn authenticated_three_node_runtime_bootstraps_replicates_and_restarts() {
         })
     });
 
+    // A follower authenticates and forwards its own origin-bound write to the
+    // current leader. A different follower then establishes the leader read
+    // barrier and waits for its local durable state machine to reach the
+    // returned cursor before exposing the snapshot.
+    let follower_origin = OriginId::new(2);
+    node2.activate_origin(follower_origin).unwrap();
+    let follower_request_id = RequestId::new(follower_origin, 1);
+    let follower_mutation = KvMutationV1::Put {
+        key: b"fwd".to_vec(),
+        value: b"forwarded-value".to_vec(),
+    };
+    let follower_canonical = canonical_mutations(std::slice::from_ref(&follower_mutation)).unwrap();
+    let follower_result = node2
+        .submit(CommitTransactionV1 {
+            request_id: follower_request_id,
+            payload_hash: payload_hash(1, &follower_request_id, 1, &follower_canonical),
+            base_epoch: 1,
+            mutations: vec![follower_mutation],
+        })
+        .unwrap();
+    assert!(matches!(follower_result, ApplyResult::Committed { .. }));
+    assert_eq!(
+        Some(&b"forwarded-value"[..]),
+        node2.store().snapshot().unwrap().get(b"fwd")
+    );
+    let follower_read = node3.read_barrier().unwrap();
+    assert_eq!(Some(&b"forwarded-value"[..]), follower_read.get(b"fwd"));
+
     drop(node3);
     let restarted = open_node(
         root.path(),
@@ -243,11 +271,10 @@ fn authenticated_three_node_runtime_bootstraps_replicates_and_restarts() {
         &addresses,
     );
     wait_for(Duration::from_secs(5), || {
-        restarted
-            .store()
-            .snapshot()
-            .ok()
-            .is_some_and(|snapshot| snapshot.get(b"key") == Some(&b"authenticated-value"[..]))
+        restarted.store().snapshot().ok().is_some_and(|snapshot| {
+            snapshot.get(b"key") == Some(&b"authenticated-value"[..])
+                && snapshot.get(b"fwd") == Some(&b"forwarded-value"[..])
+        })
     });
 
     drop(restarted);

@@ -177,6 +177,14 @@ impl OpenRaftTransport for GateService {
     ) -> Result<Response<Envelope>, Status> {
         self.handle(request, RpcMethod::InstallSnapshot)
     }
+
+    async fn client_write(&self, request: Request<Envelope>) -> Result<Response<Envelope>, Status> {
+        self.handle(request, RpcMethod::ClientWrite)
+    }
+
+    async fn read_barrier(&self, request: Request<Envelope>) -> Result<Response<Envelope>, Status> {
+        self.handle(request, RpcMethod::ReadBarrier)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -269,6 +277,24 @@ impl OpenRaftTransport for FactoryService {
         let result: Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>> =
             Ok(InstallSnapshotResponse { vote: rpc.vote });
         self.response(source, RpcPayloadDomain::InstallSnapshotResponse, &result)
+    }
+
+    async fn client_write(
+        &self,
+        _request: Request<Envelope>,
+    ) -> Result<Response<Envelope>, Status> {
+        Err(Status::unimplemented(
+            "gateway RPC not used by factory test",
+        ))
+    }
+
+    async fn read_barrier(
+        &self,
+        _request: Request<Envelope>,
+    ) -> Result<Response<Envelope>, Status> {
+        Err(Status::unimplemented(
+            "gateway RPC not used by factory test",
+        ))
     }
 }
 

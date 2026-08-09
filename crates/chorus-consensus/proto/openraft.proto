@@ -18,4 +18,9 @@ service OpenRaftTransport {
   rpc Vote(Envelope) returns (Envelope);
   rpc AppendEntries(Envelope) returns (Envelope);
   rpc InstallSnapshot(Envelope) returns (Envelope);
+  // Gateway RPCs let an authenticated follower forward an application
+  // request to the current leader without exposing OpenRaft internals to the
+  // SQL/PostgreSQL serving layers.
+  rpc ClientWrite(Envelope) returns (Envelope);
+  rpc ReadBarrier(Envelope) returns (Envelope);
 }

@@ -12,6 +12,7 @@ use chorus_storage::{
     Catalog, ColumnDescriptor, ColumnState, ObjectState, StateSnapshot, StateStore, TableDescriptor,
 };
 use chorus_txn::{CommitSequencer, Committer, Transaction, TransactionStatus};
+use std::cell::Cell as CounterCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -211,6 +212,19 @@ struct QueryPermit {
     admission: Arc<QueryAdmission>,
 }
 
+/// Shared process budget for executor materialization. Each outer SQL request
+/// owns a [`QueryMemory`] tracker; nested prepared execution reuses it.
+struct WorkMemoryPool {
+    used: AtomicUsize,
+    maximum: usize,
+}
+
+struct QueryMemory {
+    pool: Arc<WorkMemoryPool>,
+    used: CounterCell<usize>,
+    maximum: usize,
+}
+
 impl QueryAdmission {
     fn new(maximum: usize) -> Arc<Self> {
         Arc::new(Self {
@@ -248,6 +262,67 @@ impl Drop for QueryPermit {
     }
 }
 
+impl WorkMemoryPool {
+    fn new(maximum: usize) -> Arc<Self> {
+        Arc::new(Self {
+            used: AtomicUsize::new(0),
+            maximum,
+        })
+    }
+
+    fn try_charge(&self, bytes: usize) -> std::result::Result<(), SqlError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let next = used
+                .checked_add(bytes)
+                .ok_or_else(|| SqlError::new("54000", "global work memory limit exceeded"))?;
+            if next > self.maximum {
+                return Err(SqlError::new("54000", "global work memory limit exceeded"));
+            }
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(()),
+                Err(observed) => used = observed,
+            }
+        }
+    }
+}
+
+impl QueryMemory {
+    fn new(pool: Arc<WorkMemoryPool>, maximum: usize) -> Self {
+        Self {
+            pool,
+            used: CounterCell::new(0),
+            maximum,
+        }
+    }
+
+    fn charge(&self, bytes: usize) -> std::result::Result<(), SqlError> {
+        let next = self
+            .used
+            .get()
+            .checked_add(bytes)
+            .ok_or_else(|| SqlError::new("54000", "query work memory limit exceeded"))?;
+        if next > self.maximum {
+            return Err(SqlError::new("54000", "query work memory limit exceeded"));
+        }
+        self.pool.try_charge(bytes)?;
+        self.used.set(next);
+        Ok(())
+    }
+}
+
+impl Drop for QueryMemory {
+    fn drop(&mut self) {
+        self.pool.used.fetch_sub(self.used.get(), Ordering::AcqRel);
+    }
+}
+
 pub struct SqlEngine {
     store: Arc<dyn StateStore>,
     committer: Arc<dyn Committer>,
@@ -255,6 +330,7 @@ pub struct SqlEngine {
     sequencer: Arc<CommitSequencer>,
     drain_token: Arc<AtomicBool>,
     query_admission: Arc<QueryAdmission>,
+    work_memory: Arc<WorkMemoryPool>,
 }
 impl SqlEngine {
     pub fn new(
@@ -275,6 +351,7 @@ impl SqlEngine {
     ) -> Arc<Self> {
         let sequencer = Arc::new(CommitSequencer::new(committer.origin()));
         let query_admission = QueryAdmission::new(limits.max_active_queries);
+        let work_memory = WorkMemoryPool::new(limits.global_work_mem_bytes);
         Arc::new(Self {
             store,
             committer,
@@ -282,6 +359,7 @@ impl SqlEngine {
             sequencer,
             drain_token,
             query_admission,
+            work_memory,
         })
     }
     pub fn session(self: &Arc<Self>) -> SqlSession {
@@ -296,6 +374,7 @@ impl SqlEngine {
             transaction_timestamp_us: None,
             statement_timestamp_us: None,
             query_permit: None,
+            query_memory: None,
             commit_outcome_unknown: false,
         }
     }
@@ -1518,6 +1597,7 @@ pub struct SqlSession {
     transaction_timestamp_us: Option<i64>,
     statement_timestamp_us: Option<i64>,
     query_permit: Option<QueryPermit>,
+    query_memory: Option<QueryMemory>,
     // An uncertain submit keeps the exact transaction overlay available for
     // a byte-for-byte COMMIT retry.  While this latch is set, parse and
     // preflight errors must not convert that retained transaction into an
@@ -1673,7 +1753,13 @@ impl SqlSession {
         let outer_execution = self.query_permit.is_none();
         if outer_execution {
             match self.engine.query_admission.try_acquire() {
-                Ok(permit) => self.query_permit = Some(permit),
+                Ok(permit) => {
+                    self.query_permit = Some(permit);
+                    self.query_memory = Some(QueryMemory::new(
+                        Arc::clone(&self.engine.work_memory),
+                        self.engine.limits.query_work_mem_bytes,
+                    ));
+                }
                 Err(error) => return BatchExecution::failure(Vec::new(), error),
             }
         }
@@ -1686,6 +1772,7 @@ impl SqlSession {
         let result = self.execute_batch_with_deadline(sql, params, previous_checker.clone());
         self.cancellation_checker = previous_checker;
         if outer_execution {
+            self.query_memory.take();
             self.query_permit.take();
         }
         result
@@ -1988,6 +2075,19 @@ impl SqlSession {
         check_cancelled(self.cancellation_checker())
     }
 
+    fn query_memory(&self) -> std::result::Result<&QueryMemory, SqlError> {
+        self.query_memory.as_ref().ok_or_else(|| {
+            SqlError::new(
+                "XX000",
+                "query work memory tracker is missing during execution",
+            )
+        })
+    }
+
+    fn charge_work_memory(&self, bytes: usize) -> std::result::Result<(), SqlError> {
+        self.query_memory()?.charge(bytes)
+    }
+
     fn install_statement_checker(
         &mut self,
         parent: Option<Arc<dyn CancellationChecker>>,
@@ -2262,10 +2362,11 @@ impl SqlSession {
         if let Some(table) = table {
             SelectBindingScope::for_query(tx.snapshot.catalog(), &table, &q)?;
             let checker = self.cancellation_checker();
-            let mut rows = scan(tx, &table, checker)?;
+            let mut rows = scan(tx, &table, checker, self.query_memory()?)?;
             let base_qualifier = q.from_alias.as_deref().unwrap_or(&table.name);
             for row in &mut rows {
                 for cell in &mut row.cells {
+                    self.charge_work_memory(base_qualifier.len())?;
                     cell.qualifier = Some(base_qualifier.to_string());
                 }
             }
@@ -2274,6 +2375,11 @@ impl SqlSession {
                     self.join_rows(tx, &table, q.from_alias.as_deref(), rows, &q.joins, params)?;
             }
             if let Some(w) = &q.selection {
+                let filtered_bytes = rows
+                    .len()
+                    .checked_mul(std::mem::size_of::<Row>())
+                    .ok_or_else(work_memory_size_overflow)?;
+                self.charge_work_memory(filtered_bytes)?;
                 let mut filtered = Vec::with_capacity(rows.len());
                 for row in rows {
                     check_cancelled(checker)?;
@@ -2294,6 +2400,9 @@ impl SqlSession {
                 for row in rows {
                     check_cancelled(checker)?;
                     let key = self.eval(e, &row.cells, params)?;
+                    let mut bytes = std::mem::size_of::<(Row, Datum)>();
+                    add_work_bytes(&mut bytes, datum_size(&key))?;
+                    self.charge_work_memory(bytes)?;
                     keyed.push((row, key));
                 }
                 keyed.sort_by(|(_, x), (_, y)| {
@@ -2337,6 +2446,7 @@ impl SqlSession {
                     .iter()
                     .map(|e| self.eval(e, &r.cells, params))
                     .collect::<std::result::Result<Vec<_>, _>>()?;
+                self.charge_work_memory(values_work_bytes(&values)?)?;
                 if q.distinct && out.iter().any(|v: &Vec<Datum>| v == &values) {
                     continue;
                 }
@@ -2361,6 +2471,7 @@ impl SqlSession {
                 .iter()
                 .map(|e| self.eval(e, &[], params))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            self.charge_work_memory(values_work_bytes(&row)?)?;
             Ok(QueryResult {
                 columns,
                 rows: vec![row],
@@ -2387,6 +2498,9 @@ impl SqlSession {
                 .iter()
                 .map(|expr| self.eval(expr, &row.cells, params))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut group_bytes = values_work_bytes(&key)?;
+            add_work_items::<Row>(&mut group_bytes, 1)?;
+            self.charge_work_memory(group_bytes)?;
             if let Some((_, group)) = groups.iter_mut().find(|(old, _)| *old == key) {
                 group.push(row);
             } else {
@@ -2421,6 +2535,7 @@ impl SqlSession {
                 .iter()
                 .map(|expr| self.eval_group(expr, &group, params))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            self.charge_work_memory(values_work_bytes(&row)?)?;
             if q.distinct && out.iter().any(|old: &Vec<Datum>| old == &row) {
                 continue;
             }
@@ -2502,7 +2617,7 @@ impl SqlSession {
         let mut current = rows;
         for join in joins {
             let right = find_table(tx.snapshot.catalog(), &join.relation)?.clone();
-            let right_rows = scan(tx, &right, checker)?;
+            let right_rows = scan(tx, &right, checker, self.query_memory()?)?;
             let mut next = Vec::new();
             for left in current {
                 check_cancelled(checker)?;
@@ -2524,11 +2639,13 @@ impl SqlSession {
                     }
                     if self.eval(&join.on, &cells, params)?.truthy() == Some(true) {
                         matched = true;
-                        next.push(Row {
+                        let output = Row {
                             key: left.key.clone(),
                             row: left.row.clone(),
                             cells,
-                        });
+                        };
+                        self.charge_work_memory(row_work_bytes(&output)?)?;
+                        next.push(output);
                     }
                 }
                 if !matched && join.kind == JoinKind::Left {
@@ -2550,11 +2667,13 @@ impl SqlSession {
                             cell.qualifier = Some(base_alias.unwrap_or(&base.name).to_string());
                         }
                     }
-                    next.push(Row {
+                    let output = Row {
                         key: left.key,
                         row: left.row,
                         cells,
-                    });
+                    };
+                    self.charge_work_memory(row_work_bytes(&output)?)?;
+                    next.push(output);
                 }
             }
             current = next;
@@ -2583,9 +2702,9 @@ impl SqlSession {
         binding.add_table(&table, &qualifier)?;
         binding.validate_query_expressions(&q)?;
         let checker = self.cancellation_checker();
-        let mut rows = values
-            .into_iter()
-            .map(|values| VirtualRow {
+        let mut rows = Vec::with_capacity(values.len());
+        for values in values {
+            let row = VirtualRow {
                 cells: columns
                     .iter()
                     .zip(values)
@@ -2595,9 +2714,16 @@ impl SqlSession {
                         value,
                     })
                     .collect(),
-            })
-            .collect::<Vec<_>>();
+            };
+            self.charge_work_memory(virtual_row_work_bytes(&row)?)?;
+            rows.push(row);
+        }
         if let Some(w) = &q.selection {
+            let filtered_bytes = rows
+                .len()
+                .checked_mul(std::mem::size_of::<VirtualRow>())
+                .ok_or_else(work_memory_size_overflow)?;
+            self.charge_work_memory(filtered_bytes)?;
             let mut filtered = Vec::with_capacity(rows.len());
             for row in rows {
                 check_cancelled(checker)?;
@@ -2612,6 +2738,9 @@ impl SqlSession {
             for row in rows {
                 check_cancelled(checker)?;
                 let key = self.eval(e, &row.cells, params)?;
+                let mut bytes = std::mem::size_of::<(VirtualRow, Datum)>();
+                add_work_bytes(&mut bytes, datum_size(&key))?;
+                self.charge_work_memory(bytes)?;
                 keyed.push((row, key));
             }
             keyed.sort_by(|(_, x), (_, y)| {
@@ -2654,6 +2783,7 @@ impl SqlSession {
                 .iter()
                 .map(|e| self.eval(e, &row.cells, params))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            self.charge_work_memory(values_work_bytes(&projected)?)?;
             if q.distinct && out.iter().any(|old: &Vec<Datum>| old == &projected) {
                 continue;
             }
@@ -2744,7 +2874,7 @@ impl SqlSession {
             let conflict_key = if tx.get(&key).is_some() {
                 Some(key.clone())
             } else {
-                scan(tx, &table, checker)?
+                scan(tx, &table, checker, self.query_memory()?)?
                     .into_iter()
                     .find_map(|candidate| {
                         let candidate_indexes = index_entries(
@@ -2913,7 +3043,7 @@ impl SqlSession {
         self.check_cancelled()?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let checker = self.cancellation_checker();
-        let targets = scan(tx, &table, checker)?;
+        let targets = scan(tx, &table, checker, self.query_memory()?)?;
         let mut ret = Vec::new();
         let mut count = 0u64;
         for target in targets {
@@ -3019,7 +3149,7 @@ impl SqlSession {
         self.check_cancelled()?;
         let table = find_table(tx.snapshot.catalog(), &q.table)?.clone();
         let checker = self.cancellation_checker();
-        let targets = scan(tx, &table, checker)?;
+        let targets = scan(tx, &table, checker, self.query_memory()?)?;
         let mut ret = Vec::new();
         let mut count = 0u64;
         for target in targets {
@@ -3092,6 +3222,7 @@ impl SqlSession {
                 "RETURNING result exceeds configured limit",
             ));
         }
+        self.charge_work_memory(values_work_bytes(&values)?)?;
         rows.push(values);
         Ok(())
     }
@@ -4146,10 +4277,71 @@ fn datum_size(value: &Datum) -> usize {
         Datum::Text(text) | Datum::Jsonb(text) => text.len(),
     }
 }
+
+fn work_memory_size_overflow() -> SqlError {
+    SqlError::new("54000", "query work memory accounting overflow")
+}
+
+fn add_work_bytes(total: &mut usize, bytes: usize) -> std::result::Result<(), SqlError> {
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(work_memory_size_overflow)?;
+    Ok(())
+}
+
+fn add_work_items<T>(total: &mut usize, count: usize) -> std::result::Result<(), SqlError> {
+    add_work_bytes(
+        total,
+        count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(work_memory_size_overflow)?,
+    )
+}
+
+fn values_work_bytes(values: &Vec<Datum>) -> std::result::Result<usize, SqlError> {
+    let mut total = std::mem::size_of::<Vec<Datum>>();
+    add_work_items::<Datum>(&mut total, values.capacity())?;
+    for value in values {
+        add_work_bytes(&mut total, datum_size(value))?;
+    }
+    Ok(total)
+}
+
+fn cells_work_bytes(cells: &Vec<Cell>) -> std::result::Result<usize, SqlError> {
+    let mut total = 0usize;
+    add_work_items::<Cell>(&mut total, cells.capacity())?;
+    for cell in cells {
+        add_work_bytes(&mut total, cell.name.capacity())?;
+        if let Some(qualifier) = &cell.qualifier {
+            add_work_bytes(&mut total, qualifier.capacity())?;
+        }
+        add_work_bytes(&mut total, datum_size(&cell.value))?;
+    }
+    Ok(total)
+}
+
+fn row_work_bytes(row: &Row) -> std::result::Result<usize, SqlError> {
+    let mut total = std::mem::size_of::<Row>();
+    add_work_bytes(&mut total, row.key.capacity())?;
+    add_work_items::<(u32, Datum)>(&mut total, row.row.fields.capacity())?;
+    for (_, value) in &row.row.fields {
+        add_work_bytes(&mut total, datum_size(value))?;
+    }
+    add_work_bytes(&mut total, cells_work_bytes(&row.cells)?)?;
+    Ok(total)
+}
+
+fn virtual_row_work_bytes(row: &VirtualRow) -> std::result::Result<usize, SqlError> {
+    let mut total = std::mem::size_of::<VirtualRow>();
+    add_work_bytes(&mut total, cells_work_bytes(&row.cells)?)?;
+    Ok(total)
+}
+
 fn scan(
     tx: &Transaction,
     t: &TableDescriptor,
     checker: Option<&dyn CancellationChecker>,
+    memory: &QueryMemory,
 ) -> std::result::Result<Vec<Row>, SqlError> {
     let p = [
         0x20,
@@ -4163,11 +4355,16 @@ fn scan(
     for (key, bytes) in tx.scan(&p, end.as_deref()) {
         check_cancelled(checker)?;
         let row = chorus_codec::EncodedRowV1::decode(&bytes).map_err(codec_sql)?;
-        out.push(Row {
+        // Decoding one row precedes accounting, but its encoded form is
+        // independently bounded by max_row_bytes. Charge before retaining it
+        // in the materialized scan vector.
+        let row = Row {
             key,
             cells: cells(t, &row),
             row,
-        });
+        };
+        memory.charge(row_work_bytes(&row)?)?;
+        out.push(row);
     }
     Ok(out)
 }
@@ -5699,6 +5896,82 @@ mod tests {
             0,
             "permit must be reusable after an error"
         );
+    }
+
+    #[test]
+    fn work_memory_limits_materialization_and_preserves_transaction_failure_semantics() {
+        let origin = OriginId::new(1);
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let mut limits = Limits::default();
+        limits.query_work_mem_bytes = 512;
+        limits.global_work_mem_bytes = 4096;
+        let engine = SqlEngine::new(store, committer, limits);
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE bounded_work (id integer primary key, value text);",
+                &[],
+            )
+            .unwrap();
+        let large_value = "x".repeat(1024);
+        session
+            .execute(
+                &format!("INSERT INTO bounded_work VALUES (1, '{large_value}');"),
+                &[],
+            )
+            .unwrap();
+
+        let error = session
+            .execute("SELECT id FROM bounded_work ORDER BY id", &[])
+            .expect_err("materialized scan must respect query_work_mem");
+        assert_eq!(error.code, "54000");
+        assert!(error.message.contains("query work memory"));
+        assert_eq!(engine.work_memory.used.load(Ordering::Acquire), 0);
+
+        session.execute("BEGIN", &[]).unwrap();
+        let error = session
+            .execute("SELECT id FROM bounded_work", &[])
+            .expect_err("work-memory error must fail an explicit transaction");
+        assert_eq!(error.code, "54000");
+        assert_eq!(session.transaction_status(), TransactionStatus::Failed);
+        assert_eq!(session.execute("SELECT 1", &[]).unwrap_err().code, "25P02");
+        session.execute("ROLLBACK", &[]).unwrap();
+
+        // Nested prepared execution reuses the outer request's tracker rather
+        // than acquiring a second budget or leaking the first one.
+        session.prepare("small", "SELECT 1").unwrap();
+        session.execute("EXECUTE small", &[]).unwrap();
+        assert_eq!(engine.work_memory.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn global_work_memory_rejects_contention_and_releases_exact_charges() {
+        let pool = WorkMemoryPool::new(64);
+        let first = QueryMemory::new(Arc::clone(&pool), 64);
+        let second = QueryMemory::new(Arc::clone(&pool), 64);
+
+        first.charge(40).unwrap();
+        assert_eq!(pool.used.load(Ordering::Acquire), 40);
+        let error = second
+            .charge(30)
+            .expect_err("combined work memory must not exceed the global limit");
+        assert_eq!(error.code, "54000");
+        assert!(error.message.contains("global work memory"));
+        assert_eq!(
+            second.used.get(),
+            0,
+            "failed charge must not mutate local state"
+        );
+        assert_eq!(pool.used.load(Ordering::Acquire), 40);
+
+        drop(first);
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+        second.charge(30).unwrap();
+        assert_eq!(pool.used.load(Ordering::Acquire), 30);
+        drop(second);
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
     }
 
     #[test]

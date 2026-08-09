@@ -1,12 +1,11 @@
-//! Single-node production bridge from Chorus's synchronous consensus boundary
-//! to the durable OpenRaft/redb adapters.
-//!
-//! This module intentionally has no peer transport. It is useful only when
-//! the configured voter set is exactly the local node; multi-node serving
-//! remains blocked on the authenticated Tonic/Rustls transport.
+//! Production bridge from Chorus's synchronous consensus boundary to durable
+//! OpenRaft/redb adapters. The legacy constructor remains single-node; the
+//! authenticated constructor owns a bounded Tonic/Rustls server and network
+//! factory on the same dedicated Tokio runtime as OpenRaft.
 
 use std::collections::BTreeMap;
 use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
@@ -28,8 +27,13 @@ use openraft::raft::{
 use openraft::storage::RaftLogStorage;
 use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
 use tokio::runtime::Builder;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::TcpListenerStream;
 
+use crate::openraft_transport::{
+    AuthenticatedNetworkFactory, AuthenticatedRaftService, TransportTlsIdentity,
+    authenticated_server_builder, bounded_transport_server,
+};
 use crate::{Consensus, ConsensusStatus};
 
 const REQUEST_QUEUE_CAPACITY: usize = 128;
@@ -37,6 +41,24 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 type ChorusRaft = Raft<ChorusRaftConfig>;
+
+#[derive(Clone, Debug)]
+pub struct OpenRaftRuntimeOptions {
+    pub listen: SocketAddr,
+    pub heartbeat_ms: u64,
+    pub election_timeout_min_ms: u64,
+    pub election_timeout_max_ms: u64,
+    pub snapshot_entries: u64,
+}
+
+enum RuntimeMode {
+    SingleNode,
+    Authenticated {
+        identity: Arc<TransportTlsIdentity>,
+        initial_voters: BTreeMap<u64, BasicNode>,
+        options: OpenRaftRuntimeOptions,
+    },
+}
 
 /// A synchronous `Consensus` implementation backed by one real OpenRaft
 /// runtime on a dedicated thread.
@@ -60,6 +82,116 @@ impl OpenRaftConsensus {
         cluster_id: [u8; 16],
         cluster_incarnation: u64,
         initialize: bool,
+    ) -> Result<Arc<Self>> {
+        Self::open_inner(
+            node_id,
+            raft_path,
+            state_path,
+            cluster_id,
+            cluster_incarnation,
+            initialize,
+            RuntimeMode::SingleNode,
+        )
+    }
+
+    /// Open one member of an authenticated static OpenRaft group.
+    ///
+    /// Only the lowest configured voter may pass `initialize=true`. Empty
+    /// non-bootstrap members are allowed to start their authenticated RPC
+    /// server and wait for that explicit bootstrap; ordinary startup never
+    /// calls `Raft::initialize` on its own.
+    pub fn open_authenticated(
+        node_id: u64,
+        raft_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+        initialize: bool,
+        identity: Arc<TransportTlsIdentity>,
+        initial_voters: BTreeMap<u64, String>,
+        options: OpenRaftRuntimeOptions,
+    ) -> Result<Arc<Self>> {
+        if identity.node_id != node_id
+            || identity.cluster_id != cluster_id
+            || identity.cluster_incarnation != cluster_incarnation
+        {
+            return Err(ChorusError::Consensus(
+                "authenticated transport identity does not match the durable node identity".into(),
+            ));
+        }
+        identity
+            .validate()
+            .map_err(|error| ChorusError::Consensus(error.to_string()))?;
+        if initial_voters.len() < 3
+            || initial_voters.len() > 5
+            || initial_voters.len() % 2 == 0
+            || !initial_voters.contains_key(&node_id)
+        {
+            return Err(ChorusError::Consensus(
+                "authenticated static bootstrap requires 3 or 5 voters including the local node"
+                    .into(),
+            ));
+        }
+        if options.listen.port() == 0 {
+            return Err(ChorusError::Consensus(
+                "authenticated OpenRaft listen port must be nonzero".into(),
+            ));
+        }
+        let peer_ids: Vec<_> = identity.peers.keys().copied().collect();
+        let expected_peers: Vec<_> = initial_voters
+            .keys()
+            .copied()
+            .filter(|peer| *peer != node_id)
+            .collect();
+        if peer_ids != expected_peers {
+            return Err(ChorusError::Consensus(
+                "authenticated peer manifest does not exactly match the static voter set".into(),
+            ));
+        }
+        if identity.peers.iter().any(|(peer_id, peer)| {
+            initial_voters.get(peer_id).map(String::as_str) != Some(peer.endpoint.as_str())
+        }) {
+            return Err(ChorusError::Consensus(
+                "authenticated peer endpoints do not match the static voter directory".into(),
+            ));
+        }
+        let bootstrap = initial_voters
+            .keys()
+            .next()
+            .copied()
+            .ok_or_else(|| ChorusError::Consensus("authenticated voter set is empty".into()))?;
+        if initialize && node_id != bootstrap {
+            return Err(ChorusError::Consensus(format!(
+                "only deterministic bootstrap voter {bootstrap} may initialize the cluster"
+            )));
+        }
+        let initial_voters = initial_voters
+            .into_iter()
+            .map(|(node_id, endpoint)| (node_id, BasicNode::new(endpoint)))
+            .collect();
+        Self::open_inner(
+            node_id,
+            raft_path,
+            state_path,
+            cluster_id,
+            cluster_incarnation,
+            initialize,
+            RuntimeMode::Authenticated {
+                identity,
+                initial_voters,
+                options,
+            },
+        )
+    }
+
+    fn open_inner(
+        node_id: u64,
+        raft_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+        cluster_id: [u8; 16],
+        cluster_incarnation: u64,
+        initialize: bool,
+        mode: RuntimeMode,
     ) -> Result<Arc<Self>> {
         if node_id == 0 {
             return Err(ChorusError::Consensus(
@@ -85,11 +217,23 @@ impl OpenRaftConsensus {
         if state_initialized {
             let voters: Vec<_> = stored_membership.voter_ids().collect();
             let learners: Vec<_> = stored_membership.membership().learner_ids().collect();
-            if voters != [node_id] || !learners.is_empty() {
-                return Err(ChorusError::Consensus(
-                    "single-node adapter refuses durable multi-node or foreign-node membership"
-                        .into(),
-                ));
+            match &mode {
+                RuntimeMode::SingleNode if voters != [node_id] || !learners.is_empty() => {
+                    return Err(ChorusError::Consensus(
+                        "single-node adapter refuses durable multi-node or foreign-node membership"
+                            .into(),
+                    ));
+                }
+                RuntimeMode::Authenticated { initial_voters, .. }
+                    if voters != initial_voters.keys().copied().collect::<Vec<_>>()
+                        || !learners.is_empty() =>
+                {
+                    return Err(ChorusError::Consensus(
+                        "durable membership does not match the authenticated static voter manifest"
+                            .into(),
+                    ));
+                }
+                _ => {}
             }
         }
 
@@ -104,6 +248,7 @@ impl OpenRaftConsensus {
             .spawn(move || {
                 let runtime = match Builder::new_multi_thread()
                     .worker_threads(2)
+                    .enable_io()
                     .enable_time()
                     .build()
                 {
@@ -120,6 +265,7 @@ impl OpenRaftConsensus {
                     thread_state,
                     initialize,
                     state_initialized,
+                    mode,
                     receiver,
                     startup_tx,
                 ));
@@ -218,7 +364,8 @@ impl Consensus for OpenRaftConsensus {
             return Ok(());
         }
         Err(ChorusError::Consensus(
-            "multi-node membership requires the authenticated OpenRaft transport".into(),
+            "live OpenRaft membership changes are not implemented by the static bootstrap adapter"
+                .into(),
         ))
     }
 
@@ -295,9 +442,11 @@ async fn run_runtime(
     state_machine: RedbStateMachine,
     initialize: bool,
     state_initialized: bool,
+    mode: RuntimeMode,
     mut receiver: mpsc::Receiver<RuntimeRequest>,
     startup: std_mpsc::SyncSender<std::result::Result<(), String>>,
 ) {
+    let authenticated = matches!(mode, RuntimeMode::Authenticated { .. });
     let mut log_store = log_store;
     let committed = match log_store.read_committed().await {
         Ok(committed) => committed,
@@ -322,7 +471,7 @@ async fn run_runtime(
         ));
         return;
     }
-    if !initialize && !state_initialized && committed.is_none() {
+    if !initialize && !state_initialized && committed.is_none() && !authenticated {
         let message = if log_nonempty {
             "OpenRaft log is nonempty without committed membership; recovery is required"
         } else {
@@ -338,65 +487,176 @@ async fn run_runtime(
         return;
     }
 
-    let config = match single_node_config() {
-        Ok(config) => config,
-        Err(error) => {
-            let _ = startup.send(Err(error));
-            return;
+    let mut server_shutdown = None;
+    let mut server_task = None;
+    let (raft, initial_members, wait_for_self_leader) = match mode {
+        RuntimeMode::SingleNode => {
+            let config = match single_node_config() {
+                Ok(config) => config,
+                Err(error) => {
+                    let _ = startup.send(Err(error));
+                    return;
+                }
+            };
+            let raft = match ChorusRaft::new(
+                node_id,
+                config,
+                NoNetworkFactory,
+                log_store,
+                state_machine.clone(),
+            )
+            .await
+            {
+                Ok(raft) => raft,
+                Err(error) => {
+                    let _ = startup.send(Err(format!("could not open OpenRaft node: {error}")));
+                    return;
+                }
+            };
+            (
+                raft,
+                BTreeMap::from([(node_id, BasicNode::new(format!("single-node://{node_id}")))]),
+                true,
+            )
         }
-    };
-    let raft = match ChorusRaft::new(
-        node_id,
-        config,
-        NoNetworkFactory,
-        log_store,
-        state_machine.clone(),
-    )
-    .await
-    {
-        Ok(raft) => raft,
-        Err(error) => {
-            let _ = startup.send(Err(format!("could not open OpenRaft node: {error}")));
-            return;
+        RuntimeMode::Authenticated {
+            identity,
+            initial_voters,
+            options,
+        } => {
+            let listener = match tokio::net::TcpListener::bind(options.listen).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    let _ = startup.send(Err(format!(
+                        "could not bind authenticated OpenRaft listener {}: {error}",
+                        options.listen
+                    )));
+                    return;
+                }
+            };
+            let config = match authenticated_config(&options) {
+                Ok(config) => config,
+                Err(error) => {
+                    let _ = startup.send(Err(error));
+                    return;
+                }
+            };
+            let network = match AuthenticatedNetworkFactory::new(Arc::clone(&identity)) {
+                Ok(network) => network,
+                Err(error) => {
+                    let _ = startup.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let raft =
+                match ChorusRaft::new(node_id, config, network, log_store, state_machine.clone())
+                    .await
+                {
+                    Ok(raft) => raft,
+                    Err(error) => {
+                        let _ = startup.send(Err(format!("could not open OpenRaft node: {error}")));
+                        return;
+                    }
+                };
+            let service = match AuthenticatedRaftService::new(raft.clone(), Arc::clone(&identity)) {
+                Ok(service) => service,
+                Err(error) => {
+                    let _ = startup.send(Err(error.to_string()));
+                    let _ = raft.shutdown().await;
+                    return;
+                }
+            };
+            let tls = match identity.server_tls_config() {
+                Ok(tls) => tls,
+                Err(error) => {
+                    let _ = startup.send(Err(error.to_string()));
+                    let _ = raft.shutdown().await;
+                    return;
+                }
+            };
+            let mut server = match authenticated_server_builder().tls_config(tls) {
+                Ok(server) => server,
+                Err(error) => {
+                    let _ = startup.send(Err(format!(
+                        "could not configure authenticated OpenRaft TLS server: {error}"
+                    )));
+                    let _ = raft.shutdown().await;
+                    return;
+                }
+            };
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let incoming = TcpListenerStream::new(listener);
+            let task = tokio::spawn(async move {
+                server
+                    .add_service(bounded_transport_server(service))
+                    .serve_with_incoming_shutdown(incoming, async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            server_shutdown = Some(shutdown_tx);
+            server_task = Some(task);
+            (raft, initial_voters, initialize)
         }
     };
 
     if initialize {
-        let members =
-            BTreeMap::from([(node_id, BasicNode::new(format!("single-node://{node_id}")))]);
-        match tokio::time::timeout(OPERATION_TIMEOUT, raft.initialize(members)).await {
+        match tokio::time::timeout(OPERATION_TIMEOUT, raft.initialize(initial_members)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 let _ = startup.send(Err(format!("OpenRaft initialization failed: {error}")));
+                stop_transport_server(&mut server_shutdown, &mut server_task).await;
                 let _ = raft.shutdown().await;
                 return;
             }
             Err(_) => {
                 let _ = startup.send(Err("OpenRaft initialization timed out".into()));
+                stop_transport_server(&mut server_shutdown, &mut server_task).await;
                 let _ = raft.shutdown().await;
                 return;
             }
         }
     }
 
-    // Whether freshly initialized or reopened, do not publish the adapter
-    // until the one-member group has elected this process.
-    match raft
-        .wait(Some(OPERATION_TIMEOUT))
-        .current_leader(node_id, "single-node OpenRaft leader")
-        .await
-    {
-        Ok(_) => {
-            let _ = startup.send(Ok(()));
-        }
-        Err(error) => {
-            let _ = startup.send(Err(format!("OpenRaft leader startup failed: {error}")));
-            let _ = raft.shutdown().await;
-            return;
+    if wait_for_self_leader {
+        match raft
+            .wait(Some(OPERATION_TIMEOUT))
+            .current_leader(node_id, "OpenRaft bootstrap leader")
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                let _ = startup.send(Err(format!("OpenRaft leader startup failed: {error}")));
+                stop_transport_server(&mut server_shutdown, &mut server_task).await;
+                let _ = raft.shutdown().await;
+                return;
+            }
         }
     }
+    let _ = startup.send(Ok(()));
 
-    while let Some(request) = receiver.recv().await {
+    loop {
+        let request = if let Some(task) = server_task.as_mut() {
+            tokio::select! {
+                request = receiver.recv() => request,
+                result = task => {
+                    server_task = None;
+                    let message = match result {
+                        Ok(Ok(())) => "authenticated OpenRaft server stopped unexpectedly".into(),
+                        Ok(Err(error)) => format!("authenticated OpenRaft server failed: {error}"),
+                        Err(error) => format!("authenticated OpenRaft server task failed: {error}"),
+                    };
+                    eprintln!("{message}");
+                    break;
+                }
+            }
+        } else {
+            receiver.recv().await
+        };
+        let Some(request) = request else {
+            break;
+        };
         match request {
             RuntimeRequest::Write { command, response } => {
                 let result =
@@ -470,13 +730,33 @@ async fn run_runtime(
                 }));
             }
             RuntimeRequest::Shutdown { response } => {
+                stop_transport_server(&mut server_shutdown, &mut server_task).await;
                 let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, raft.shutdown()).await;
                 let _ = response.send(());
                 return;
             }
         }
     }
+    stop_transport_server(&mut server_shutdown, &mut server_task).await;
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, raft.shutdown()).await;
+}
+
+async fn stop_transport_server(
+    shutdown: &mut Option<oneshot::Sender<()>>,
+    task: &mut Option<tokio::task::JoinHandle<std::result::Result<(), String>>>,
+) {
+    if let Some(shutdown) = shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    if let Some(mut task) = task.take() {
+        if tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 fn single_node_config() -> std::result::Result<Arc<Config>, String> {
@@ -492,6 +772,25 @@ fn single_node_config() -> std::result::Result<Arc<Config>, String> {
     .validate()
     .map(Arc::new)
     .map_err(|error| format!("invalid OpenRaft configuration: {error}"))
+}
+
+fn authenticated_config(
+    options: &OpenRaftRuntimeOptions,
+) -> std::result::Result<Arc<Config>, String> {
+    Config {
+        cluster_name: "chorus-authenticated".into(),
+        heartbeat_interval: options.heartbeat_ms,
+        election_timeout_min: options.election_timeout_min_ms,
+        election_timeout_max: options.election_timeout_max_ms,
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(options.snapshot_entries),
+        snapshot_max_chunk_size: crate::openraft_transport::MAX_SNAPSHOT_CHUNK_BYTES as u64,
+        max_payload_entries: crate::openraft_transport::MAX_APPEND_ENTRIES as u64,
+        max_in_snapshot_log_to_keep: options.snapshot_entries.min(10_000),
+        ..Config::default()
+    }
+    .validate()
+    .map(Arc::new)
+    .map_err(|error| format!("invalid authenticated OpenRaft configuration: {error}"))
 }
 
 #[derive(Clone, Copy)]

@@ -5,7 +5,7 @@
 //! deterministic in-process cluster used by tests and local development.
 
 pub mod openraft_adapter;
-pub use openraft_adapter::OpenRaftConsensus;
+pub use openraft_adapter::{OpenRaftConsensus, OpenRaftRuntimeOptions};
 
 pub mod openraft_transport;
 
@@ -73,10 +73,27 @@ pub trait Consensus: Send + Sync {
 pub struct ConsensusCommitter {
     inner: Arc<dyn Consensus>,
     origin: chorus_common::OriginId,
+    activated: Mutex<bool>,
 }
 impl ConsensusCommitter {
     pub fn new(inner: Arc<dyn Consensus>, origin: chorus_common::OriginId) -> Arc<Self> {
-        Arc::new(Self { inner, origin })
+        Arc::new(Self {
+            inner,
+            origin,
+            // Preserve the historical constructor contract for tests and
+            // adapters that do not require replicated origin activation.
+            activated: Mutex::new(true),
+        })
+    }
+    pub fn new_pending_activation(
+        inner: Arc<dyn Consensus>,
+        origin: chorus_common::OriginId,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            origin,
+            activated: Mutex::new(false),
+        })
     }
     pub fn new_activated(
         inner: Arc<dyn Consensus>,
@@ -85,15 +102,29 @@ impl ConsensusCommitter {
         inner.activate_origin(origin)?;
         Ok(Self::new(inner, origin))
     }
+
+    fn ensure_activated(&self) -> Result<()> {
+        let mut activated = self
+            .activated
+            .lock()
+            .map_err(|_| ChorusError::Consensus("origin activation lock is poisoned".into()))?;
+        if !*activated {
+            self.inner.activate_origin(self.origin)?;
+            *activated = true;
+        }
+        Ok(())
+    }
 }
 impl chorus_txn::Committer for ConsensusCommitter {
     fn read_barrier(&self) -> Result<StateSnapshot> {
         self.inner.read_barrier()
     }
     fn submit(&self, command: CommitTransactionV1) -> Result<ApplyResult> {
+        self.ensure_activated()?;
         self.inner.submit(command)
     }
     fn submit_schema(&self, command: SchemaCommandV1) -> Result<ApplyResult> {
+        self.ensure_activated()?;
         self.inner.submit_schema(command)
     }
     fn origin(&self) -> chorus_common::OriginId {

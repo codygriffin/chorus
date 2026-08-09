@@ -8,7 +8,8 @@ use chorus_codec::{LogicalSnapshot, ReplicatedCommandV1};
 use chorus_common::{LogId, OriginId};
 use chorus_consensus::openraft_transport::{PeerTlsConfig, TransportTlsIdentity, leaf_fingerprint};
 use chorus_consensus::{
-    Consensus, ConsensusCommitter, NetworkConsensus, OpenRaftConsensus, StandaloneConsensus,
+    Consensus, ConsensusCommitter, NetworkConsensus, OpenRaftConsensus, OpenRaftRuntimeOptions,
+    StandaloneConsensus,
 };
 use chorus_pg::{PgConfig, PgServer};
 use chorus_sql::SqlEngine;
@@ -32,6 +33,36 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
     match command {
         "bootstrap" => {
             let path = config_path;
+            if has_flag(&args, "--openraft-mtls") {
+                if !has_flag(&args, "--confirm") {
+                    return Err("authenticated OpenRaft bootstrap requires --confirm".into());
+                }
+                if !Path::new(&path).exists() {
+                    return Err(
+                        "authenticated OpenRaft bootstrap requires an operator-provisioned config"
+                            .into(),
+                    );
+                }
+                let cfg = Config::load(&path).map_err(|error| error.to_string())?;
+                if cfg.node_id
+                    != cfg
+                        .openraft_bootstrap_node_id()
+                        .map_err(|error| error.to_string())?
+                {
+                    return Err(
+                        "only the lowest configured voter may bootstrap authenticated OpenRaft"
+                            .into(),
+                    );
+                }
+                let consensus = open_authenticated_consensus(&cfg, true)?;
+                drop(consensus);
+                log_event(
+                    "openraft_mtls_bootstrapped",
+                    serde_json::json!({ "config": path, "node_id": cfg.node_id }),
+                );
+                println!("bootstrapped authenticated OpenRaft {path}");
+                return Ok(());
+            }
             if Path::new(&path).exists() && !has_flag(&args, "--confirm") {
                 return Err(format!(
                     "bootstrap refuses to overwrite existing {}; pass --confirm",
@@ -158,17 +189,11 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
     if openraft_single_node && openraft_mtls {
         return Err("choose only one OpenRaft serving mode".into());
     }
-    if openraft_mtls {
-        let _identity = openraft_transport_identity(&cfg)?;
-        return Err(
-            "authenticated OpenRaft configuration is valid, but multi-node runtime wiring is not enabled in this checkpoint"
-                .into(),
-        );
-    }
     if openraft_single_node {
         validate_openraft_single_node(&cfg)?;
     }
     if cfg.initial_nodes.len() > 1
+        && !openraft_mtls
         && !cfg.allow_insecure_dev
         && !has_flag(args, "--allow-insecure-dev")
     {
@@ -176,7 +201,7 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
             "multi-node startup requires the mTLS peer transport; current adapter is plaintext, so pass allow_insecure_dev in config or --allow-insecure-dev for an explicit development-only run".into(),
         );
     }
-    if cfg.initial_nodes.len() > 1 {
+    if cfg.initial_nodes.len() > 1 && !openraft_mtls {
         log_event(
             "security_warning",
             serde_json::json!({
@@ -194,8 +219,24 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
         }),
     );
     let origin = OriginId::new(cfg.node_id);
-    let (store, committer): (Arc<dyn StateStore>, Arc<ConsensusCommitter>) = if openraft_single_node
-    {
+    let (store, committer): (Arc<dyn StateStore>, Arc<ConsensusCommitter>) = if openraft_mtls {
+        let consensus = open_authenticated_consensus(&cfg, false)?;
+        let store = consensus.store();
+        let committer = match ConsensusCommitter::new_activated(consensus.clone(), origin) {
+            Ok(committer) => committer,
+            Err(error) => {
+                log_event(
+                    "openraft_gateway_waiting_for_leadership",
+                    serde_json::json!({
+                        "node_id": cfg.node_id,
+                        "reason": error.to_string(),
+                    }),
+                );
+                ConsensusCommitter::new_pending_activation(consensus, origin)
+            }
+        };
+        (store, committer)
+    } else if openraft_single_node {
         // `open_store` is deliberately opened first: it owns the hardened,
         // immutable installation identity checks. The compatibility state
         // must remain empty, so this mode can never reinterpret a legacy
@@ -630,6 +671,59 @@ fn openraft_transport_identity(cfg: &Config) -> Result<Arc<TransportTlsIdentity>
     Ok(identity)
 }
 
+fn open_authenticated_consensus(
+    cfg: &Config,
+    initialize: bool,
+) -> Result<Arc<OpenRaftConsensus>, String> {
+    let identity = openraft_transport_identity(cfg)?;
+    if cfg.initial_nodes.iter().any(|node| !node.voter) {
+        return Err(
+            "authenticated static bootstrap currently requires every initial node to be a voter; add learners through live membership after bootstrap"
+                .into(),
+        );
+    }
+    // Open the compatibility store only to enforce the immutable installation
+    // identity and to refuse reinterpretation of legacy state as OpenRaft.
+    let legacy_store = open_store(cfg).map_err(|error| error.to_string())?;
+    ensure_openraft_legacy_state_empty(&legacy_store)?;
+    drop(legacy_store);
+
+    let (raft_path, state_path) = openraft_paths(cfg);
+    validate_redb_target(&raft_path, "raft.redb")?;
+    validate_redb_target(&state_path, "state/active.redb")?;
+    let initial_voters = cfg
+        .initial_nodes
+        .iter()
+        .map(|node| (node.node_id, node.endpoint.clone()))
+        .collect();
+    let options = OpenRaftRuntimeOptions {
+        listen: cfg
+            .raft
+            .listen
+            .parse()
+            .map_err(|_| "raft.listen is not a socket address".to_string())?,
+        heartbeat_ms: cfg.raft.heartbeat_ms,
+        election_timeout_min_ms: cfg.raft.election_timeout_min_ms,
+        election_timeout_max_ms: cfg.raft.election_timeout_max_ms,
+        snapshot_entries: cfg.raft.snapshot_entries,
+    };
+    let consensus = OpenRaftConsensus::open_authenticated(
+        cfg.node_id,
+        &raft_path,
+        &state_path,
+        cfg.cluster_id().0,
+        cfg.cluster_incarnation,
+        initialize,
+        identity,
+        initial_voters,
+        options,
+    )
+    .map_err(|error| error.to_string())?;
+    harden_file(&raft_path, false)?;
+    harden_file(&state_path, false)?;
+    Ok(consensus)
+}
+
 fn ensure_openraft_legacy_state_empty(store: &dyn StateStore) -> Result<(), String> {
     let snapshot = store.snapshot().map_err(|error| error.to_string())?;
     if snapshot.last_applied() != LogId::ZERO
@@ -899,7 +993,6 @@ mod tests {
     #[test]
     fn openraft_mtls_identity_binds_local_leaf_and_peer_manifest_before_runtime() {
         let root = tempfile::tempdir().unwrap();
-        let config_path = root.path().join("chorus.toml");
         let config = authenticated_test_config(root.path());
         let identity = openraft_transport_identity(&config).unwrap();
         assert_eq!(config.cluster_id().0, identity.cluster_id);
@@ -908,14 +1001,6 @@ mod tests {
             vec![2, 3],
             identity.peers.keys().copied().collect::<Vec<_>>()
         );
-
-        config.save(&config_path).unwrap();
-        let error = run_command(
-            &["run".into(), "--openraft-mtls".into()],
-            &config_path.display().to_string(),
-        )
-        .unwrap_err();
-        assert!(error.contains("runtime wiring is not enabled"));
         assert!(!config.data_dir.join("raft.redb").exists());
 
         let mut wrong_leaf = config;

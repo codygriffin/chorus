@@ -22,6 +22,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+pub(crate) fn validate_activation_result(result: ApplyResult) -> Result<()> {
+    match result {
+        ApplyResult::Activated => Ok(()),
+        ApplyResult::StaleOrigin => Err(ChorusError::Consensus(
+            "origin activation was rejected because the node is not a current member".into(),
+        )),
+        ApplyResult::ProtocolError(message) | ApplyResult::Rejected(message) => Err(
+            ChorusError::Protocol(format!("origin activation was rejected: {message}")),
+        ),
+        other => Err(ChorusError::Consensus(format!(
+            "origin activation returned an unexpected result: {other:?}"
+        ))),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsensusStatus {
     pub node_id: u64,
@@ -155,6 +170,19 @@ impl Consensus for StandaloneConsensus {
     fn activate_origin(&self, origin: chorus_common::OriginId) -> Result<()> {
         let snapshot = self.store.snapshot()?;
         if snapshot
+            .membership()
+            .voters
+            .binary_search(&origin.node_id)
+            .is_err()
+            && snapshot
+                .membership()
+                .learners
+                .binary_search(&origin.node_id)
+                .is_err()
+        {
+            return validate_activation_result(ApplyResult::StaleOrigin);
+        }
+        if snapshot
             .origins()
             .get(&origin.node_id)
             .is_some_and(|state| state.active_origin == origin)
@@ -162,14 +190,14 @@ impl Consensus for StandaloneConsensus {
             return Ok(());
         }
         let index = snapshot.last_applied().index + 1;
-        self.store.apply(
+        let result = self.store.apply(
             LogId {
                 term: *self.term.lock().unwrap(),
                 index,
             },
             &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 { origin }),
         )?;
-        Ok(())
+        validate_activation_result(result)
     }
     fn read_barrier(&self) -> Result<StateSnapshot> {
         if !*self.leader.lock().unwrap() {
@@ -1093,10 +1121,10 @@ impl Consensus for NetworkConsensus {
                 "origin activation must use this node's identity".into(),
             ));
         }
-        self.append(ReplicatedCommandV1::ActivateOrigin(
+        let result = self.append(ReplicatedCommandV1::ActivateOrigin(
             chorus_codec::ActivateOriginV1 { origin },
-        ))
-        .map(|_| ())
+        ))?;
+        validate_activation_result(result)
     }
     fn read_barrier(&self) -> Result<StateSnapshot> {
         if self
@@ -1277,6 +1305,49 @@ pub struct InMemoryCluster {
 }
 impl InMemoryCluster {
     pub fn new(replicas: Vec<(u64, Arc<dyn StateStore>)>) -> Arc<Self> {
+        let mut voters: Vec<_> = replicas.iter().map(|(id, _)| *id).collect();
+        voters.sort_unstable();
+        assert!(
+            !voters.is_empty() && !voters.contains(&0),
+            "in-memory cluster requires nonzero voters"
+        );
+        assert!(
+            voters.windows(2).all(|pair| pair[0] != pair[1]),
+            "in-memory cluster voter ids must be unique"
+        );
+
+        // The deterministic cluster represents an already provisioned voter
+        // set. Persist that membership through the same state-machine path as
+        // production before any node origin can be activated. This avoids
+        // accidentally authorizing against StateData's single-node default.
+        let membership = ReplicatedCommandV1::Membership {
+            voters: voters.clone(),
+            learners: Vec::new(),
+        };
+        for (_, store) in &replicas {
+            let snapshot = store
+                .snapshot()
+                .expect("in-memory cluster must read each replica before initialization");
+            if snapshot.last_applied() == LogId::ZERO {
+                let result = store
+                    .apply(LogId { term: 1, index: 1 }, &membership)
+                    .expect("in-memory cluster must persist initial membership");
+                assert!(
+                    matches!(result, ApplyResult::Noop),
+                    "initial in-memory membership returned {result:?}"
+                );
+            } else {
+                assert_eq!(
+                    snapshot.membership().voters,
+                    voters,
+                    "reopened in-memory replica voter set differs from configured voters"
+                );
+                assert!(
+                    snapshot.membership().learners.is_empty(),
+                    "reopened in-memory replica unexpectedly contains learners"
+                );
+            }
+        }
         let max = replicas
             .iter()
             .filter_map(|(_, s)| s.snapshot().ok().map(|x| x.last_applied().index))
@@ -1354,7 +1425,7 @@ impl InMemoryCluster {
             term: *self.term.lock().unwrap(),
             index: *i,
         };
-        let mut replicas = self.replicas.lock().unwrap();
+        let replicas = self.replicas.lock().unwrap();
         let mut before = Vec::new();
         for replica in replicas.iter().filter(|replica| replica.healthy) {
             before.push((replica.id, snapshot_from_store(replica.store.as_ref())?));
@@ -1392,10 +1463,10 @@ pub struct ClusterConsensus {
 impl Consensus for ClusterConsensus {
     fn activate_origin(&self, origin: chorus_common::OriginId) -> Result<()> {
         self.local_store_if_healthy()?;
-        let _ = self.cluster.append(ReplicatedCommandV1::ActivateOrigin(
+        let result = self.cluster.append(ReplicatedCommandV1::ActivateOrigin(
             chorus_codec::ActivateOriginV1 { origin },
         ))?;
-        Ok(())
+        validate_activation_result(result)
     }
     fn read_barrier(&self) -> Result<StateSnapshot> {
         if !self.cluster.quorum() {
@@ -1535,6 +1606,11 @@ mod tests {
             (2, stores[1].clone()),
             (3, stores[2].clone()),
         ]);
+        for store in &stores {
+            let snapshot = store.snapshot().unwrap();
+            assert_eq!(snapshot.membership().voters, vec![1, 2, 3]);
+            assert_eq!(snapshot.membership().log_id, LogId { term: 1, index: 1 });
+        }
         let origin = OriginId::new(2);
         let adapter = cluster.adapter(2);
         Consensus::activate_origin(&adapter, origin).unwrap();
@@ -1564,6 +1640,43 @@ mod tests {
         cluster.set_healthy(3, true);
         assert_eq!(cluster.leader(), Some(2));
         assert!(adapter.read_barrier().is_ok());
+    }
+
+    #[test]
+    fn activation_does_not_accept_a_stale_origin_result() {
+        let store = Arc::new(MemoryStateStore::new()) as Arc<dyn StateStore>;
+        let consensus = StandaloneConsensus::new(2, store.clone());
+
+        assert!(matches!(
+            consensus.activate_origin(OriginId::new(2)),
+            Err(ChorusError::Consensus(_))
+        ));
+        let snapshot = store.snapshot().unwrap();
+        assert!(snapshot.origins().is_empty());
+        assert_eq!(snapshot.last_applied(), LogId::ZERO);
+        assert!(validate_activation_result(ApplyResult::StaleOrigin).is_err());
+
+        // A state written by an older implementation may still retain an
+        // origin record after membership no longer includes that node. The
+        // standalone fast path must not treat the matching record as proof
+        // that the process is authorized.
+        let legacy_origin = OriginId::new(2);
+        let mut legacy = chorus_storage::StateData::default();
+        legacy.origins.insert(
+            legacy_origin.node_id,
+            chorus_codec::NodeOriginState {
+                active_origin: legacy_origin,
+                last_sequence: 0,
+                recent_results: Vec::new(),
+            },
+        );
+        let legacy_store = Arc::new(MemoryStateStore::from_data(legacy)) as Arc<dyn StateStore>;
+        let legacy_consensus = StandaloneConsensus::new(2, legacy_store.clone());
+        assert!(matches!(
+            legacy_consensus.activate_origin(legacy_origin),
+            Err(ChorusError::Consensus(_))
+        ));
+        assert_eq!(legacy_store.snapshot().unwrap().last_applied(), LogId::ZERO);
     }
 
     #[test]

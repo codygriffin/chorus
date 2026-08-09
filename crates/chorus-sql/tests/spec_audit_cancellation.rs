@@ -29,7 +29,7 @@ impl CancellationChecker for CancelAfter {
 fn cancellation_rolls_back_partially_staged_implicit_write() {
     let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
     let committer: Arc<dyn Committer> =
-        Arc::new(LocalCommitter::new(store.clone(), OriginId::new(91)).expect("local committer"));
+        Arc::new(LocalCommitter::new(store.clone(), OriginId::new(1)).expect("local committer"));
     let engine = SqlEngine::new(store, committer, Limits::default());
     let mut session = engine.session();
     session

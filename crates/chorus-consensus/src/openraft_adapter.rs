@@ -368,10 +368,10 @@ impl OpenRaftConsensus {
 
 impl Consensus for OpenRaftConsensus {
     fn activate_origin(&self, origin: OriginId) -> Result<()> {
-        self.write(ReplicatedCommandV1::ActivateOrigin(ActivateOriginV1 {
+        let result = self.write(ReplicatedCommandV1::ActivateOrigin(ActivateOriginV1 {
             origin,
         }))?;
-        Ok(())
+        crate::validate_activation_result(result)
     }
 
     fn read_barrier(&self) -> Result<StateSnapshot> {

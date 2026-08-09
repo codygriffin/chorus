@@ -71,7 +71,7 @@ fn engine_with_delays(
     let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
     let committer = Arc::new(SlowCommitter::new(
         Arc::clone(&store),
-        OriginId::new(701),
+        OriginId::new(1),
         read_delay,
         submit_delay,
     ));

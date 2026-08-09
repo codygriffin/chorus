@@ -39,7 +39,10 @@ impl Committer for ApplyThenLoseResponse {
 #[test]
 fn retry_after_ambiguous_apply_reuses_the_same_request_identity() {
     let store = Arc::new(MemoryStateStore::new()) as Arc<dyn StateStore>;
-    let origin = OriginId::new(9);
+    // MemoryStateStore starts with the deterministic bootstrap membership
+    // containing node 1; use that authorized origin for this local retry
+    // exercise rather than relying on an unreplicated activation.
+    let origin = OriginId::new(1);
     let local = Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
     let committer = ApplyThenLoseResponse {
         inner: local.clone(),

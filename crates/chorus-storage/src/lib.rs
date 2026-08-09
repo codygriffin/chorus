@@ -1285,46 +1285,69 @@ fn apply_command(
             data.last_applied.term, log_id.term
         )));
     }
-    let result = match command {
-        ReplicatedCommandV1::Noop => ApplyResult::Noop,
-        ReplicatedCommandV1::Membership { voters, learners } => {
-            let voters_sorted = voters.windows(2).all(|w| w[0] < w[1]);
-            let learners_sorted = learners.windows(2).all(|w| w[0] < w[1]);
-            if !voters_sorted
-                || !learners_sorted
-                || voters.iter().any(|id| learners.binary_search(id).is_ok())
-                || voters.contains(&0)
-                || learners.contains(&0)
-            {
-                ApplyResult::Rejected("membership contains overlapping or invalid node ids".into())
-            } else {
-                data.membership = Membership {
-                    log_id,
-                    voters: voters.clone(),
-                    learners: learners.clone(),
-                };
-                ApplyResult::Noop
+    // Membership authorization is part of deterministic apply, not merely a
+    // gateway check. A removed or not-yet-added node can therefore never
+    // mutate state even if an already-ordered command reaches every replica.
+    let command_origin = match command {
+        ReplicatedCommandV1::ActivateOrigin(command) => Some(command.origin.node_id),
+        ReplicatedCommandV1::CommitTransaction(command) => Some(command.request_id.origin.node_id),
+        ReplicatedCommandV1::SchemaChange(command) => Some(command.request_id.origin.node_id),
+        ReplicatedCommandV1::Noop | ReplicatedCommandV1::Membership { .. } => None,
+    };
+    let authorized = command_origin.is_none_or(|node_id| {
+        data.membership.voters.binary_search(&node_id).is_ok()
+            || data.membership.learners.binary_search(&node_id).is_ok()
+    });
+    let result = if !authorized {
+        ApplyResult::StaleOrigin
+    } else {
+        match command {
+            ReplicatedCommandV1::Noop => ApplyResult::Noop,
+            ReplicatedCommandV1::Membership { voters, learners } => {
+                let voters_sorted = voters.windows(2).all(|w| w[0] < w[1]);
+                let learners_sorted = learners.windows(2).all(|w| w[0] < w[1]);
+                if !voters_sorted
+                    || !learners_sorted
+                    || voters.iter().any(|id| learners.binary_search(id).is_ok())
+                    || voters.contains(&0)
+                    || learners.contains(&0)
+                {
+                    ApplyResult::Rejected(
+                        "membership contains overlapping or invalid node ids".into(),
+                    )
+                } else {
+                    data.membership = Membership {
+                        log_id,
+                        voters: voters.clone(),
+                        learners: learners.clone(),
+                    };
+                    data.origins.retain(|node_id, _| {
+                        voters.binary_search(node_id).is_ok()
+                            || learners.binary_search(node_id).is_ok()
+                    });
+                    ApplyResult::Noop
+                }
             }
-        }
-        ReplicatedCommandV1::ActivateOrigin(a) => {
-            if !data
-                .origins
-                .get(&a.origin.node_id)
-                .is_some_and(|state| state.active_origin == a.origin)
-            {
-                data.origins.insert(
-                    a.origin.node_id,
-                    NodeOriginState {
-                        active_origin: a.origin,
-                        last_sequence: 0,
-                        recent_results: Vec::new(),
-                    },
-                );
+            ReplicatedCommandV1::ActivateOrigin(a) => {
+                if !data
+                    .origins
+                    .get(&a.origin.node_id)
+                    .is_some_and(|state| state.active_origin == a.origin)
+                {
+                    data.origins.insert(
+                        a.origin.node_id,
+                        NodeOriginState {
+                            active_origin: a.origin,
+                            last_sequence: 0,
+                            recent_results: Vec::new(),
+                        },
+                    );
+                }
+                ApplyResult::Activated
             }
-            ApplyResult::Activated
+            ReplicatedCommandV1::CommitTransaction(c) => apply_commit(data, log_id, c)?,
+            ReplicatedCommandV1::SchemaChange(c) => apply_schema(data, log_id, c)?,
         }
-        ReplicatedCommandV1::CommitTransaction(c) => apply_commit(data, log_id, c)?,
-        ReplicatedCommandV1::SchemaChange(c) => apply_schema(data, log_id, c)?,
     };
     data.last_applied = log_id;
     Ok(result)
@@ -2221,6 +2244,139 @@ mod tests {
     }
 
     #[test]
+    fn replicated_membership_authorizes_learners_and_fences_removed_origins() {
+        let store = MemoryStateStore::new();
+        let removed_origin = OriginId::new(2);
+        assert_eq!(
+            ApplyResult::StaleOrigin,
+            store
+                .apply(
+                    LogId { term: 1, index: 1 },
+                    &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 {
+                        origin: removed_origin,
+                    }),
+                )
+                .unwrap()
+        );
+        assert!(store.snapshot().unwrap().origins().is_empty());
+
+        store
+            .apply(
+                LogId { term: 1, index: 2 },
+                &ReplicatedCommandV1::Membership {
+                    voters: vec![1],
+                    learners: vec![2],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ApplyResult::Activated,
+            store
+                .apply(
+                    LogId { term: 1, index: 3 },
+                    &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 {
+                        origin: removed_origin,
+                    }),
+                )
+                .unwrap()
+        );
+        assert!(matches!(
+            store
+                .apply(
+                    LogId { term: 1, index: 4 },
+                    &command(removed_origin, 1, 0, b"l", b"learner"),
+                )
+                .unwrap(),
+            ApplyResult::Committed { epoch: 1, .. }
+        ));
+
+        let retained_origin = OriginId::new(1);
+        store
+            .apply(
+                LogId { term: 1, index: 5 },
+                &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 {
+                    origin: retained_origin,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .apply(
+                    LogId { term: 1, index: 6 },
+                    &ReplicatedCommandV1::Membership {
+                        voters: vec![1, 1],
+                        learners: Vec::new(),
+                    },
+                )
+                .unwrap(),
+            ApplyResult::Rejected(_)
+        ));
+        let rejected = store.snapshot().unwrap();
+        assert!(rejected.origins().contains_key(&1));
+        assert!(rejected.origins().contains_key(&2));
+        assert_eq!(vec![1], rejected.membership().voters);
+        assert_eq!(vec![2], rejected.membership().learners);
+
+        store
+            .apply(
+                LogId { term: 1, index: 7 },
+                &ReplicatedCommandV1::Membership {
+                    voters: vec![1],
+                    learners: Vec::new(),
+                },
+            )
+            .unwrap();
+        let removed = store.snapshot().unwrap();
+        assert!(removed.origins().contains_key(&1));
+        assert!(!removed.origins().contains_key(&2));
+
+        assert_eq!(
+            ApplyResult::StaleOrigin,
+            store
+                .apply(
+                    LogId { term: 1, index: 8 },
+                    &command(removed_origin, 2, 1, b"x", b"forbidden"),
+                )
+                .unwrap()
+        );
+        let operation = SchemaOperationV1::CreateTable {
+            table_id: 500,
+            schema_id: 2200,
+            name: "forbidden".into(),
+            schema_version: 1,
+            columns: Vec::new(),
+            primary_key: Vec::new(),
+        };
+        let request_id = RequestId::new(removed_origin, 3);
+        assert_eq!(
+            ApplyResult::StaleOrigin,
+            store
+                .apply(
+                    LogId { term: 1, index: 9 },
+                    &ReplicatedCommandV1::SchemaChange(chorus_codec::SchemaCommandV1 {
+                        request_id,
+                        payload_hash: [0; 32],
+                        base_epoch: 1,
+                        operation,
+                    }),
+                )
+                .unwrap()
+        );
+        let final_snapshot = store.snapshot().unwrap();
+        assert_eq!(LogId { term: 1, index: 9 }, final_snapshot.last_applied());
+        assert_eq!(1, final_snapshot.db_epoch());
+        assert_eq!(0, final_snapshot.catalog_epoch());
+        assert_eq!(Some(&b"learner"[..]), final_snapshot.get(b"l"));
+        assert!(final_snapshot.get(b"x").is_none());
+        assert!(
+            final_snapshot
+                .catalog()
+                .table_by_name("forbidden")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn higher_term_lower_index_cannot_regress_cursor() {
         let store = MemoryStateStore::new();
         for index in 1..=5 {
@@ -2237,10 +2393,19 @@ mod tests {
     #[test]
     fn logical_snapshot_roundtrip_preserves_catalog_and_origins() {
         let store = MemoryStateStore::new();
-        let origin = OriginId::new(3);
         store
             .apply(
                 LogId { term: 1, index: 1 },
+                &ReplicatedCommandV1::Membership {
+                    voters: vec![1, 3, 5],
+                    learners: Vec::new(),
+                },
+            )
+            .unwrap();
+        let origin = OriginId::new(3);
+        store
+            .apply(
+                LogId { term: 1, index: 2 },
                 &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 { origin }),
             )
             .unwrap();
@@ -2261,7 +2426,7 @@ mod tests {
             operation,
         });
         store
-            .apply(LogId { term: 1, index: 2 }, &schema_command)
+            .apply(LogId { term: 1, index: 3 }, &schema_command)
             .unwrap();
         let kv_origin = OriginId {
             node_id: 5,
@@ -2269,7 +2434,7 @@ mod tests {
         };
         store
             .apply(
-                LogId { term: 1, index: 3 },
+                LogId { term: 1, index: 4 },
                 &ReplicatedCommandV1::ActivateOrigin(chorus_codec::ActivateOriginV1 {
                     origin: kv_origin,
                 }),
@@ -2277,7 +2442,7 @@ mod tests {
             .unwrap();
         let kv_command = command(kv_origin, 1, 1, b"\xffk", b"binary-value");
         store
-            .apply(LogId { term: 1, index: 4 }, &kv_command)
+            .apply(LogId { term: 1, index: 5 }, &kv_command)
             .unwrap();
         let snapshot = snapshot_from_store(&store).unwrap();
         let metadata_state: StateData =
@@ -2366,7 +2531,7 @@ mod tests {
         let cluster_id = [8; 16];
         let store = FileStateStore::open(&path).unwrap();
         let origin = OriginId {
-            node_id: 2,
+            node_id: 1,
             boot_nonce: [10; 16],
         };
         store
@@ -2384,7 +2549,7 @@ mod tests {
         let reopened = FileStateStore::open(&path).unwrap();
         assert_eq!(reopened.snapshot().unwrap().cluster_id(), cluster_id);
         assert_eq!(reopened.data().cluster_incarnation, 9);
-        assert!(reopened.snapshot().unwrap().origins().contains_key(&2));
+        assert!(reopened.snapshot().unwrap().origins().contains_key(&1));
         assert_eq!(fs::metadata(&raft_log_path).unwrap().len(), 0);
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(raft_log_path);

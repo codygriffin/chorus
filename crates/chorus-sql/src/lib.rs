@@ -4524,6 +4524,32 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
+    fn store_for_origin(origin: OriginId) -> Arc<dyn StateStore> {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        authorize_store_origin(&store, origin);
+        store
+    }
+
+    fn authorize_store_origin(store: &Arc<dyn StateStore>, origin: OriginId) {
+        let snapshot = store.snapshot().expect("test store snapshot");
+        let authorized = snapshot.membership().voters.contains(&origin.node_id)
+            || snapshot.membership().learners.contains(&origin.node_id);
+        if authorized {
+            return;
+        }
+        let index = snapshot.last_applied().index + 1;
+        let result = store
+            .apply(
+                chorus_common::LogId { term: 1, index },
+                &chorus_codec::ReplicatedCommandV1::Membership {
+                    voters: vec![origin.node_id],
+                    learners: Vec::new(),
+                },
+            )
+            .expect("test membership must apply");
+        assert_eq!(result, ApplyResult::Noop);
+    }
+
     struct CountingCommitter {
         inner: LocalCommitter,
         reads: AtomicUsize,
@@ -4662,8 +4688,8 @@ mod tests {
 
     #[test]
     fn statement_timeout_marks_explicit_transaction_failed_until_rollback() {
-        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         let origin = OriginId::new(104);
+        let store = store_for_origin(origin);
         let committer: Arc<dyn Committer> =
             Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
         let engine = SqlEngine::new(store, committer, Limits::default());
@@ -4702,8 +4728,8 @@ mod tests {
 
     #[test]
     fn drain_rejects_new_work_before_committer_but_allows_existing_transactions() {
-        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         let origin = OriginId::new(101);
+        let store = store_for_origin(origin);
         let counting = Arc::new(CountingCommitter::new(
             LocalCommitter::new(store.clone(), origin).unwrap(),
         ));
@@ -4766,8 +4792,8 @@ mod tests {
 
     #[test]
     fn resolve_pending_command_retries_the_exact_request_once() {
-        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         let origin = OriginId::new(103);
+        let store = store_for_origin(origin);
         let retry = Arc::new(RetryOnceCommitter::new(
             LocalCommitter::new(store.clone(), origin).unwrap(),
         ));
@@ -4807,8 +4833,8 @@ mod tests {
 
     #[test]
     fn legacy_engine_constructor_has_no_drain_gate() {
-        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         let origin = OriginId::new(102);
+        let store = store_for_origin(origin);
         let committer: Arc<dyn Committer> =
             Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
         let engine = SqlEngine::new(store, committer, Limits::default());
@@ -4846,8 +4872,8 @@ mod tests {
 
     #[test]
     fn secondary_unique_index_and_virtual_catalog() {
-        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         let origin = OriginId::new(7);
+        let store = store_for_origin(origin);
         let committer: Arc<dyn Committer> =
             Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
         let engine = SqlEngine::new(store.clone(), committer, Limits::default());
@@ -4893,8 +4919,8 @@ mod tests {
 
     #[test]
     fn grouped_aggregates() {
-        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         let origin = OriginId::new(8);
+        let store = store_for_origin(origin);
         let committer: Arc<dyn Committer> =
             Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
         let engine = SqlEngine::new(store, committer, Limits::default());
@@ -4924,8 +4950,8 @@ mod tests {
 
     #[test]
     fn inner_and_left_join() {
-        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         let origin = OriginId::new(9);
+        let store = store_for_origin(origin);
         let committer: Arc<dyn Committer> =
             Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
         let engine = SqlEngine::new(store, committer, Limits::default());
@@ -4961,8 +4987,8 @@ mod tests {
 
     #[test]
     fn select_binding_rejects_ambiguous_and_invalid_names_before_scan() {
-        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         let origin = OriginId::new(13);
+        let store = store_for_origin(origin);
         let committer: Arc<dyn Committer> =
             Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
         let engine = SqlEngine::new(store, committer, Limits::default());
@@ -5090,8 +5116,8 @@ mod tests {
 
     #[test]
     fn on_conflict_update_uses_excluded_row() {
-        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         let origin = OriginId::new(10);
+        let store = store_for_origin(origin);
         let committer: Arc<dyn Committer> =
             Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
         let engine = SqlEngine::new(store, committer, Limits::default());
@@ -5119,8 +5145,8 @@ mod tests {
 
     #[test]
     fn casts_json_and_coalesce() {
-        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
         let origin = OriginId::new(11);
+        let store = store_for_origin(origin);
         let committer: Arc<dyn Committer> =
             Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
         let engine = SqlEngine::new(store, committer, Limits::default());
@@ -5163,6 +5189,7 @@ mod tests {
         )]);
         let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::from_data(data));
         let origin = OriginId::new(12);
+        authorize_store_origin(&store, origin);
         let committer: Arc<dyn Committer> =
             Arc::new(LocalCommitter::new(store.clone(), origin).unwrap());
         let engine = SqlEngine::new(store.clone(), committer, Limits::default());

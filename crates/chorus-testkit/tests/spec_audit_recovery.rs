@@ -54,7 +54,10 @@ fn post_apply_fault_reopens_to_one_deterministic_state_and_deduplicates_retry() 
     let file = Arc::new(FileStateStore::open(&path).unwrap());
     file.initialize_cluster([1; 16], 1).unwrap();
     let base = file.clone() as Arc<dyn StateStore>;
-    let origin = OriginId::new(7);
+    // FileStateStore's bootstrap membership contains node 1.  Keep the
+    // recovery scenario focused on durable apply/retry behavior by using the
+    // authorized origin instead of requiring a separate membership command.
+    let origin = OriginId::new(1);
     base.apply(
         LogId { term: 1, index: 1 },
         &ReplicatedCommandV1::ActivateOrigin(ActivateOriginV1 { origin }),

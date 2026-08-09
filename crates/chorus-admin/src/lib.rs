@@ -2652,7 +2652,7 @@ mod tests {
         store
             .initialize_cluster(cluster.0, 1)
             .expect("initialize cluster");
-        let origin = OriginId::new(7);
+        let origin = OriginId::new(1);
         store
             .apply(
                 LogId { term: 1, index: 1 },

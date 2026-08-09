@@ -2237,7 +2237,7 @@ mod tests {
     fn idle_transaction_timeout_is_fatal_even_for_a_partial_frontend_frame() {
         let store = Arc::new(MemoryStateStore::new()) as Arc<dyn StateStore>;
         let committer = Arc::new(
-            LocalCommitter::new(Arc::clone(&store), OriginId::new(701)).expect("test committer"),
+            LocalCommitter::new(Arc::clone(&store), OriginId::new(1)).expect("test committer"),
         ) as Arc<dyn Committer>;
         let engine = SqlEngine::new(store, committer, Limits::default());
         let mut input = startup_wire();

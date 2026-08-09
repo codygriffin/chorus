@@ -306,7 +306,7 @@ async fn initialize_write_and_linearizable_read_use_real_durable_adapters() {
 
     nodes[&1].raft.initialize(initial_members()).await.unwrap();
     let origin = OriginId {
-        node_id: 77,
+        node_id: 1,
         boot_nonce: [7; 16],
     };
     let (leader_id, response) = write_with_healthy_quorum(
@@ -331,7 +331,7 @@ async fn initialize_write_and_linearizable_read_use_real_durable_adapters() {
         network.partition(leader_id, follower_id);
     }
     let minority_origin = OriginId {
-        node_id: 88,
+        node_id: 2,
         boot_nonce: [8; 16],
     };
     let minority_write = tokio::time::timeout(
@@ -370,7 +370,7 @@ async fn initialize_write_and_linearizable_read_use_real_durable_adapters() {
 
     network.heal_all();
     let healed_origin = OriginId {
-        node_id: 99,
+        node_id: 3,
         boot_nonce: [9; 16],
     };
     let (healed_leader_id, healed_response) = write_with_healthy_quorum(
@@ -394,7 +394,7 @@ async fn initialize_write_and_linearizable_read_use_real_durable_adapters() {
     drop(stopped);
 
     let restart_origin = OriginId {
-        node_id: 100,
+        node_id: 1,
         boot_nonce: [10; 16],
     };
     let (_, restart_response) = write_with_healthy_quorum(

@@ -1339,7 +1339,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.redb");
         let origin = OriginId {
-            node_id: 7,
+            node_id: 2,
             boot_nonce: [3; 16],
         };
         let expected_membership = joint_membership();
@@ -1360,7 +1360,7 @@ mod tests {
         assert_eq!(&expected_membership, stored.membership());
         assert_eq!(
             origin,
-            state_machine.state_data().unwrap().origins[&7].active_origin
+            state_machine.state_data().unwrap().origins[&2].active_origin
         );
         drop(state_machine);
 
@@ -1370,7 +1370,7 @@ mod tests {
         assert_eq!(&expected_membership, stored.membership());
         assert_eq!(
             origin,
-            reopened.state_data().unwrap().origins[&7].active_origin
+            reopened.state_data().unwrap().origins[&2].active_origin
         );
         drop(reopened);
 
@@ -1446,7 +1446,7 @@ mod tests {
         let source_dir = tempfile::tempdir().unwrap();
         let source_path = source_dir.path().join("state.redb");
         let origin = OriginId {
-            node_id: 9,
+            node_id: 2,
             boot_nonce: [5; 16],
         };
         let mut source = RedbStateMachine::open(&source_path, CLUSTER_ID, INCARNATION).unwrap();
@@ -1519,7 +1519,7 @@ mod tests {
         assert_eq!(Some(log_id(1, 1)), applied(&mut destination).await.0);
         assert_eq!(
             origin,
-            destination.state_data().unwrap().origins[&9].active_origin
+            destination.state_data().unwrap().origins[&2].active_origin
         );
         assert_eq!(
             reopened.exact_membership().unwrap(),

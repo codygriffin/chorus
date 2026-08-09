@@ -1567,7 +1567,7 @@ mod tests {
         nodes[0].0.activate_origin(origin).unwrap();
         let id = RequestId::new(origin, 1);
         let mutation = KvMutationV1::Put {
-            key: b"network-key".to_vec(),
+            key: b"k".to_vec(),
             value: b"network-value".to_vec(),
         };
         let canonical = canonical_mutations(std::slice::from_ref(&mutation)).unwrap();
@@ -1578,12 +1578,12 @@ mod tests {
             mutations: vec![mutation],
         };
         assert!(matches!(
-            nodes[2].0.submit(command),
+            nodes[0].0.submit(command),
             Ok(ApplyResult::Committed { .. })
         ));
         for (_, store) in &nodes {
             assert_eq!(
-                store.snapshot().unwrap().get(b"network-key"),
+                store.snapshot().unwrap().get(b"k"),
                 Some(&b"network-value"[..])
             );
         }

@@ -12,15 +12,20 @@ use std::time::Duration;
 
 use chorus_codec::{MAX_COMMAND_BYTES, encode_command};
 use chorus_redb::ChorusRaftConfig;
-use openraft::error::{Fatal, InstallSnapshotError, RaftError};
+use openraft::error::{
+    Fatal, InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError, RemoteError,
+    Timeout, Unreachable,
+};
+use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::{EntryPayload, Raft};
+use openraft::{BasicNode, EntryPayload, RPCTypes, Raft};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
 use tonic::Status;
 use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tonic::transport::{
@@ -38,6 +43,7 @@ pub const MAX_RPC_PAYLOAD_BYTES: usize = MAX_RPC_MESSAGE_BYTES - 1024;
 pub const MAX_SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
 pub const MAX_APPEND_ENTRIES: usize = 4096;
 pub const RPC_QUEUE_CAPACITY: usize = 128;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_PAYLOAD_MAGIC: &[u8; 8] = b"CHRFRPC\0";
 const RPC_PAYLOAD_VERSION: u8 = 1;
 const RPC_PAYLOAD_HEADER_BYTES: usize = RPC_PAYLOAD_MAGIC.len() + 1 + 1 + 4;
@@ -597,19 +603,26 @@ pub fn authenticated_server_builder() -> Server {
         .timeout(Duration::from_secs(30))
 }
 
+fn authenticated_endpoint(
+    identity: &TransportTlsIdentity,
+    peer: &PeerTlsConfig,
+) -> Result<Endpoint, TransportConfigError> {
+    let tls = identity.client_tls_config(peer)?;
+    Endpoint::from_shared(peer.endpoint.clone())
+        .map_err(|error| TransportConfigError::Endpoint(error.to_string()))?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .concurrency_limit(RPC_QUEUE_CAPACITY)
+        .buffer_size(RPC_QUEUE_CAPACITY)
+        .tls_config(tls)
+        .map_err(|error| TransportConfigError::Tls(error.to_string()))
+}
+
 pub async fn connect_authenticated(
     identity: &TransportTlsIdentity,
     peer: &PeerTlsConfig,
 ) -> Result<wire::open_raft_transport_client::OpenRaftTransportClient<Channel>, TransportConfigError>
 {
-    let tls = identity.client_tls_config(peer)?;
-    let endpoint = Endpoint::from_shared(peer.endpoint.clone())
-        .map_err(|error| TransportConfigError::Endpoint(error.to_string()))?
-        .connect_timeout(Duration::from_secs(5))
-        .concurrency_limit(RPC_QUEUE_CAPACITY)
-        .buffer_size(RPC_QUEUE_CAPACITY)
-        .tls_config(tls)
-        .map_err(|error| TransportConfigError::Tls(error.to_string()))?;
+    let endpoint = authenticated_endpoint(identity, peer)?;
     let channel = endpoint
         .connect()
         .await
@@ -619,6 +632,358 @@ pub async fn connect_authenticated(
             .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_RPC_MESSAGE_BYTES),
     )
+}
+
+/// OpenRaft network factory backed by authenticated, lazily connected Tonic
+/// channels. One reconnecting `Channel` is retained per immutable peer
+/// manifest entry; creating an OpenRaft client does not perform network I/O.
+#[derive(Clone)]
+pub struct AuthenticatedNetworkFactory {
+    identity: Arc<TransportTlsIdentity>,
+    channels: Arc<AsyncMutex<BTreeMap<u64, Channel>>>,
+}
+
+impl AuthenticatedNetworkFactory {
+    pub fn new(identity: Arc<TransportTlsIdentity>) -> Result<Self, TransportConfigError> {
+        identity.validate()?;
+        Ok(Self {
+            identity,
+            channels: Arc::new(AsyncMutex::new(BTreeMap::new())),
+        })
+    }
+
+    /// Number of peer channels allocated so far. Exposed for health metrics
+    /// and deterministic cache tests; channels are established lazily by
+    /// Tonic when an RPC is first sent.
+    pub async fn cached_peer_count(&self) -> usize {
+        self.channels.lock().await.len()
+    }
+
+    async fn channel_for(&self, target: u64) -> Result<Channel, TransportConfigError> {
+        let mut channels = self.channels.lock().await;
+        if let Some(channel) = channels.get(&target) {
+            return Ok(channel.clone());
+        }
+        let peer = self.identity.peers.get(&target).ok_or_else(|| {
+            TransportConfigError::Invalid(format!(
+                "target node {target} is not present in the authenticated manifest"
+            ))
+        })?;
+        let channel = authenticated_endpoint(&self.identity, peer)?.connect_lazy();
+        channels.insert(target, channel.clone());
+        Ok(channel)
+    }
+
+    async fn client_for(
+        &self,
+        target: u64,
+    ) -> Result<
+        wire::open_raft_transport_client::OpenRaftTransportClient<Channel>,
+        TransportConfigError,
+    > {
+        Ok(
+            wire::open_raft_transport_client::OpenRaftTransportClient::new(
+                self.channel_for(target).await?,
+            )
+            .max_decoding_message_size(MAX_RPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_RPC_MESSAGE_BYTES),
+        )
+    }
+}
+
+pub struct AuthenticatedNetwork {
+    factory: AuthenticatedNetworkFactory,
+    target: u64,
+    target_node: BasicNode,
+    configuration_error: Option<String>,
+}
+
+impl RaftNetworkFactory<ChorusRaftConfig> for AuthenticatedNetworkFactory {
+    type Network = AuthenticatedNetwork;
+
+    async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
+        let configuration_error = match self.identity.peers.get(&target) {
+            None => Some(format!(
+                "target node {target} is not present in the authenticated manifest"
+            )),
+            Some(peer) if node.addr != peer.endpoint => Some(format!(
+                "OpenRaft address for node {target} does not match the authenticated manifest"
+            )),
+            Some(_) => None,
+        };
+        AuthenticatedNetwork {
+            factory: self.clone(),
+            target,
+            target_node: node.clone(),
+            configuration_error,
+        }
+    }
+}
+
+fn io_error(kind: io::ErrorKind, message: impl Into<String>) -> io::Error {
+    io::Error::new(kind, message.into())
+}
+
+fn unreachable_rpc<E>(message: impl Into<String>) -> RPCError<u64, BasicNode, E>
+where
+    E: std::error::Error,
+{
+    let error = io_error(io::ErrorKind::NotConnected, message);
+    RPCError::Unreachable(Unreachable::new(&error))
+}
+
+fn network_rpc<E>(message: impl Into<String>) -> RPCError<u64, BasicNode, E>
+where
+    E: std::error::Error,
+{
+    let error = io_error(io::ErrorKind::InvalidData, message);
+    RPCError::Network(NetworkError::new(&error))
+}
+
+fn timeout_rpc<E>(
+    action: RPCTypes,
+    source: u64,
+    target: u64,
+    timeout: Duration,
+) -> RPCError<u64, BasicNode, E>
+where
+    E: std::error::Error,
+{
+    RPCError::Timeout(Timeout {
+        action,
+        id: source,
+        target,
+        timeout,
+    })
+}
+
+impl AuthenticatedNetwork {
+    fn configuration_error<E>(&self) -> Result<(), RPCError<u64, BasicNode, E>>
+    where
+        E: std::error::Error,
+    {
+        match &self.configuration_error {
+            Some(message) => Err(unreachable_rpc(message.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn status_error<E>(
+        &self,
+        action: RPCTypes,
+        timeout: Duration,
+        status: Status,
+    ) -> RPCError<u64, BasicNode, E>
+    where
+        E: std::error::Error,
+    {
+        if status.code() == tonic::Code::DeadlineExceeded {
+            return timeout_rpc(action, self.factory.identity.node_id, self.target, timeout);
+        }
+        match status.code() {
+            tonic::Code::Unavailable
+            | tonic::Code::Unauthenticated
+            | tonic::Code::PermissionDenied
+            | tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::ResourceExhausted => unreachable_rpc(status.to_string()),
+            _ => network_rpc(status.to_string()),
+        }
+    }
+
+    async fn client<E>(
+        &self,
+    ) -> Result<
+        wire::open_raft_transport_client::OpenRaftTransportClient<Channel>,
+        RPCError<u64, BasicNode, E>,
+    >
+    where
+        E: std::error::Error,
+    {
+        self.configuration_error()?;
+        self.factory
+            .client_for(self.target)
+            .await
+            .map_err(|error| unreachable_rpc(error.to_string()))
+    }
+
+    fn request(&self, payload: Vec<u8>) -> Result<Request<wire::Envelope>, TransportConfigError> {
+        envelope(&self.factory.identity, self.target, payload).map(Request::new)
+    }
+
+    fn validate_response<E>(
+        &self,
+        response: wire::Envelope,
+    ) -> Result<Vec<u8>, RPCError<u64, BasicNode, E>>
+    where
+        E: std::error::Error,
+    {
+        let peer = self
+            .factory
+            .identity
+            .peers
+            .get(&self.target)
+            .ok_or_else(|| {
+                unreachable_rpc(format!(
+                    "target node {} disappeared from the authenticated manifest",
+                    self.target
+                ))
+            })?;
+        validate_response_envelope(&self.factory.identity, peer, &response)
+            .map_err(|error| unreachable_rpc(error.to_string()))?;
+        Ok(response.payload)
+    }
+}
+
+impl RaftNetwork<ChorusRaftConfig> for AuthenticatedNetwork {
+    async fn vote(
+        &mut self,
+        rpc: VoteRequest<u64>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        self.configuration_error()?;
+        let timeout = option.hard_ttl();
+        let payload = encode_rpc_payload(RpcPayloadDomain::VoteRequest, &rpc)
+            .map_err(|error| network_rpc(error.to_string()))?;
+        let mut request = self
+            .request(payload)
+            .map_err(|error| unreachable_rpc(error.to_string()))?;
+        request.set_timeout(timeout);
+        let mut client = self.client().await?;
+        let result = tokio::time::timeout(timeout, client.vote(request)).await;
+        let response = match result {
+            Err(_) => {
+                return Err(timeout_rpc(
+                    RPCTypes::Vote,
+                    self.factory.identity.node_id,
+                    self.target,
+                    timeout,
+                ));
+            }
+            Ok(Err(status)) => return Err(self.status_error(RPCTypes::Vote, timeout, status)),
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        let payload = self.validate_response(response)?;
+        let result: VoteWireResult = decode_rpc_payload(RpcPayloadDomain::VoteResponse, &payload)
+            .map_err(|error| network_rpc(error.to_string()))?;
+        result.map_err(|error| {
+            RPCError::RemoteError(RemoteError::new_with_node(
+                self.target,
+                self.target_node.clone(),
+                RaftError::Fatal(error),
+            ))
+        })
+    }
+
+    async fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<ChorusRaftConfig>,
+        option: RPCOption,
+    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        self.configuration_error()?;
+        if let Err(error) = validate_append_request(&rpc) {
+            return Err(match error {
+                RpcCodecError::Limit => RPCError::PayloadTooLarge(
+                    PayloadTooLarge::new_entries_hint((rpc.entries.len() / 2).max(1) as u64),
+                ),
+                other => network_rpc(other.to_string()),
+            });
+        }
+        let payload =
+            encode_rpc_payload(RpcPayloadDomain::AppendEntriesRequest, &rpc).map_err(|error| {
+                match error {
+                    RpcCodecError::Limit => RPCError::PayloadTooLarge(
+                        PayloadTooLarge::new_entries_hint((rpc.entries.len() / 2).max(1) as u64),
+                    ),
+                    other => network_rpc(other.to_string()),
+                }
+            })?;
+        let timeout = option.hard_ttl();
+        let mut request = self
+            .request(payload)
+            .map_err(|error| unreachable_rpc(error.to_string()))?;
+        request.set_timeout(timeout);
+        let mut client = self.client().await?;
+        let result = tokio::time::timeout(timeout, client.append_entries(request)).await;
+        let response = match result {
+            Err(_) => {
+                return Err(timeout_rpc(
+                    RPCTypes::AppendEntries,
+                    self.factory.identity.node_id,
+                    self.target,
+                    timeout,
+                ));
+            }
+            Ok(Err(status)) if status.code() == tonic::Code::ResourceExhausted => {
+                return Err(RPCError::PayloadTooLarge(
+                    PayloadTooLarge::new_entries_hint((rpc.entries.len() / 2).max(1) as u64),
+                ));
+            }
+            Ok(Err(status)) => {
+                return Err(self.status_error(RPCTypes::AppendEntries, timeout, status));
+            }
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        let payload = self.validate_response(response)?;
+        let result: AppendWireResult =
+            decode_rpc_payload(RpcPayloadDomain::AppendEntriesResponse, &payload)
+                .map_err(|error| network_rpc(error.to_string()))?;
+        result.map_err(|error| {
+            RPCError::RemoteError(RemoteError::new_with_node(
+                self.target,
+                self.target_node.clone(),
+                RaftError::Fatal(error),
+            ))
+        })
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        rpc: InstallSnapshotRequest<ChorusRaftConfig>,
+        option: RPCOption,
+    ) -> Result<
+        InstallSnapshotResponse<u64>,
+        RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
+    > {
+        self.configuration_error()?;
+        if let Err(status) = validate_snapshot_chunk_size(rpc.data.len()) {
+            return Err(unreachable_rpc(status.message().to_owned()));
+        }
+        let payload = encode_rpc_payload(RpcPayloadDomain::InstallSnapshotRequest, &rpc)
+            .map_err(|error| unreachable_rpc(error.to_string()))?;
+        let timeout = option.hard_ttl();
+        let mut request = self
+            .request(payload)
+            .map_err(|error| unreachable_rpc(error.to_string()))?;
+        request.set_timeout(timeout);
+        let mut client = self.client().await?;
+        let result = tokio::time::timeout(timeout, client.install_snapshot(request)).await;
+        let response = match result {
+            Err(_) => {
+                return Err(timeout_rpc(
+                    RPCTypes::InstallSnapshot,
+                    self.factory.identity.node_id,
+                    self.target,
+                    timeout,
+                ));
+            }
+            Ok(Err(status)) => {
+                return Err(self.status_error(RPCTypes::InstallSnapshot, timeout, status));
+            }
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        let payload = self.validate_response(response)?;
+        let result: SnapshotWireResult =
+            decode_rpc_payload(RpcPayloadDomain::InstallSnapshotResponse, &payload)
+                .map_err(|error| network_rpc(error.to_string()))?;
+        result.map_err(|error| {
+            RPCError::RemoteError(RemoteError::new_with_node(
+                self.target,
+                self.target_node.clone(),
+                error,
+            ))
+        })
+    }
 }
 
 pub fn leaf_fingerprint(der: &[u8]) -> [u8; 32] {

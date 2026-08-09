@@ -1,16 +1,26 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use chorus_consensus::openraft_transport::wire::Envelope;
 use chorus_consensus::openraft_transport::wire::open_raft_transport_client::OpenRaftTransportClient;
 use chorus_consensus::openraft_transport::wire::open_raft_transport_server::OpenRaftTransport;
 use chorus_consensus::openraft_transport::{
-    MAX_RPC_PAYLOAD_BYTES, MAX_SNAPSHOT_CHUNK_BYTES, PeerAuthenticator, PeerTlsConfig, RpcMethod,
-    RpcPayloadDomain, TransportTlsIdentity, authenticated_server_builder, bounded_transport_server,
+    AuthenticatedNetworkFactory, MAX_APPEND_ENTRIES, MAX_RPC_PAYLOAD_BYTES,
+    MAX_SNAPSHOT_CHUNK_BYTES, PeerAuthenticator, PeerTlsConfig, RpcMethod, RpcPayloadDomain,
+    TransportTlsIdentity, authenticated_server_builder, bounded_transport_server,
     connect_authenticated, decode_rpc_payload, encode_rpc_payload, envelope, leaf_fingerprint,
     validate_response_envelope, validate_snapshot_chunk_size,
 };
+use chorus_redb::ChorusRaftConfig;
+use openraft::error::{Fatal, InstallSnapshotError, RPCError, RaftError};
+use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
+use openraft::{BasicNode, Entry, SnapshotMeta, Vote};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -169,6 +179,99 @@ impl OpenRaftTransport for GateService {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FactoryVoteBehavior {
+    Grant,
+    Delay(Duration),
+    Fatal,
+}
+
+#[derive(Clone)]
+struct FactoryService {
+    identity: Arc<TransportTlsIdentity>,
+    authenticator: PeerAuthenticator,
+    calls: Arc<AtomicUsize>,
+    vote_behavior: FactoryVoteBehavior,
+}
+
+impl FactoryService {
+    fn response(
+        &self,
+        target: u64,
+        domain: RpcPayloadDomain,
+        value: &impl serde::Serialize,
+    ) -> Result<Response<Envelope>, Status> {
+        let payload = encode_rpc_payload(domain, value)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        envelope(&self.identity, target, payload)
+            .map(Response::new)
+            .map_err(|error| Status::internal(error.to_string()))
+    }
+}
+
+#[tonic::async_trait]
+impl OpenRaftTransport for FactoryService {
+    async fn vote(&self, request: Request<Envelope>) -> Result<Response<Envelope>, Status> {
+        let source =
+            self.authenticator
+                .authenticate(&request, request.get_ref(), RpcMethod::Vote)?;
+        let rpc: VoteRequest<u64> =
+            decode_rpc_payload(RpcPayloadDomain::VoteRequest, &request.into_inner().payload)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let FactoryVoteBehavior::Delay(delay) = self.vote_behavior {
+            tokio::time::sleep(delay).await;
+        }
+        let result: Result<VoteResponse<u64>, Fatal<u64>> = match self.vote_behavior {
+            FactoryVoteBehavior::Fatal => Err(Fatal::Stopped),
+            FactoryVoteBehavior::Grant | FactoryVoteBehavior::Delay(_) => {
+                Ok(VoteResponse::new(rpc.vote, rpc.last_log_id, true))
+            }
+        };
+        self.response(source, RpcPayloadDomain::VoteResponse, &result)
+    }
+
+    async fn append_entries(
+        &self,
+        request: Request<Envelope>,
+    ) -> Result<Response<Envelope>, Status> {
+        let source = self.authenticator.authenticate(
+            &request,
+            request.get_ref(),
+            RpcMethod::AppendEntries,
+        )?;
+        let _: AppendEntriesRequest<ChorusRaftConfig> = decode_rpc_payload(
+            RpcPayloadDomain::AppendEntriesRequest,
+            &request.into_inner().payload,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let result: Result<AppendEntriesResponse<u64>, Fatal<u64>> =
+            Ok(AppendEntriesResponse::Success);
+        self.response(source, RpcPayloadDomain::AppendEntriesResponse, &result)
+    }
+
+    async fn install_snapshot(
+        &self,
+        request: Request<Envelope>,
+    ) -> Result<Response<Envelope>, Status> {
+        let source = self.authenticator.authenticate(
+            &request,
+            request.get_ref(),
+            RpcMethod::InstallSnapshot,
+        )?;
+        let rpc: InstallSnapshotRequest<ChorusRaftConfig> = decode_rpc_payload(
+            RpcPayloadDomain::InstallSnapshotRequest,
+            &request.into_inner().payload,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let result: Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>> =
+            Ok(InstallSnapshotResponse { vote: rpc.vote });
+        self.response(source, RpcPayloadDomain::InstallSnapshotResponse, &result)
+    }
+}
+
 async fn start_server(
     identity: Arc<TransportTlsIdentity>,
     calls: Arc<AtomicUsize>,
@@ -185,6 +288,41 @@ async fn start_server(
         identity: Arc::clone(&identity),
         authenticator,
         calls,
+    };
+    let tls = identity.server_tls_config().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        authenticated_server_builder()
+            .tls_config(tls)
+            .unwrap()
+            .add_service(bounded_transport_server(service))
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (address, shutdown_tx, task)
+}
+
+async fn start_factory_server(
+    identity: Arc<TransportTlsIdentity>,
+    calls: Arc<AtomicUsize>,
+    vote_behavior: FactoryVoteBehavior,
+) -> (
+    std::net::SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let incoming = TcpListenerStream::new(listener);
+    let authenticator = PeerAuthenticator::new(Arc::clone(&identity)).unwrap();
+    let service = FactoryService {
+        identity: Arc::clone(&identity),
+        authenticator,
+        calls,
+        vote_behavior,
     };
     let tls = identity.server_tls_config().unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -340,4 +478,199 @@ async fn untrusted_client_and_oversized_payloads_fail_closed() {
 
     let _ = shutdown.send(());
     task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raft_factory_routes_vote_and_reuses_lazy_authenticated_channel() {
+    let ca = test_ca();
+    let server_leaf = test_leaf(&ca, "node-1.chorus.test");
+    let client_leaf = test_leaf(&ca, "node-2.chorus.test");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_identity = identity(
+        &ca,
+        1,
+        &server_leaf,
+        vec![peer(
+            2,
+            "https://127.0.0.1:1".into(),
+            "node-2.chorus.test",
+            &client_leaf,
+        )],
+    );
+    let (address, shutdown, task) = start_factory_server(
+        server_identity,
+        Arc::clone(&calls),
+        FactoryVoteBehavior::Grant,
+    )
+    .await;
+    let server_peer = peer(
+        1,
+        format!("https://{address}"),
+        "node-1.chorus.test",
+        &server_leaf,
+    );
+    let client_identity = identity(&ca, 2, &client_leaf, vec![server_peer.clone()]);
+    let mut factory = AuthenticatedNetworkFactory::new(client_identity).unwrap();
+    let node = BasicNode::new(&server_peer.endpoint);
+    let mut network = factory.new_client(1, &node).await;
+
+    assert_eq!(0, factory.cached_peer_count().await);
+    let vote = Vote::new(7, 2);
+    let response = network
+        .vote(
+            VoteRequest::new(vote, None),
+            RPCOption::new(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert!(response.is_granted_to(&vote));
+    assert_eq!(1, factory.cached_peer_count().await);
+
+    let mut second = factory.new_client(1, &node).await;
+    second
+        .vote(
+            VoteRequest::new(Vote::new(8, 2), None),
+            RPCOption::new(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(1, factory.cached_peer_count().await);
+    assert_eq!(2, calls.load(Ordering::SeqCst));
+
+    let _ = shutdown.send(());
+    task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raft_factory_maps_remote_fatal_and_hard_ttl_timeout() {
+    let ca = test_ca();
+    let server_leaf = test_leaf(&ca, "node-1.chorus.test");
+    let client_leaf = test_leaf(&ca, "node-2.chorus.test");
+
+    for (behavior, expect_timeout) in [
+        (FactoryVoteBehavior::Fatal, false),
+        (FactoryVoteBehavior::Delay(Duration::from_millis(250)), true),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_identity = identity(
+            &ca,
+            1,
+            &server_leaf,
+            vec![peer(
+                2,
+                "https://127.0.0.1:1".into(),
+                "node-2.chorus.test",
+                &client_leaf,
+            )],
+        );
+        let (address, shutdown, task) =
+            start_factory_server(server_identity, Arc::clone(&calls), behavior).await;
+        let server_peer = peer(
+            1,
+            format!("https://{address}"),
+            "node-1.chorus.test",
+            &server_leaf,
+        );
+        let client_identity = identity(&ca, 2, &client_leaf, vec![server_peer.clone()]);
+        let mut factory = AuthenticatedNetworkFactory::new(client_identity).unwrap();
+        let mut network = factory
+            .new_client(1, &BasicNode::new(&server_peer.endpoint))
+            .await;
+        let ttl = if expect_timeout {
+            Duration::from_millis(25)
+        } else {
+            Duration::from_secs(2)
+        };
+        let error = network
+            .vote(VoteRequest::new(Vote::new(9, 2), None), RPCOption::new(ttl))
+            .await
+            .unwrap_err();
+        if expect_timeout {
+            assert!(matches!(
+                error,
+                RPCError::Timeout(openraft::error::Timeout {
+                    action: openraft::RPCTypes::Vote,
+                    id: 2,
+                    target: 1,
+                    ..
+                })
+            ));
+        } else {
+            match error {
+                RPCError::RemoteError(remote) => {
+                    assert_eq!(1, remote.target);
+                    assert_eq!(
+                        Some(BasicNode::new(&server_peer.endpoint)),
+                        remote.target_node
+                    );
+                    assert!(matches!(remote.source, RaftError::Fatal(Fatal::Stopped)));
+                }
+                other => panic!("expected remote fatal, got {other:?}"),
+            }
+        }
+        assert_eq!(1, calls.load(Ordering::SeqCst));
+        let _ = shutdown.send(());
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn raft_factory_rejects_address_and_payload_limits_before_network_io() {
+    let ca = test_ca();
+    let local_leaf = test_leaf(&ca, "node-2.chorus.test");
+    let remote_leaf = test_leaf(&ca, "node-1.chorus.test");
+    let remote = peer(
+        1,
+        "https://127.0.0.1:9".into(),
+        "node-1.chorus.test",
+        &remote_leaf,
+    );
+    let local = identity(&ca, 2, &local_leaf, vec![remote.clone()]);
+    let mut factory = AuthenticatedNetworkFactory::new(local).unwrap();
+
+    let mut wrong_address = factory
+        .new_client(1, &BasicNode::new("https://127.0.0.1:10"))
+        .await;
+    let address_error = wrong_address
+        .vote(
+            VoteRequest::new(Vote::new(1, 2), None),
+            RPCOption::new(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(address_error, RPCError::Unreachable(_)));
+    assert_eq!(0, factory.cached_peer_count().await);
+
+    let mut network = factory
+        .new_client(1, &BasicNode::new(&remote.endpoint))
+        .await;
+    let append_error = network
+        .append_entries(
+            AppendEntriesRequest {
+                vote: Vote::new_committed(1, 2),
+                prev_log_id: None,
+                entries: vec![Entry::<ChorusRaftConfig>::default(); MAX_APPEND_ENTRIES + 1],
+                leader_commit: None,
+            },
+            RPCOption::new(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(append_error, RPCError::PayloadTooLarge(_)));
+
+    let snapshot_error = network
+        .install_snapshot(
+            InstallSnapshotRequest {
+                vote: Vote::new_committed(1, 2),
+                meta: SnapshotMeta::default(),
+                offset: 0,
+                data: vec![0; MAX_SNAPSHOT_CHUNK_BYTES + 1],
+                done: false,
+            },
+            RPCOption::new(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(snapshot_error, RPCError::Unreachable(_)));
+    assert_eq!(0, factory.cached_peer_count().await);
 }

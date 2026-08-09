@@ -11,6 +11,7 @@ members = [
     "crates/chorus-consensus",
     "crates/chorus-testkit",
     "crates/chorus-raft-contract",
+    "crates/chorus-redb",
     "crates/chorus-node",
 ]
 
@@ -18,7 +19,7 @@ members = [
 edition = "2024"
 version = "0.1.0"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [profile.release]
 lto = "thin"

@@ -1002,20 +1002,15 @@ impl Connection {
             return self.ready();
         }
         self.begin_query();
-        let results = self.session.execute_batch(&sql, &[]);
+        let outcome = self.session.execute_simple_batch(&sql, &[]);
         self.end_query();
-        match results {
-            Ok(results) => {
-                for result in &results {
-                    self.result(result)?;
-                }
-                self.ready()
-            }
-            Err(e) => {
-                self.error(&e)?;
-                self.ready()
-            }
+        for result in &outcome.results {
+            self.result(result)?;
         }
+        if let Some(error) = outcome.error {
+            self.error(&error)?;
+        }
+        self.ready()
     }
 
     fn prepared_entry_bytes(&self, name: &str) -> WireResult<usize> {

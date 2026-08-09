@@ -53,8 +53,22 @@ fn startup(stream: &mut TcpStream) {
     }
 }
 
-#[test]
-fn simple_query_batch_emits_each_result_before_one_ready_for_query() {
+fn simple_query(stream: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    send_message(stream, b'Q', &body);
+    let mut messages = Vec::new();
+    loop {
+        let message = read_message(stream);
+        let done = message.0 == b'Z';
+        messages.push(message);
+        if done {
+            return messages;
+        }
+    }
+}
+
+fn open_test_connection() -> (chorus_pg::PgServerHandle, TcpStream) {
     let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
     let origin = OriginId::new(1);
     let committer: Arc<dyn Committer> =
@@ -77,17 +91,64 @@ fn simple_query_batch_emits_each_result_before_one_ready_for_query() {
         .set_read_timeout(Some(Duration::from_secs(1)))
         .expect("read timeout");
     startup(&mut stream);
+    (handle, stream)
+}
 
-    send_message(&mut stream, b'Q', b"SELECT 1; SELECT 2;\0");
-    let mut types = Vec::new();
-    loop {
-        let (typ, _body) = read_message(&mut stream);
-        types.push(typ);
-        if typ == b'Z' {
-            break;
-        }
-    }
+#[test]
+fn simple_query_batch_emits_each_result_before_one_ready_for_query() {
+    let (handle, mut stream) = open_test_connection();
+    let messages = simple_query(&mut stream, "SELECT 1; SELECT 2;");
+    let types = messages.iter().map(|message| message.0).collect::<Vec<_>>();
 
     assert_eq!(types, vec![b'T', b'D', b'C', b'T', b'D', b'C', b'Z']);
+    assert_eq!(messages.last().unwrap().1, vec![b'I']);
+    handle.shutdown().expect("shutdown test listener");
+}
+
+#[test]
+fn simple_query_transaction_boundaries_report_status_and_committed_prefix() {
+    let (handle, mut stream) = open_test_connection();
+
+    let opened = simple_query(&mut stream, "SELECT 1; BEGIN; SELECT 2;");
+    assert_eq!(
+        opened.iter().map(|message| message.0).collect::<Vec<_>>(),
+        vec![b'T', b'D', b'C', b'C', b'T', b'D', b'C', b'Z']
+    );
+    assert_eq!(opened.last().unwrap().1, vec![b'T']);
+
+    let closed = simple_query(&mut stream, "COMMIT; SELECT 3;");
+    assert_eq!(
+        closed.iter().map(|message| message.0).collect::<Vec<_>>(),
+        vec![b'C', b'T', b'D', b'C', b'Z']
+    );
+    assert_eq!(closed.last().unwrap().1, vec![b'I']);
+
+    let created = simple_query(
+        &mut stream,
+        "CREATE TABLE wire_segments (id integer primary key);",
+    );
+    assert_eq!(
+        created.iter().map(|message| message.0).collect::<Vec<_>>(),
+        vec![b'C', b'Z']
+    );
+
+    let failed = simple_query(
+        &mut stream,
+        "INSERT INTO wire_segments VALUES (1); COMMIT; INSERT INTO missing_wire_segment VALUES (2);",
+    );
+    assert_eq!(
+        failed.iter().map(|message| message.0).collect::<Vec<_>>(),
+        vec![b'C', b'C', b'E', b'Z']
+    );
+    assert_eq!(failed.last().unwrap().1, vec![b'I']);
+
+    // The prefix crossed an explicit commit boundary before the later error.
+    let count = simple_query(&mut stream, "SELECT count(*) FROM wire_segments;");
+    assert_eq!(
+        count.iter().map(|message| message.0).collect::<Vec<_>>(),
+        vec![b'T', b'D', b'C', b'Z']
+    );
+    assert_eq!(count.last().unwrap().1, vec![b'I']);
+
     handle.shutdown().expect("shutdown test listener");
 }

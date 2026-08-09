@@ -44,6 +44,42 @@ impl QueryResult {
     }
 }
 
+/// Results which are safe to expose from a simple-query message, followed by
+/// an optional error from a later transaction segment.
+///
+/// Ordinary statements in one implicit segment are withheld until that
+/// segment commits. Explicit transaction statements, session controls, and
+/// earlier committed segments may already have externally visible effects,
+/// so their ordered results accompany a later error.
+#[derive(Clone, Debug)]
+pub struct BatchExecution {
+    pub results: Vec<QueryResult>,
+    pub error: Option<SqlError>,
+}
+
+impl BatchExecution {
+    fn success(results: Vec<QueryResult>) -> Self {
+        Self {
+            results,
+            error: None,
+        }
+    }
+
+    fn failure(results: Vec<QueryResult>, error: SqlError) -> Self {
+        Self {
+            results,
+            error: Some(error),
+        }
+    }
+
+    fn into_result(self) -> std::result::Result<Vec<QueryResult>, SqlError> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.results),
+        }
+    }
+}
+
 /// A cooperative cancellation hook supplied by a protocol adapter.
 ///
 /// The SQL executor only observes this hook at bounded statement and row-work
@@ -1520,13 +1556,22 @@ impl SqlSession {
         sql: &str,
         params: &[Datum],
     ) -> std::result::Result<Vec<QueryResult>, SqlError> {
+        self.execute_simple_batch(sql, params).into_result()
+    }
+
+    /// Execute a simple-query message while retaining any result prefix whose
+    /// transaction boundary completed before a later error.
+    pub fn execute_simple_batch(&mut self, sql: &str, params: &[Datum]) -> BatchExecution {
         // `Statement::Execute` dispatches through this method recursively.
         // Keep one permit for the externally submitted operation so prepared
         // statements cannot consume a second slot or deadlock at a limit of
         // one.
         let outer_execution = self.query_permit.is_none();
         if outer_execution {
-            self.query_permit = Some(self.engine.query_admission.try_acquire()?);
+            match self.engine.query_admission.try_acquire() {
+                Ok(permit) => self.query_permit = Some(permit),
+                Err(error) => return BatchExecution::failure(Vec::new(), error),
+            }
         }
         // The protocol cancellation hook belongs to the connection and must
         // survive a statement.  A timeout wrapper is installed only for the
@@ -1547,79 +1592,143 @@ impl SqlSession {
         sql: &str,
         params: &[Datum],
         parent_checker: Option<Arc<dyn CancellationChecker>>,
-    ) -> std::result::Result<Vec<QueryResult>, SqlError> {
+    ) -> BatchExecution {
         if sql.len() > self.engine.limits.max_sql_message_bytes {
-            return Err(SqlError::new(
-                "54000",
-                "SQL message exceeds configured limit",
-            ));
+            return BatchExecution::failure(
+                Vec::new(),
+                SqlError::new("54000", "SQL message exceeds configured limit"),
+            );
         }
-        let statements = Parser::batch(sql)?;
+        let statements = match Parser::batch(sql) {
+            Ok(statements) => statements,
+            Err(error) => return BatchExecution::failure(Vec::new(), error),
+        };
         if statements.is_empty() {
-            return Ok(vec![QueryResult::command("", 0)]);
+            return BatchExecution::success(vec![QueryResult::command("", 0)]);
         }
         if statements.iter().any(|s| s.is_ddl()) && statements.len() != 1 {
-            return Err(SqlError::new(
-                "25001",
-                "DDL statements must be executed alone in the MVP",
-            ));
+            return BatchExecution::failure(
+                Vec::new(),
+                SqlError::new("25001", "DDL statements must be executed alone in the MVP"),
+            );
         }
-        let implicit = self.txn.is_none()
-            && !statements.iter().any(Statement::txn_control)
-            && !statements.iter().any(Statement::is_ddl)
-            && !statements.iter().all(Statement::session_control);
-        let mut first_statement = true;
-        if implicit {
-            self.install_statement_checker(parent_checker.clone())?;
-            self.start_txn()?;
-        }
-        let mut results = Vec::with_capacity(statements.len());
+        let mut completed = Vec::with_capacity(statements.len());
+        let mut implicit_results = Vec::new();
+        let mut implicit_segment = false;
+        // A transaction already owned by the session was explicitly opened,
+        // except for an outcome-unknown implicit commit. Treating that case
+        // as explicit is conservative: only COMMIT/ROLLBACK can resolve it.
+        let mut explicit_transaction = self.txn.is_some();
+
         for statement in statements {
-            if !implicit || !first_statement {
-                // Each AST statement gets a fresh timeout budget.  The
-                // external CancelRequest checker remains shared across the
-                // complete protocol Execute/Simple Query operation.
-                self.install_statement_checker(parent_checker.clone())?;
+            let is_begin = matches!(&statement, Statement::Begin { .. });
+            let is_commit = matches!(&statement, Statement::Commit);
+            let is_rollback = matches!(&statement, Statement::Rollback);
+            let is_txn_control = statement.txn_control();
+            let is_session_control = statement.session_control();
+            let is_ddl = statement.is_ddl();
+
+            // BEGIN starts a new explicit boundary. Commit the preceding
+            // ordinary implicit segment before executing BEGIN itself.
+            if is_begin && implicit_segment {
+                if let Err(error) = self.finish_implicit_batch_segment() {
+                    return BatchExecution::failure(completed, error);
+                }
+                completed.append(&mut implicit_results);
+                implicit_segment = false;
             }
-            first_statement = false;
+
+            // Each AST statement gets a fresh timeout budget. The external
+            // CancelRequest checker remains shared across the complete
+            // protocol simple-query message.
+            if let Err(error) = self.install_statement_checker(parent_checker.clone()) {
+                if implicit_segment {
+                    self.rollback_internal();
+                }
+                return BatchExecution::failure(completed, error);
+            }
+
+            if !explicit_transaction
+                && !implicit_segment
+                && !is_txn_control
+                && !is_session_control
+                && !is_ddl
+            {
+                if let Err(error) = self.start_txn() {
+                    return BatchExecution::failure(completed, error);
+                }
+                implicit_segment = true;
+            }
+
             let result = check_cancelled(self.cancellation_checker())
                 .and_then(|()| self.exec_statement(statement, params));
             match result {
-                Ok(r) => results.push(r),
-                Err(e) => {
-                    if implicit {
-                        self.rollback_internal();
+                Ok(result) if is_begin => {
+                    explicit_transaction = self.txn.is_some();
+                    completed.push(result);
+                }
+                Ok(result) if is_commit || is_rollback => {
+                    if implicit_segment {
+                        if is_commit {
+                            completed.append(&mut implicit_results);
+                        } else {
+                            implicit_results.clear();
+                        }
+                        implicit_segment = false;
+                    }
+                    explicit_transaction = self.txn.is_some();
+                    completed.push(result);
+                }
+                Ok(result) if implicit_segment => implicit_results.push(result),
+                Ok(result) => completed.push(result),
+                Err(error) => {
+                    if implicit_segment {
+                        // An ambiguous COMMIT retains the exact transaction
+                        // for a later COMMIT retry. Every pre-commit result in
+                        // this segment remains withheld.
+                        if error.code != "08007" {
+                            self.rollback_internal();
+                        }
                     } else if self.txn.is_some()
-                        && e.code != "25P02"
-                        && e.code != "08006"
-                        && e.code != "08007"
+                        && error.code != "25P02"
+                        && error.code != "08006"
+                        && error.code != "08007"
                     {
                         self.failed = true;
                         if let Some(t) = self.txn.as_mut() {
                             t.fail();
                         }
                     }
-                    return Err(e);
+                    return BatchExecution::failure(completed, error);
                 }
             }
         }
-        if implicit {
-            if let Err(error) = check_cancelled(self.cancellation_checker()) {
+
+        if implicit_segment {
+            if let Err(error) = self.finish_implicit_batch_segment() {
+                return BatchExecution::failure(completed, error);
+            }
+            completed.append(&mut implicit_results);
+        }
+        BatchExecution::success(completed)
+    }
+
+    fn finish_implicit_batch_segment(&mut self) -> std::result::Result<(), SqlError> {
+        if let Err(error) = check_cancelled(self.cancellation_checker()) {
+            self.rollback_internal();
+            return Err(error);
+        }
+        if let Err(error) = self.commit_internal() {
+            // A timeout racing with the final pre-submit check must not leave
+            // an implicit transaction behind. Once submission begins, an
+            // outcome-unknown command and its overlay stay available for an
+            // exact COMMIT retry.
+            if error.code == "57014" {
                 self.rollback_internal();
-                return Err(error);
             }
-            if let Err(error) = self.commit_internal() {
-                // A timeout racing with the final pre-submit check must not
-                // leave an implicit transaction behind.  Once the committer
-                // call begins, commit_internal never checks again, so a slow
-                // successful submission keeps its real outcome.
-                if error.code == "57014" {
-                    self.rollback_internal();
-                }
-                return Err(error);
-            }
+            return Err(error);
         }
-        Ok(results)
+        Ok(())
     }
     pub fn prepare(&mut self, name: &str, sql: &str) -> std::result::Result<(), SqlError> {
         if Parser::batch(sql)?.len() != 1 {
@@ -5277,6 +5386,89 @@ mod tests {
         assert!(matches!(results[1].rows[0][0], Datum::Int32(3)));
         assert!(matches!(results[2].rows[0][0], Datum::Int32(3)));
         assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+    }
+
+    #[test]
+    fn execute_batch_segments_work_around_transaction_control_boundaries() {
+        let origin = OriginId::new(110);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut session = engine.session();
+
+        let first = session
+            .execute_batch("SELECT 1; BEGIN; SELECT 2;", &[])
+            .expect("pre-BEGIN implicit segment and explicit transaction");
+        assert_eq!(
+            first
+                .iter()
+                .map(|result| result.command_tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SELECT", "BEGIN", "SELECT"]
+        );
+        assert_eq!(session.transaction_status(), TransactionStatus::Active);
+
+        let second = session
+            .execute_batch("COMMIT; SELECT 3;", &[])
+            .expect("post-COMMIT work must form a fresh implicit segment");
+        assert_eq!(
+            second
+                .iter()
+                .map(|result| result.command_tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["COMMIT", "SELECT"]
+        );
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+    }
+
+    #[test]
+    fn execute_batch_commits_trailing_implicit_work_and_preserves_committed_error_prefix() {
+        let origin = OriginId::new(111);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let engine = SqlEngine::new(store.clone(), committer, Limits::default());
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE segmented_batch (id integer primary key);",
+                &[],
+            )
+            .unwrap();
+
+        let success = session
+            .execute_batch(
+                "BEGIN; INSERT INTO segmented_batch VALUES (1); COMMIT; INSERT INTO segmented_batch VALUES (2);",
+                &[],
+            )
+            .expect("explicit and trailing implicit segments must commit");
+        assert_eq!(success.len(), 4);
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+
+        let outcome = session.execute_simple_batch(
+            "INSERT INTO segmented_batch VALUES (3); COMMIT; INSERT INTO missing_segment VALUES (4);",
+            &[],
+        );
+        assert_eq!(
+            outcome
+                .results
+                .iter()
+                .map(|result| result.command_tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["INSERT 0 1", "COMMIT"]
+        );
+        assert_eq!(
+            outcome.error.as_ref().map(|error| error.code),
+            Some("42P01")
+        );
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+
+        let rows = session
+            .execute("SELECT id FROM segmented_batch ORDER BY id;", &[])
+            .unwrap();
+        assert_eq!(rows.rows.len(), 3);
+        assert!(matches!(rows.rows[2][0], Datum::Int32(3)));
     }
 
     #[test]

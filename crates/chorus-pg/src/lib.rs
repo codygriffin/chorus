@@ -206,7 +206,7 @@ impl PgServer {
         let registry = Arc::new(ConnectionRegistry::default());
         let mut tcp_addr = None;
         let tcp_listener = if let Some(addr) = &self.config.tcp_listen {
-            let listener = TcpListener::bind(addr)?;
+            let listener = bind_trust_tcp_listener(addr)?;
             listener.set_nonblocking(true)?;
             tcp_addr = Some(listener.local_addr()?);
             Some(listener)
@@ -298,7 +298,7 @@ impl PgServer {
         })
     }
     pub fn serve_tcp_once(&self, addr: &str) -> std::io::Result<()> {
-        let listener = TcpListener::bind(addr)?;
+        let listener = bind_trust_tcp_listener(addr)?;
         if let Ok((stream, _)) = listener.accept() {
             let permit = ConnectionPermit::try_acquire(
                 Arc::new(AtomicUsize::new(0)),
@@ -312,6 +312,26 @@ impl PgServer {
         }
         Ok(())
     }
+}
+
+fn trust_tcp_address(address: &str) -> std::io::Result<SocketAddr> {
+    let address = address.parse::<SocketAddr>().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "trust-authenticated PostgreSQL TCP requires an explicit socket address",
+        )
+    })?;
+    if !address.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "trust-authenticated PostgreSQL TCP requires a loopback address",
+        ));
+    }
+    Ok(address)
+}
+
+fn bind_trust_tcp_listener(address: &str) -> std::io::Result<TcpListener> {
+    TcpListener::bind(trust_tcp_address(address)?)
 }
 
 trait ShutdownSocket: Send + Sync {
@@ -2413,6 +2433,48 @@ mod tests {
             "expected at least {expected} active PostgreSQL sessions, observed {}",
             handle.active_connections()
         );
+    }
+
+    #[test]
+    fn trust_tcp_listener_is_loopback_only_even_without_admin_validation() {
+        assert_eq!(
+            trust_tcp_address("127.0.0.1:0").unwrap(),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            trust_tcp_address("[::1]:0").unwrap(),
+            "[::1]:0".parse::<SocketAddr>().unwrap()
+        );
+        for address in [
+            "0.0.0.0:5432",
+            "[::]:5432",
+            "192.0.2.10:5432",
+            "localhost:5432",
+            "not-an-address",
+        ] {
+            let error = trust_tcp_address(address).expect_err("remote trust listener must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+
+        let unix_path = unique_socket_path("reject-remote-trust");
+        let server = test_server(
+            Some("0.0.0.0:5432".into()),
+            Some(unix_path.display().to_string()),
+        );
+        let error = server
+            .start()
+            .err()
+            .expect("remote trust listener must be rejected before any bind");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !unix_path.exists(),
+            "a rejected TCP configuration must not create its Unix listener"
+        );
+
+        let error = server
+            .serve_tcp_once("198.51.100.10:5432")
+            .expect_err("one-shot trust listener must enforce the same boundary");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

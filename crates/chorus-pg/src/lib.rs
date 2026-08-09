@@ -6,12 +6,13 @@
 //! native PostgreSQL client library.
 
 use chorus_common::{Datum, POSTGRES_EPOCH_UNIX_SECS, SqlError, SqlType};
-use chorus_sql::{QueryResult, ResultColumn, SqlEngine, SqlSession};
+use chorus_sql::{BatchExecution, QueryResult, ResultColumn, SqlEngine, SqlSession};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -75,6 +76,175 @@ impl Default for PgConfig {
 pub struct PgServer {
     engine: Arc<SqlEngine>,
     config: PgConfig,
+}
+
+/// A bounded, server-wide execution pool shared by every PostgreSQL
+/// connection served by one [`PgServer`]. Socket workers only parse and encode
+/// protocol messages; storage and CPU-heavy SQL execution runs here.
+struct QueryWorkerPool {
+    sender: Option<SyncSender<QueryJob>>,
+    workers: Vec<JoinHandle<()>>,
+    queued: Arc<AtomicUsize>,
+}
+
+enum QueryWorkerRequest {
+    Simple {
+        sql: String,
+    },
+    Execute {
+        sql: String,
+        params: Vec<Datum>,
+    },
+    #[cfg(test)]
+    Block {
+        entered: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+    },
+}
+
+enum QueryWorkerResponse {
+    Simple(BatchExecution),
+    Execute(Result<QueryResult, SqlError>),
+}
+
+struct QueryJob {
+    session: SqlSession,
+    request: QueryWorkerRequest,
+    response: SyncSender<(SqlSession, QueryWorkerResponse)>,
+}
+
+enum QueryDispatchError {
+    Rejected {
+        session: SqlSession,
+        error: SqlError,
+    },
+    WorkerLost,
+}
+
+impl QueryWorkerPool {
+    fn new(worker_count: usize, queue_capacity: usize) -> std::io::Result<Arc<Self>> {
+        if worker_count == 0 || queue_capacity == 0 || worker_count > queue_capacity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "query worker count must be positive and not exceed maximum active queries",
+            ));
+        }
+        let (sender, receiver) = sync_channel(queue_capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let worker_receiver = Arc::clone(&receiver);
+            let worker_queued = Arc::clone(&queued);
+            match thread::Builder::new()
+                .name(format!("chorus-query-{index}"))
+                .spawn(move || query_worker_loop(worker_receiver, worker_queued))
+            {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    drop(sender);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Arc::new(Self {
+            sender: Some(sender),
+            workers,
+            queued,
+        }))
+    }
+
+    fn dispatch(
+        &self,
+        session: SqlSession,
+        request: QueryWorkerRequest,
+    ) -> Result<(SqlSession, QueryWorkerResponse), QueryDispatchError> {
+        let (response, received) = sync_channel(1);
+        let job = QueryJob {
+            session,
+            request,
+            response,
+        };
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(QueryDispatchError::Rejected {
+                session: job.session,
+                error: SqlError::new("57P03", "query worker pool is shutting down"),
+            });
+        };
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        match sender.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) => {
+                self.queued.fetch_sub(1, Ordering::AcqRel);
+                return Err(QueryDispatchError::Rejected {
+                    session: job.session,
+                    error: SqlError::new("54000", "query worker queue limit reached"),
+                });
+            }
+            Err(TrySendError::Disconnected(job)) => {
+                self.queued.fetch_sub(1, Ordering::AcqRel);
+                return Err(QueryDispatchError::Rejected {
+                    session: job.session,
+                    error: SqlError::new("57P03", "query worker pool is unavailable"),
+                });
+            }
+        }
+        // The session already carries the connection's external cancellation
+        // token, so a queued CancelRequest is observed when execution starts.
+        // The per-AST statement_timeout is installed by SqlSession on the
+        // worker and therefore does not currently include time spent queued.
+        received.recv().map_err(|_| QueryDispatchError::WorkerLost)
+    }
+}
+
+impl Drop for QueryWorkerPool {
+    fn drop(&mut self) {
+        self.sender.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn query_worker_loop(receiver: Arc<Mutex<Receiver<QueryJob>>>, queued: Arc<AtomicUsize>) {
+    loop {
+        let job = match receiver.lock() {
+            Ok(receiver) => match receiver.recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        queued.fetch_sub(1, Ordering::AcqRel);
+        let QueryJob {
+            mut session,
+            request,
+            response,
+        } = job;
+        let outcome = match request {
+            QueryWorkerRequest::Simple { sql } => {
+                QueryWorkerResponse::Simple(session.execute_simple_batch(&sql, &[]))
+            }
+            QueryWorkerRequest::Execute { sql, params } => {
+                QueryWorkerResponse::Execute(session.execute(&sql, &params))
+            }
+            #[cfg(test)]
+            QueryWorkerRequest::Block { entered, release } => {
+                entered.fetch_add(1, Ordering::AcqRel);
+                while !release.load(Ordering::Acquire) {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                QueryWorkerResponse::Simple(BatchExecution {
+                    results: Vec::new(),
+                    error: None,
+                })
+            }
+        };
+        let _ = response.send((session, outcome));
+    }
 }
 
 const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
@@ -201,6 +371,8 @@ impl PgServer {
         shutdown: Arc<AtomicBool>,
         drain_timeout: Duration,
     ) -> std::io::Result<PgServerHandle> {
+        let (worker_count, queue_capacity) = self.engine.query_worker_limits();
+        let query_workers = QueryWorkerPool::new(worker_count, queue_capacity)?;
         let active = Arc::new(AtomicUsize::new(0));
         let registry = Arc::new(ConnectionRegistry::default());
         let mut tcp_addr = None;
@@ -237,6 +409,7 @@ impl PgServer {
                 Arc::clone(&active),
                 self.config.max_connections,
                 Arc::clone(&registry),
+                Arc::clone(&query_workers),
             ));
         }
         if let Some(listener) = unix_listener {
@@ -247,6 +420,7 @@ impl PgServer {
                 Arc::clone(&active),
                 self.config.max_connections,
                 Arc::clone(&registry),
+                Arc::clone(&query_workers),
             ));
         }
 
@@ -297,6 +471,8 @@ impl PgServer {
         })
     }
     pub fn serve_tcp_once(&self, addr: &str) -> std::io::Result<()> {
+        let (worker_count, queue_capacity) = self.engine.query_worker_limits();
+        let query_workers = QueryWorkerPool::new(worker_count, queue_capacity)?;
         let listener = bind_trust_tcp_listener(addr)?;
         if let Ok((stream, _)) = listener.accept() {
             let permit = ConnectionPermit::try_acquire(
@@ -307,7 +483,12 @@ impl PgServer {
                 std::io::Error::new(std::io::ErrorKind::WouldBlock, "connection limit reached")
             })?;
             let _permit = permit;
-            Connection::new(self.engine.clone(), Box::new(stream)).run()?;
+            Connection::new_with_workers(
+                self.engine.clone(),
+                Box::new(stream),
+                Arc::clone(&query_workers),
+            )
+            .run()?;
         }
         Ok(())
     }
@@ -400,6 +581,7 @@ fn spawn_tcp_accept_loop(
     active: Arc<AtomicUsize>,
     max_connections: usize,
     registry: Arc<ConnectionRegistry>,
+    query_workers: Arc<QueryWorkerPool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         loop {
@@ -428,6 +610,7 @@ fn spawn_tcp_accept_loop(
                         engine.clone(),
                         permit,
                         Arc::clone(&registry),
+                        Arc::clone(&query_workers),
                     );
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -446,6 +629,7 @@ fn spawn_unix_accept_loop(
     active: Arc<AtomicUsize>,
     max_connections: usize,
     registry: Arc<ConnectionRegistry>,
+    query_workers: Arc<QueryWorkerPool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         loop {
@@ -474,6 +658,7 @@ fn spawn_unix_accept_loop(
                         engine.clone(),
                         permit,
                         Arc::clone(&registry),
+                        Arc::clone(&query_workers),
                     );
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -491,6 +676,7 @@ fn spawn_connection_worker<S>(
     engine: Arc<SqlEngine>,
     permit: ConnectionPermit,
     registry: Arc<ConnectionRegistry>,
+    query_workers: Arc<QueryWorkerPool>,
 ) where
     S: Io + 'static,
 {
@@ -498,7 +684,7 @@ fn spawn_connection_worker<S>(
     let worker_registry = Arc::clone(&registry);
     let worker = thread::spawn(move || {
         let _permit = permit;
-        let _ = Connection::new(engine, Box::new(stream)).run();
+        let _ = Connection::new_with_workers(engine, Box::new(stream), query_workers).run();
         worker_registry.unregister(socket_id);
     });
     registry.add_worker(worker);
@@ -642,7 +828,9 @@ impl Io for std::io::Cursor<Vec<u8>> {
 }
 struct Connection {
     io: Box<dyn Io>,
+    engine: Arc<SqlEngine>,
     session: SqlSession,
+    query_workers: Option<Arc<QueryWorkerPool>>,
     portals: HashMap<String, Portal>,
     prepared_types: HashMap<String, Vec<u32>>,
     retained_extended_query_bytes: usize,
@@ -802,6 +990,22 @@ impl Drop for Connection {
 
 impl Connection {
     fn new(engine: Arc<SqlEngine>, io: Box<dyn Io>) -> Self {
+        Self::new_inner(engine, io, None)
+    }
+
+    fn new_with_workers(
+        engine: Arc<SqlEngine>,
+        io: Box<dyn Io>,
+        query_workers: Arc<QueryWorkerPool>,
+    ) -> Self {
+        Self::new_inner(engine, io, Some(query_workers))
+    }
+
+    fn new_inner(
+        engine: Arc<SqlEngine>,
+        io: Box<dyn Io>,
+        query_workers: Option<Arc<QueryWorkerPool>>,
+    ) -> Self {
         let pid = next_backend_pid();
         let secret = pid
             .rotate_left(13)
@@ -818,7 +1022,9 @@ impl Connection {
         session.set_cancellation_checker(Some(cancel_token.clone()));
         Self {
             io,
+            engine,
             session,
+            query_workers,
             portals: HashMap::new(),
             prepared_types: HashMap::new(),
             retained_extended_query_bytes: 0,
@@ -829,6 +1035,80 @@ impl Connection {
             cancel_registration,
             extended_error: false,
             idle_transaction_deadline: None,
+        }
+    }
+
+    fn dispatch_query(
+        &mut self,
+        request: QueryWorkerRequest,
+    ) -> std::io::Result<Result<QueryWorkerResponse, SqlError>> {
+        let Some(query_workers) = self.query_workers.as_ref().cloned() else {
+            let response = match request {
+                QueryWorkerRequest::Simple { sql } => {
+                    QueryWorkerResponse::Simple(self.session.execute_simple_batch(&sql, &[]))
+                }
+                QueryWorkerRequest::Execute { sql, params } => {
+                    QueryWorkerResponse::Execute(self.session.execute(&sql, &params))
+                }
+                #[cfg(test)]
+                QueryWorkerRequest::Block { entered, release } => {
+                    entered.fetch_add(1, Ordering::AcqRel);
+                    while !release.load(Ordering::Acquire) {
+                        thread::park_timeout(Duration::from_millis(1));
+                    }
+                    QueryWorkerResponse::Simple(BatchExecution {
+                        results: Vec::new(),
+                        error: None,
+                    })
+                }
+            };
+            return Ok(Ok(response));
+        };
+
+        // Keep a valid placeholder in the connection while the exact session
+        // is owned by a worker. No protocol method can observe the placeholder
+        // because this socket worker waits synchronously for the response.
+        let placeholder = self.engine.session();
+        let session = std::mem::replace(&mut self.session, placeholder);
+        match query_workers.dispatch(session, request) {
+            Ok((session, response)) => {
+                self.session = session;
+                Ok(Ok(response))
+            }
+            Err(QueryDispatchError::Rejected { session, error }) => {
+                self.session = session;
+                Ok(Err(error))
+            }
+            Err(QueryDispatchError::WorkerLost) => Err(std::io::Error::other(
+                "query worker terminated before returning the SQL session",
+            )),
+        }
+    }
+
+    fn dispatch_simple_query(&mut self, sql: String) -> std::io::Result<BatchExecution> {
+        match self.dispatch_query(QueryWorkerRequest::Simple { sql })? {
+            Ok(QueryWorkerResponse::Simple(outcome)) => Ok(outcome),
+            Ok(QueryWorkerResponse::Execute(_)) => Err(std::io::Error::other(
+                "query worker returned the wrong response type",
+            )),
+            Err(error) => Ok(BatchExecution {
+                results: Vec::new(),
+                error: Some(error),
+            }),
+        }
+    }
+
+    fn dispatch_execute(
+        &mut self,
+        sql: String,
+        params: Vec<Datum>,
+    ) -> std::io::Result<Result<QueryResult, SqlError>> {
+        match self.dispatch_query(QueryWorkerRequest::Execute { sql, params })? {
+            Ok(QueryWorkerResponse::Execute(result)) => Ok(result),
+            Ok(QueryWorkerResponse::Simple(_)) => Err(std::io::Error::other(
+                "query worker returned the wrong response type",
+            )),
+            Err(error) => Ok(Err(error)),
         }
     }
     fn run(mut self) -> std::io::Result<()> {
@@ -1038,8 +1318,9 @@ impl Connection {
             return self.ready();
         }
         self.begin_query();
-        let outcome = self.session.execute_simple_batch(&sql, &[]);
+        let outcome = self.dispatch_simple_query(sql);
         self.end_query();
+        let outcome = outcome?;
         for result in &outcome.results {
             self.result(result)?;
         }
@@ -1385,12 +1666,13 @@ impl Connection {
             }
         };
         self.begin_query();
-        let result = if let Some(pending) = p.pending.take() {
-            Ok(pending)
+        let dispatched = if let Some(pending) = p.pending.take() {
+            Ok(Ok(pending))
         } else {
-            self.session.execute(&p.sql, &p.params)
+            self.dispatch_execute(p.sql.clone(), p.params.clone())
         };
         self.end_query();
+        let result = dispatched?;
         let mut result = match result {
             Ok(result) => result,
             Err(e) => return self.extended_failure(&e),
@@ -2272,9 +2554,24 @@ mod tests {
     use super::*;
     use chorus_common::{Limits, OriginId};
     use chorus_storage::{MemoryStateStore, StateStore};
-    use chorus_txn::{Committer, LocalCommitter};
+    use chorus_txn::{Committer, LocalCommitter, TransactionStatus};
     use std::io::{Cursor, Read, Write};
     use std::sync::Mutex;
+
+    fn wait_for_pool_count(counter: &AtomicUsize, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let observed = counter.load(Ordering::Acquire);
+            if observed == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "query pool count did not reach {expected}; observed {observed}"
+            );
+            thread::yield_now();
+        }
+    }
 
     struct IdleTimeoutIo {
         input: Vec<u8>,
@@ -2360,6 +2657,192 @@ mod tests {
         ) as Arc<dyn Committer>;
         let engine = SqlEngine::new(store, committer, Limits::default());
         Connection::new(engine, Box::new(Cursor::new(Vec::new())))
+    }
+
+    fn query_worker_test_engine(worker_count: usize, max_active: usize) -> Arc<SqlEngine> {
+        let store = Arc::new(MemoryStateStore::new()) as Arc<dyn StateStore>;
+        let committer = Arc::new(
+            LocalCommitter::new(Arc::clone(&store), OriginId::new(1)).expect("test committer"),
+        ) as Arc<dyn Committer>;
+        let mut limits = Limits::default();
+        limits.query_workers = worker_count;
+        limits.max_active_queries = max_active;
+        SqlEngine::new(store, committer, limits)
+    }
+
+    fn expect_worker_response(
+        result: Result<(SqlSession, QueryWorkerResponse), QueryDispatchError>,
+    ) -> (SqlSession, QueryWorkerResponse) {
+        match result {
+            Ok(response) => response,
+            Err(QueryDispatchError::Rejected { error, .. }) => {
+                panic!("worker request was unexpectedly rejected: {error:?}")
+            }
+            Err(QueryDispatchError::WorkerLost) => panic!("query worker was lost"),
+        }
+    }
+
+    #[test]
+    fn fixed_query_workers_bound_execution_queue_and_preserve_rejected_session() {
+        let engine = query_worker_test_engine(2, 8);
+        let pool = QueryWorkerPool::new(2, 2).expect("query worker pool");
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+
+        let spawn_blocker = |session: SqlSession| {
+            let pool = Arc::clone(&pool);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            thread::spawn(move || {
+                pool.dispatch(session, QueryWorkerRequest::Block { entered, release })
+            })
+        };
+        let first = spawn_blocker(engine.session());
+        wait_for_pool_count(&entered, 1);
+        let second = spawn_blocker(engine.session());
+        wait_for_pool_count(&entered, 2);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut queued_session = engine.session();
+        queued_session.set_cancellation_checker(Some(cancelled.clone()));
+        let queued_pool = Arc::clone(&pool);
+        let queued = thread::spawn(move || {
+            queued_pool.dispatch(
+                queued_session,
+                QueryWorkerRequest::Simple {
+                    sql: "SELECT 1".into(),
+                },
+            )
+        });
+        wait_for_pool_count(&pool.queued, 1);
+
+        let waiting_pool = Arc::clone(&pool);
+        let waiting_engine = Arc::clone(&engine);
+        let waiting = thread::spawn(move || {
+            waiting_pool.dispatch(
+                waiting_engine.session(),
+                QueryWorkerRequest::Simple {
+                    sql: "SELECT 3".into(),
+                },
+            )
+        });
+        wait_for_pool_count(&pool.queued, 2);
+
+        let mut rejected_session = engine.session();
+        rejected_session
+            .prepare("kept", "SELECT 9")
+            .expect("prepare before rejection");
+        rejected_session = match pool.dispatch(
+            rejected_session,
+            QueryWorkerRequest::Simple {
+                sql: "SELECT 2".into(),
+            },
+        ) {
+            Err(QueryDispatchError::Rejected { session, error }) => {
+                assert_eq!(error.code, "54000");
+                assert!(error.message.contains("queue"));
+                session
+            }
+            Ok(_) => panic!("full query queue unexpectedly accepted another request"),
+            Err(QueryDispatchError::WorkerLost) => panic!("query worker was lost"),
+        };
+        assert_eq!(rejected_session.prepared_sql("kept"), Some("SELECT 9"));
+        assert_eq!(entered.load(Ordering::Acquire), 2);
+
+        cancelled.store(true, Ordering::Release);
+        release.store(true, Ordering::Release);
+        for blocker in [first, second] {
+            let (_, response) =
+                expect_worker_response(blocker.join().expect("blocker worker join"));
+            let QueryWorkerResponse::Simple(outcome) = response else {
+                panic!("blocker returned wrong response type");
+            };
+            assert!(outcome.error.is_none());
+        }
+        let (_, response) = expect_worker_response(queued.join().expect("queued worker join"));
+        let QueryWorkerResponse::Simple(outcome) = response else {
+            panic!("queued request returned wrong response type");
+        };
+        assert_eq!(outcome.error.expect("queued cancellation").code, "57014");
+        let (_, response) = expect_worker_response(waiting.join().expect("waiting worker join"));
+        let QueryWorkerResponse::Simple(outcome) = response else {
+            panic!("waiting request returned wrong response type");
+        };
+        assert!(outcome.error.is_none());
+
+        let (rejected_session, response) = expect_worker_response(pool.dispatch(
+            rejected_session,
+            QueryWorkerRequest::Execute {
+                sql: "EXECUTE kept".into(),
+                params: Vec::new(),
+            },
+        ));
+        let QueryWorkerResponse::Execute(result) = response else {
+            panic!("recovered session returned wrong response type");
+        };
+        assert_eq!(
+            result.expect("recovered session query").rows[0][0],
+            Datum::Int32(9)
+        );
+        drop(rejected_session);
+        wait_for_pool_count(&pool.queued, 0);
+
+        let started = Instant::now();
+        drop(pool);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "completed query workers did not join promptly"
+        );
+    }
+
+    #[test]
+    fn query_worker_handoff_preserves_transaction_and_prepared_state() {
+        let engine = query_worker_test_engine(1, 2);
+        let pool = QueryWorkerPool::new(1, 2).expect("query worker pool");
+        let mut session = engine.session();
+        session.prepare("kept", "SELECT 7").expect("prepare");
+
+        let (next, response) = expect_worker_response(pool.dispatch(
+            session,
+            QueryWorkerRequest::Simple {
+                sql: "BEGIN".into(),
+            },
+        ));
+        session = next;
+        let QueryWorkerResponse::Simple(begin) = response else {
+            panic!("BEGIN returned wrong response type");
+        };
+        assert!(begin.error.is_none());
+        assert_eq!(session.transaction_status(), TransactionStatus::Active);
+        assert_eq!(session.prepared_sql("kept"), Some("SELECT 7"));
+
+        let (next, response) = expect_worker_response(pool.dispatch(
+            session,
+            QueryWorkerRequest::Execute {
+                sql: "EXECUTE kept".into(),
+                params: Vec::new(),
+            },
+        ));
+        session = next;
+        let QueryWorkerResponse::Execute(result) = response else {
+            panic!("prepared query returned wrong response type");
+        };
+        assert_eq!(result.expect("prepared query").rows[0][0], Datum::Int32(7));
+        assert_eq!(session.transaction_status(), TransactionStatus::Active);
+
+        let (session, response) = expect_worker_response(pool.dispatch(
+            session,
+            QueryWorkerRequest::Simple {
+                sql: "ROLLBACK".into(),
+            },
+        ));
+        let QueryWorkerResponse::Simple(rollback) = response else {
+            panic!("ROLLBACK returned wrong response type");
+        };
+        assert!(rollback.error.is_none());
+        assert_eq!(session.transaction_status(), TransactionStatus::Aborted);
+        drop(session);
+        drop(pool);
     }
 
     #[test]

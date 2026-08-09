@@ -421,6 +421,13 @@ impl SqlEngine {
         &self.store
     }
 
+    /// Return the configured serving-path worker count and bounded queue
+    /// capacity. Protocol adapters use these values to keep storage and CPU
+    /// execution off their socket workers without duplicating configuration.
+    pub fn query_worker_limits(&self) -> (usize, usize) {
+        (self.limits.query_workers, self.limits.max_active_queries)
+    }
+
     /// Retry the one process-wide command retained after an ambiguous
     /// committer response.  The exact encoded request is owned by the shared
     /// sequencer, so shutdown recovery never reconstructs a different

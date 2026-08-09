@@ -368,6 +368,7 @@ pub struct SqlEngine {
     limits: Limits,
     sequencer: Arc<CommitSequencer>,
     drain_token: Arc<AtomicBool>,
+    write_admission: Arc<dyn Fn() -> bool + Send + Sync>,
     query_admission: Arc<QueryAdmission>,
     work_memory: Arc<WorkMemoryPool>,
 }
@@ -388,6 +389,27 @@ impl SqlEngine {
         limits: Limits,
         drain_token: Arc<AtomicBool>,
     ) -> Arc<Self> {
+        Self::new_with_drain_and_write_admission(
+            store,
+            committer,
+            limits,
+            drain_token,
+            Arc::new(|| true),
+        )
+    }
+
+    /// Construct an engine with a dynamic local write-admission predicate.
+    /// The predicate is checked before a new transaction or DDL read barrier;
+    /// an existing transaction is allowed to finish or roll back.  This keeps
+    /// local disk watermarks out of the replicated state machine while still
+    /// making the serving path fail closed when the node cannot safely grow.
+    pub fn new_with_drain_and_write_admission(
+        store: Arc<dyn StateStore>,
+        committer: Arc<dyn Committer>,
+        limits: Limits,
+        drain_token: Arc<AtomicBool>,
+        write_admission: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Arc<Self> {
         let sequencer = Arc::new(CommitSequencer::new(committer.origin()));
         let query_admission = QueryAdmission::new(limits.max_active_queries);
         let work_memory = WorkMemoryPool::new(limits.global_work_mem_bytes);
@@ -397,6 +419,7 @@ impl SqlEngine {
             limits,
             sequencer,
             drain_token,
+            write_admission,
             query_admission,
             work_memory,
         })
@@ -2173,6 +2196,16 @@ impl SqlSession {
             Ok(())
         }
     }
+    fn check_write_admission(&self) -> std::result::Result<(), SqlError> {
+        if !(self.engine.write_admission)() {
+            Err(SqlError::new(
+                "53100",
+                "local disk write admission is closed",
+            ))
+        } else {
+            Ok(())
+        }
+    }
     fn start_txn(&mut self) -> std::result::Result<(), SqlError> {
         // Check before the read barrier so a statement which has already
         // timed out cannot create a transaction or touch the committer.
@@ -2305,6 +2338,7 @@ impl SqlSession {
         }
         self.check_cancelled()?;
         self.check_draining()?;
+        self.check_write_admission()?;
         let snap = self.engine.committer.read_barrier().map_err(to_sql)?;
         // IF [NOT] EXISTS branches are true no-ops.  They must not consume a
         // catalog epoch or manufacture a fake schema command, because doing
@@ -2861,6 +2895,7 @@ impl SqlSession {
         q: Insert,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
+        self.check_write_admission()?;
         if self.txn.is_none() {
             self.start_txn()?;
         }
@@ -3080,6 +3115,7 @@ impl SqlSession {
         q: Update,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
+        self.check_write_admission()?;
         if self.txn.is_none() {
             self.start_txn()?;
         }
@@ -3187,6 +3223,7 @@ impl SqlSession {
         q: Delete,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
+        self.check_write_admission()?;
         if self.txn.is_none() {
             self.start_txn()?;
         }
@@ -5637,6 +5674,62 @@ mod tests {
             .execute("SELECT id,name FROM users WHERE id = 1;", &[])
             .unwrap();
         assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    fn disk_write_admission_rejects_new_writes_but_preserves_existing_transactions() {
+        let origin = OriginId::new(108);
+        let store = store_for_origin(origin);
+        let committer: Arc<dyn Committer> =
+            Arc::new(LocalCommitter::new(store.clone(), origin).expect("test committer"));
+        let admission = Arc::new(AtomicBool::new(true));
+        let predicate_gate = Arc::clone(&admission);
+        let predicate: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || predicate_gate.load(Ordering::Acquire));
+        let engine = SqlEngine::new_with_drain_and_write_admission(
+            store.clone(),
+            committer,
+            Limits::default(),
+            Arc::new(AtomicBool::new(false)),
+            predicate,
+        );
+        let mut setup = engine.session();
+        setup
+            .execute(
+                "CREATE TABLE disk_gate (id integer primary key, value text);",
+                &[],
+            )
+            .unwrap();
+        drop(setup);
+
+        admission.store(false, Ordering::Release);
+        let mut read = engine.session();
+        assert!(read.execute("SELECT 1", &[]).is_ok());
+        let mut blocked = engine.session();
+        let error = blocked
+            .execute("INSERT INTO disk_gate VALUES (1, 'blocked');", &[])
+            .expect_err("new writes must fail closed when disk admission is closed");
+        assert_eq!(error.code, "53100");
+        let error = blocked
+            .execute("CREATE TABLE blocked_ddl (id integer);", &[])
+            .expect_err("new DDL must fail closed when disk admission is closed");
+        assert_eq!(error.code, "53100");
+
+        admission.store(true, Ordering::Release);
+        let mut existing = engine.session();
+        existing.execute("BEGIN", &[]).unwrap();
+        existing
+            .execute("INSERT INTO disk_gate VALUES (2, 'staged');", &[])
+            .unwrap();
+        admission.store(false, Ordering::Release);
+        existing
+            .execute("COMMIT", &[])
+            .expect("an already-started transaction may finish after admission closes");
+        let mut verify = engine.session();
+        let result = verify
+            .execute("SELECT value FROM disk_gate WHERE id = 2", &[])
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
     }
 
     #[test]

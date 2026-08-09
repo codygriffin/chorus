@@ -857,15 +857,7 @@ pub fn status(
     };
     let state_file = config.state_path();
     let state_file_bytes = fs::metadata(&state_file).ok().map(|m| m.len());
-    let disk_write_admission = state_file_bytes.is_none_or(|size| {
-        let percentage = config
-            .storage
-            .data_dir_budget_bytes
-            .saturating_mul(config.storage.low_space_watermark_percent as u64)
-            / 100;
-        size.saturating_add(config.storage.low_space_watermark_bytes.max(percentage))
-            <= config.storage.data_dir_budget_bytes
-    });
+    let disk_write_admission = disk_write_admission(config);
     let mut warnings = Vec::new();
     if !identity_ok {
         warnings.push("persisted state identity does not match configuration".into());
@@ -894,6 +886,46 @@ pub fn status(
         identity_ok,
         warnings,
     }
+}
+
+/// Return whether the configured data-directory budget still admits writes.
+/// This is deliberately local-only: it sums the owned data directory without
+/// following symlinks and reserves the larger configured byte/percentage
+/// watermark.  Any metadata/read failure fails closed.
+pub fn disk_write_admission(config: &Config) -> bool {
+    let Some(observed) = directory_bytes(&config.data_dir) else {
+        return false;
+    };
+    let percentage = config
+        .storage
+        .data_dir_budget_bytes
+        .saturating_mul(config.storage.low_space_watermark_percent as u64)
+        / 100;
+    let watermark = config.storage.low_space_watermark_bytes.max(percentage);
+    observed.saturating_add(watermark) <= config.storage.data_dir_budget_bytes
+}
+
+fn directory_bytes(path: &Path) -> Option<u64> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    if metadata.file_type().is_symlink() {
+        return Some(0);
+    }
+    if metadata.is_file() {
+        return Some(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Some(0);
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path).ok()? {
+        let entry = entry.ok()?;
+        total = total.checked_add(directory_bytes(&entry.path())?)?;
+    }
+    Some(total)
 }
 pub fn open_store(config: &Config) -> Result<FileStateStore, ConfigError> {
     config.validate()?;
@@ -2392,6 +2424,22 @@ mod tests {
         assert!(rendered.contains("chorus_node_info{node_id=\"7\",role=\"unknown\"} 1"));
         assert!(!rendered.contains("cluster_id"));
         assert!(!rendered.contains("SELECT"));
+    }
+
+    #[test]
+    fn disk_write_admission_sums_owned_data_and_reserves_watermark() {
+        let directory = TestDirectory::new("disk-admission");
+        let data_dir = directory.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let mut config = Config::defaults(&data_dir, 1);
+        config.storage.data_dir_budget_bytes = 100;
+        config.storage.low_space_watermark_bytes = 20;
+        config.storage.low_space_watermark_percent = 1;
+
+        fs::write(data_dir.join("state.redb"), vec![0u8; 80]).unwrap();
+        assert!(disk_write_admission(&config));
+        fs::write(data_dir.join("raft.redb"), vec![0u8; 1]).unwrap();
+        assert!(!disk_write_admission(&config));
     }
 
     #[test]

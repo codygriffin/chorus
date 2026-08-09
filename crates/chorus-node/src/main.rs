@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use chorus_admin::{
-    Config, is_logical_backup, logical_backup_from_store, open_store, render_metrics,
-    render_status, snapshot_file_within_limit, status as node_status,
+    Config, disk_write_admission, is_logical_backup, logical_backup_from_store, open_store,
+    render_metrics, render_status, snapshot_file_within_limit, status as node_status,
 };
 use chorus_codec::{LogicalSnapshot, ReplicatedCommandV1};
 use chorus_common::{LogId, OriginId};
@@ -322,11 +322,25 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
     // watcher flips it before the server stops accepting connections, so new
     // transactions fail closed while already-open transactions can finish.
     let shutdown = Arc::new(AtomicBool::new(false));
-    let engine = SqlEngine::new_with_drain_token(
+    let admission_state = Arc::new(AtomicBool::new(disk_write_admission(&cfg)));
+    let admission_config = cfg.clone();
+    let admission_shutdown = Arc::clone(&shutdown);
+    let admission_refresh = Arc::clone(&admission_state);
+    let disk_monitor = thread::spawn(move || {
+        while !admission_shutdown.load(Ordering::Acquire) {
+            admission_refresh.store(disk_write_admission(&admission_config), Ordering::Release);
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+    let admission_state_for_engine = Arc::clone(&admission_state);
+    let write_admission: Arc<dyn Fn() -> bool + Send + Sync> =
+        Arc::new(move || admission_state_for_engine.load(Ordering::Acquire));
+    let engine = SqlEngine::new_with_drain_and_write_admission(
         store.clone(),
         committer,
         cfg.limits.clone(),
         Arc::clone(&shutdown),
+        write_admission,
     );
     let socket = cfg.postgres.unix_socket_dir.as_ref().map(|dir| {
         let _ = fs::create_dir_all(dir);
@@ -365,11 +379,13 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
         Ok(true) => {}
         Ok(false) => {
             shutdown.store(true, Ordering::Release);
+            let _ = disk_monitor.join();
             let _ = signal_thread.join();
             return Err("could not install process shutdown signal handlers".into());
         }
         Err(error) => {
             shutdown.store(true, Ordering::Release);
+            let _ = disk_monitor.join();
             let _ = signal_thread.join();
             return Err(format!("shutdown signal watcher did not start: {error}"));
         }
@@ -379,6 +395,7 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
             Ok(handle) => handle,
             Err(error) => {
                 shutdown.store(true, Ordering::Release);
+                let _ = disk_monitor.join();
                 let _ = signal_thread.join();
                 return Err(error.to_string());
             }
@@ -397,6 +414,7 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
     // this point.  Resolve the one exact command retained by the shared SQL
     // sequencer before dropping the OpenRaft committer/runtime.
     shutdown.store(true, Ordering::Release);
+    let _ = disk_monitor.join();
     let pending = engine
         .resolve_pending_command()
         .map_err(|error| format!("pending command could not be resolved during shutdown: {error}"));

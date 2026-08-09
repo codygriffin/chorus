@@ -14,7 +14,7 @@ use chorus_storage::{
 use chorus_txn::{CommitSequencer, Committer, Transaction, TransactionStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -159,12 +159,66 @@ impl Default for SessionSettings {
     }
 }
 
+/// Process-wide admission for externally submitted SQL execution.
+///
+/// The PostgreSQL adapter may have many session workers, but the SQL engine
+/// still needs one shared fail-closed bound on concurrently executing work.
+/// A permit is held by the outer `SqlSession::execute` call and released by
+/// its RAII guard on every return path.  Nested `EXECUTE` dispatch reuses the
+/// outer permit rather than consuming another slot.
+struct QueryAdmission {
+    active: AtomicUsize,
+    maximum: usize,
+}
+
+struct QueryPermit {
+    admission: Arc<QueryAdmission>,
+}
+
+impl QueryAdmission {
+    fn new(maximum: usize) -> Arc<Self> {
+        Arc::new(Self {
+            active: AtomicUsize::new(0),
+            maximum,
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> std::result::Result<QueryPermit, SqlError> {
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.maximum {
+                return Err(SqlError::new("54000", "maximum active query limit reached"));
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(QueryPermit {
+                        admission: Arc::clone(self),
+                    });
+                }
+                Err(observed) => active = observed,
+            }
+        }
+    }
+}
+
+impl Drop for QueryPermit {
+    fn drop(&mut self) {
+        self.admission.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct SqlEngine {
     store: Arc<dyn StateStore>,
     committer: Arc<dyn Committer>,
     limits: Limits,
     sequencer: Arc<CommitSequencer>,
     drain_token: Arc<AtomicBool>,
+    query_admission: Arc<QueryAdmission>,
 }
 impl SqlEngine {
     pub fn new(
@@ -184,12 +238,14 @@ impl SqlEngine {
         drain_token: Arc<AtomicBool>,
     ) -> Arc<Self> {
         let sequencer = Arc::new(CommitSequencer::new(committer.origin()));
+        let query_admission = QueryAdmission::new(limits.max_active_queries);
         Arc::new(Self {
             store,
             committer,
             limits,
             sequencer,
             drain_token,
+            query_admission,
         })
     }
     pub fn session(self: &Arc<Self>) -> SqlSession {
@@ -203,6 +259,7 @@ impl SqlEngine {
             sequencer: Arc::clone(&self.sequencer),
             transaction_timestamp_us: None,
             statement_timestamp_us: None,
+            query_permit: None,
         }
     }
     pub fn store(&self) -> &Arc<dyn StateStore> {
@@ -1413,6 +1470,7 @@ pub struct SqlSession {
     sequencer: Arc<CommitSequencer>,
     transaction_timestamp_us: Option<i64>,
     statement_timestamp_us: Option<i64>,
+    query_permit: Option<QueryPermit>,
 }
 impl SqlSession {
     /// Install or clear the cooperative cancellation hook for this session.
@@ -1449,6 +1507,14 @@ impl SqlSession {
         sql: &str,
         params: &[Datum],
     ) -> std::result::Result<QueryResult, SqlError> {
+        // `Statement::Execute` dispatches through this method recursively.
+        // Keep one permit for the externally submitted operation so prepared
+        // statements cannot consume a second slot or deadlock at a limit of
+        // one.
+        let outer_execution = self.query_permit.is_none();
+        if outer_execution {
+            self.query_permit = Some(self.engine.query_admission.try_acquire()?);
+        }
         // The protocol cancellation hook belongs to the connection and must
         // survive a statement.  A timeout wrapper is installed only for the
         // duration of this call and is restored even when parsing/execution
@@ -1457,6 +1523,9 @@ impl SqlSession {
         let previous_checker = self.cancellation_checker.clone();
         let result = self.execute_with_deadline(sql, params, previous_checker.clone());
         self.cancellation_checker = previous_checker;
+        if outer_execution {
+            self.query_permit.take();
+        }
         result
     }
 
@@ -4521,8 +4590,8 @@ mod tests {
     use chorus_storage::MemoryStateStore;
     use chorus_txn::{Committer, LocalCommitter};
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Condvar, Mutex};
 
     fn store_for_origin(origin: OriginId) -> Arc<dyn StateStore> {
         let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
@@ -4651,6 +4720,88 @@ mod tests {
                     "simulated ambiguous response".into(),
                 ));
             }
+            self.inner.submit(command)
+        }
+
+        fn submit_schema(
+            &self,
+            command: chorus_codec::SchemaCommandV1,
+        ) -> chorus_common::Result<ApplyResult> {
+            self.inner.submit_schema(command)
+        }
+
+        fn origin(&self) -> OriginId {
+            self.inner.origin()
+        }
+    }
+
+    struct AdmissionGate {
+        entered: Mutex<bool>,
+        entered_cv: Condvar,
+        released: Mutex<bool>,
+        released_cv: Condvar,
+    }
+
+    impl AdmissionGate {
+        fn new() -> Self {
+            Self {
+                entered: Mutex::new(false),
+                entered_cv: Condvar::new(),
+                released: Mutex::new(false),
+                released_cv: Condvar::new(),
+            }
+        }
+
+        fn mark_entered(&self) {
+            *self.entered.lock().expect("entered lock") = true;
+            self.entered_cv.notify_all();
+        }
+
+        fn wait_until_entered(&self) {
+            let mut entered = self.entered.lock().expect("entered lock");
+            while !*entered {
+                entered = self.entered_cv.wait(entered).expect("entered wait");
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().expect("released lock") = true;
+            self.released_cv.notify_all();
+        }
+
+        fn wait_until_released(&self) {
+            let mut released = self.released.lock().expect("released lock");
+            while !*released {
+                released = self.released_cv.wait(released).expect("released wait");
+            }
+        }
+    }
+
+    struct AdmissionCommitter {
+        inner: LocalCommitter,
+        block_first_barrier: AtomicBool,
+        fail_next_barrier: AtomicBool,
+        gate: Arc<AdmissionGate>,
+    }
+
+    impl Committer for AdmissionCommitter {
+        fn read_barrier(&self) -> chorus_common::Result<StateSnapshot> {
+            if self.block_first_barrier.swap(false, Ordering::AcqRel) {
+                self.gate.mark_entered();
+                self.gate.wait_until_released();
+            }
+            if self.fail_next_barrier.swap(false, Ordering::AcqRel) {
+                return Err(ChorusError::Consensus(
+                    "simulated read-barrier failure".into(),
+                ));
+            }
+            self.inner.read_barrier()
+        }
+
+        fn submit(
+            &self,
+            command: chorus_codec::CommitTransactionV1,
+        ) -> chorus_common::Result<ApplyResult> {
             self.inner.submit(command)
         }
 
@@ -4829,6 +4980,69 @@ mod tests {
         assert_eq!(encoded.len(), 2);
         assert_eq!(encoded[0], encoded[1]);
         assert_eq!(store.snapshot().unwrap().db_epoch(), 2);
+    }
+
+    #[test]
+    fn active_query_admission_is_shared_and_released_on_success_and_error() {
+        let origin = OriginId::new(1);
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let gate = Arc::new(AdmissionGate::new());
+        let committer = Arc::new(AdmissionCommitter {
+            inner: LocalCommitter::new(store.clone(), origin).expect("test committer"),
+            block_first_barrier: AtomicBool::new(true),
+            fail_next_barrier: AtomicBool::new(false),
+            gate: Arc::clone(&gate),
+        });
+        let mut limits = Limits::default();
+        limits.max_active_queries = 1;
+        let engine = SqlEngine::new(store, committer.clone(), limits);
+
+        let first_engine = Arc::clone(&engine);
+        let first = std::thread::spawn(move || {
+            let mut session = first_engine.session();
+            session.execute("SELECT 1", &[])
+        });
+        gate.wait_until_entered();
+
+        let mut rejected = engine.session();
+        let error = rejected
+            .execute("SELECT 1", &[])
+            .expect_err("the second active query must be rejected");
+        assert_eq!(error.code, "54000");
+
+        gate.release();
+        assert!(first.join().expect("first query thread").is_ok());
+        assert_eq!(
+            engine.query_admission.active.load(Ordering::Acquire),
+            0,
+            "successful query must release its permit"
+        );
+
+        // Nested EXECUTE dispatch is one externally submitted operation and
+        // must reuse the outer permit even when the limit is one.
+        let mut prepared = engine.session();
+        prepared.prepare("one", "SELECT 1").unwrap();
+        assert!(prepared.execute("EXECUTE one", &[]).is_ok());
+
+        // A read-barrier error must release the permit just as a successful
+        // query does, allowing the next request to proceed.
+        committer.fail_next_barrier.store(true, Ordering::Release);
+        let mut failing = engine.session();
+        let error = failing
+            .execute("SELECT 1", &[])
+            .expect_err("the injected read-barrier error must surface");
+        assert_eq!(error.code, "57P03");
+        assert_eq!(
+            engine.query_admission.active.load(Ordering::Acquire),
+            0,
+            "failed query must release its permit"
+        );
+        assert!(failing.execute("SELECT 1", &[]).is_ok());
+        assert_eq!(
+            engine.query_admission.active.load(Ordering::Acquire),
+            0,
+            "permit must be reusable after an error"
+        );
     }
 
     #[test]

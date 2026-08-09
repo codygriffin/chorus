@@ -7,6 +7,12 @@
 //! integration steps. In particular, purging is fenced by an explicit durable
 //! checkpoint marker that a future state-machine adapter must advance.
 
+pub mod state_machine;
+
+pub use state_machine::{
+    BoundedSnapshotData, ChorusRaftConfig, RedbStateMachine, RedbStateMachineError,
+};
+
 use std::fmt::Debug;
 use std::io;
 use std::marker::PhantomData;

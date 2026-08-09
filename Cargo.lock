@@ -309,6 +309,9 @@ dependencies = [
 name = "chorus-redb"
 version = "0.1.0"
 dependencies = [
+ "chorus-codec",
+ "chorus-common",
+ "chorus-storage",
  "openraft",
  "redb",
  "serde",

@@ -83,7 +83,11 @@ pub struct Config {
 pub struct PostgresConfig {
     pub unix_socket_dir: Option<PathBuf>,
     pub listen: Option<String>,
+    /// Explicit remote TLS listener. It is disabled by default and never
+    /// reuses the local trust listener.
     pub remote_listen: Option<String>,
+    /// Private, line-oriented PostgreSQL SCRAM verifier file used only by the
+    /// explicit remote listener (`username:SCRAM-SHA-256$...`).
     pub auth_file: Option<PathBuf>,
     pub max_connections: usize,
 }
@@ -466,17 +470,31 @@ impl Config {
             .as_deref()
             .filter(|x| !x.is_empty())
         {
-            let _: SocketAddr = remote.parse().map_err(|_| {
+            let address: SocketAddr = remote.parse().map_err(|_| {
                 ConfigError::Invalid("postgres.remote_listen is not a socket address".into())
             })?;
+            if address.port() == 0 {
+                return Err(ConfigError::Invalid(
+                    "postgres.remote_listen port must be nonzero".into(),
+                ));
+            }
+            if !self.tls.complete() {
+                return Err(ConfigError::Invalid(
+                    "postgres.remote_listen requires complete TLS certificate, key, and CA configuration".into(),
+                ));
+            }
+            let auth_file = self.postgres.auth_file.as_deref().ok_or_else(|| {
+                ConfigError::Invalid(
+                    "postgres.remote_listen requires postgres.auth_file with SCRAM verifiers"
+                        .into(),
+                )
+            })?;
+            validate_tls_file(Some(auth_file), "postgres.auth_file", true)?;
+            let auth = read_bounded_regular_file(auth_file, "postgres.auth_file", true)?;
+            validate_scram_auth_file(&auth)?;
+        } else if self.postgres.auth_file.is_some() {
             return Err(ConfigError::Invalid(
-                "postgres remote TCP is unsupported until TLS and authentication are implemented"
-                    .into(),
-            ));
-        }
-        if self.postgres.auth_file.is_some() {
-            return Err(ConfigError::Invalid(
-                "postgres authentication configuration is unsupported by the current trust-only gateway".into(),
+                "postgres.auth_file requires postgres.remote_listen".into(),
             ));
         }
         if let Some(dir) = &self.postgres.unix_socket_dir {
@@ -742,6 +760,46 @@ impl Config {
                 true,
             )?,
         })
+    }
+
+    /// Read the bounded server certificate/key and SCRAM verifier file for the
+    /// explicit remote PostgreSQL listener. Plaintext passwords are never
+    /// accepted or returned.
+    pub fn postgres_remote_material(&self) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), ConfigError> {
+        let remote = self.postgres.remote_listen.as_deref().ok_or_else(|| {
+            ConfigError::Invalid("postgres.remote_listen is not configured".into())
+        })?;
+        let _: SocketAddr = remote.parse().map_err(|_| {
+            ConfigError::Invalid("postgres.remote_listen is not a socket address".into())
+        })?;
+        if !self.tls.complete() {
+            return Err(ConfigError::Invalid(
+                "remote PostgreSQL requires complete TLS certificate, key, and CA configuration"
+                    .into(),
+            ));
+        }
+        let auth_path = self.postgres.auth_file.as_deref().ok_or_else(|| {
+            ConfigError::Invalid("remote PostgreSQL requires postgres.auth_file".into())
+        })?;
+        let certificate = read_bounded_regular_file(
+            self.tls
+                .certificate
+                .as_deref()
+                .expect("validated certificate"),
+            "tls.certificate",
+            false,
+        )?;
+        let private_key = read_bounded_regular_file(
+            self.tls
+                .private_key
+                .as_deref()
+                .expect("validated private key"),
+            "tls.private_key",
+            true,
+        )?;
+        let auth_file = read_bounded_regular_file(auth_path, "postgres.auth_file", true)?;
+        validate_scram_auth_file(&auth_file)?;
+        Ok((certificate, private_key, auth_file))
     }
 }
 
@@ -1956,6 +2014,121 @@ fn read_bounded_regular_file(
     Ok(bytes)
 }
 
+fn validate_scram_auth_file(bytes: &[u8]) -> Result<(), ConfigError> {
+    const MAX_USERS: usize = 64;
+    const MIN_ITERATIONS: u32 = 4096;
+    const MAX_ITERATIONS: u32 = 1_000_000;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use std::collections::HashSet;
+
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        ConfigError::Invalid("postgres.auth_file must be UTF-8 SCRAM verifier text".into())
+    })?;
+    let mut users = 0usize;
+    let mut names = HashSet::new();
+    for (line_number, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (username, verifier) = line.split_once(':').ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "postgres.auth_file line {} is missing ':'",
+                line_number + 1
+            ))
+        })?;
+        if username.is_empty()
+            || username.len() > 128
+            || username
+                .bytes()
+                .any(|byte| byte == 0 || byte == b':' || byte.is_ascii_whitespace())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "postgres.auth_file line {} has an invalid username",
+                line_number + 1
+            )));
+        }
+        if !names.insert(username) {
+            return Err(ConfigError::Invalid(format!(
+                "postgres.auth_file line {} duplicates a username",
+                line_number + 1
+            )));
+        }
+        users += 1;
+        if users > MAX_USERS {
+            return Err(ConfigError::Invalid(
+                "postgres.auth_file contains too many users".into(),
+            ));
+        }
+        let rest = verifier.strip_prefix("SCRAM-SHA-256$").ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "postgres.auth_file line {} is not SCRAM-SHA-256",
+                line_number + 1
+            ))
+        })?;
+        let (parameters, keys) = rest.split_once('$').ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "postgres.auth_file line {} is missing key data",
+                line_number + 1
+            ))
+        })?;
+        let (iterations, salt) = parameters.split_once(':').ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "postgres.auth_file line {} is missing iterations or salt",
+                line_number + 1
+            ))
+        })?;
+        let iterations = iterations.parse::<u32>().map_err(|_| {
+            ConfigError::Invalid(format!(
+                "postgres.auth_file line {} has invalid iterations",
+                line_number + 1
+            ))
+        })?;
+        if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
+            return Err(ConfigError::Invalid(format!(
+                "postgres.auth_file line {} has out-of-range iterations",
+                line_number + 1
+            )));
+        }
+        let (stored, server) = keys.split_once(':').ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "postgres.auth_file line {} is missing stored/server keys",
+                line_number + 1
+            ))
+        })?;
+        let salt = BASE64.decode(salt).map_err(|_| {
+            ConfigError::Invalid(format!(
+                "postgres.auth_file line {} has invalid salt",
+                line_number + 1
+            ))
+        })?;
+        let stored = BASE64.decode(stored).map_err(|_| {
+            ConfigError::Invalid(format!(
+                "postgres.auth_file line {} has invalid stored key",
+                line_number + 1
+            ))
+        })?;
+        let server = BASE64.decode(server).map_err(|_| {
+            ConfigError::Invalid(format!(
+                "postgres.auth_file line {} has invalid server key",
+                line_number + 1
+            ))
+        })?;
+        if salt.is_empty() || salt.len() > 64 || stored.len() != 32 || server.len() != 32 {
+            return Err(ConfigError::Invalid(format!(
+                "postgres.auth_file line {} has invalid key lengths",
+                line_number + 1
+            )));
+        }
+    }
+    if users == 0 {
+        return Err(ConfigError::Invalid(
+            "postgres.auth_file contains no SCRAM users".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_tls_file(path: Option<&Path>, name: &str, private: bool) -> Result<(), ConfigError> {
     let path = path.ok_or_else(|| ConfigError::Invalid(format!("{name} is missing")))?;
     let metadata = fs::symlink_metadata(path)
@@ -2470,6 +2643,25 @@ mod tests {
                 .to_string()
                 .contains("exceeds")
         );
+    }
+
+    #[test]
+    fn remote_postgres_requires_complete_tls_and_bounded_scram_verifiers() {
+        let directory = TestDirectory::new("remote-postgres-config");
+        let mut config = authenticated_config(&directory);
+        let auth_path = directory.path().join("pg-auth.txt");
+        let verifier = "app:SCRAM-SHA-256$4096:MDEyMzQ1Njc4OWFiY2RlZg==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n";
+        fs::write(&auth_path, verifier).expect("write SCRAM verifier");
+        make_private_file(&auth_path);
+        config.postgres.remote_listen = Some("127.0.0.1:6543".into());
+        config.postgres.auth_file = Some(auth_path);
+        config.validate().expect("remote TLS/SCRAM configuration");
+
+        config.postgres.auth_file = None;
+        assert!(config.validate().is_err());
+        config.postgres.auth_file = Some(directory.path().join("missing-auth"));
+        config.tls.private_key = None;
+        assert!(config.validate().is_err());
     }
 
     #[test]

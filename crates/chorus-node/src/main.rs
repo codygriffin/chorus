@@ -15,7 +15,7 @@ use chorus_consensus::{
     Consensus, ConsensusCommitter, NetworkConsensus, OpenRaftConsensus, OpenRaftRuntimeOptions,
     StandaloneConsensus,
 };
-use chorus_pg::{PgConfig, PgServer};
+use chorus_pg::{PgConfig, PgRemoteConfig, PgServer};
 use chorus_sql::SqlEngine;
 use chorus_storage::{Catalog, FileStateStore, StateStore};
 use std::env;
@@ -339,6 +339,22 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
             tcp_listen: cfg.postgres.listen.clone(),
             unix_socket: socket.clone(),
             max_connections: cfg.postgres.max_connections,
+            remote: cfg
+                .postgres
+                .remote_listen
+                .as_ref()
+                .map(|listen| {
+                    let (certificate_pem, private_key_pem, auth_file) = cfg
+                        .postgres_remote_material()
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>(PgRemoteConfig {
+                        listen: listen.clone(),
+                        certificate_pem,
+                        private_key_pem,
+                        auth_file,
+                    })
+                })
+                .transpose()?,
         },
     );
     let (signal_ready_tx, signal_ready_rx) = mpsc::sync_channel(1);
@@ -372,6 +388,7 @@ fn run_command(args: &[String], path: &str) -> Result<(), String> {
         serde_json::json!({
             "node_id": cfg.node_id,
             "tcp": server_handle.tcp_addr().map(|address| address.to_string()),
+            "remote_tls": server_handle.remote_addr().map(|address| address.to_string()),
             "unix_socket": server_handle.unix_socket().map(|path| path.display().to_string()),
         }),
     );

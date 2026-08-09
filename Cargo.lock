@@ -323,6 +323,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 name = "chorus-admin"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chorus-codec",
  "chorus-common",
  "chorus-consensus",
@@ -411,10 +412,16 @@ dependencies = [
 name = "chorus-pg"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chorus-common",
  "chorus-sql",
  "chorus-storage",
  "chorus-txn",
+ "rcgen",
+ "ring",
+ "rustls",
+ "rustls-pemfile",
+ "subtle",
  "thiserror 2.0.19",
  "uuid",
 ]

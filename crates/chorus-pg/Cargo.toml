@@ -11,3 +11,11 @@ chorus-txn = { path = "../chorus-txn" }
 chorus-storage = { path = "../chorus-storage" }
 thiserror = "2.0.19"
 uuid = { version = "1.22.0", features = ["v4"] }
+base64 = "=0.22.1"
+ring = "=0.17.14"
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "=2.2.0"
+subtle = "=2.6.1"
+
+[dev-dependencies]
+rcgen = "=0.13.2"

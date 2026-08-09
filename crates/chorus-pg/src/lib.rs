@@ -5,10 +5,18 @@
 //! Sync flow, cancellation keys, and structured errors without depending on a
 //! native PostgreSQL client library.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chorus_common::{Datum, POSTGRES_EPOCH_UNIX_SECS, SqlError, SqlType};
 use chorus_sql::{BatchExecution, QueryResult, ResultColumn, SqlEngine, SqlSession};
+use ring::digest::{SHA256, digest};
+use ring::hmac::{HMAC_SHA256, Key as HmacKey, sign as hmac_sign};
+use ring::pbkdf2::{PBKDF2_HMAC_SHA256, derive as pbkdf2_derive};
+use ring::rand::{SecureRandom, SystemRandom};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use rustls_pemfile::{certs as pem_certs, private_key as pem_private_key};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -16,6 +24,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
 // Keep wire limits deliberately conservative.  PostgreSQL's protocol uses a
 // signed 32-bit length, but accepting multi-gigabyte frames is an easy denial
@@ -33,6 +42,15 @@ const PROTOCOL_VERSION_3_0: u32 = 196_608;
 const SSL_REQUEST_CODE: u32 = 80_877_103;
 const CANCEL_REQUEST_CODE: u32 = 80_877_102;
 const GSSENC_REQUEST_CODE: u32 = 80_877_104;
+const MAX_REMOTE_AUTH_FILE_BYTES: usize = 1024 * 1024;
+const MAX_REMOTE_TLS_FILE_BYTES: usize = 1024 * 1024;
+const MAX_REMOTE_AUTH_USERS: usize = 64;
+const MAX_SCRAM_USERNAME_BYTES: usize = 128;
+const MAX_SCRAM_NONCE_BYTES: usize = 256;
+const MIN_SCRAM_ITERATIONS: u32 = 4096;
+const MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
+const SCRAM_SHA256_MECHANISM: &str = "SCRAM-SHA-256";
+const SCRAM_SASL_NONE: &str = "n,,";
 
 type CancelKey = (u32, u32);
 
@@ -62,15 +80,306 @@ pub struct PgConfig {
     pub tcp_listen: Option<String>,
     pub unix_socket: Option<String>,
     pub max_connections: usize,
+    /// Explicit remote access.  Remote connections are never accepted by the
+    /// trust listener: this path requires a TLS certificate and a bounded
+    /// PostgreSQL SCRAM verifier file before a socket is bound.
+    pub remote: Option<PgRemoteConfig>,
 }
+
+/// Configuration for the explicitly enabled remote PostgreSQL listener.
+/// `auth_file` contains one `username:SCRAM-SHA-256$...` verifier per line;
+/// plaintext passwords are deliberately not accepted or retained.
+#[derive(Clone)]
+pub struct PgRemoteConfig {
+    pub listen: String,
+    pub certificate_pem: Vec<u8>,
+    pub private_key_pem: Vec<u8>,
+    pub auth_file: Vec<u8>,
+}
+
+impl std::fmt::Debug for PgRemoteConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PgRemoteConfig")
+            .field("listen", &self.listen)
+            .field("certificate_pem_bytes", &self.certificate_pem.len())
+            .field("private_key_pem_bytes", &self.private_key_pem.len())
+            .field("auth_file_bytes", &self.auth_file.len())
+            .finish()
+    }
+}
+
 impl Default for PgConfig {
     fn default() -> Self {
         Self {
             tcp_listen: Some("127.0.0.1:5432".into()),
             unix_socket: None,
             max_connections: 32,
+            remote: None,
         }
     }
+}
+
+#[derive(Clone)]
+struct ScramVerifier {
+    iterations: u32,
+    salt: Vec<u8>,
+    stored_key: [u8; 32],
+    server_key: [u8; 32],
+}
+
+#[derive(Clone)]
+struct ScramUsers {
+    users: HashMap<String, ScramVerifier>,
+}
+
+impl ScramUsers {
+    fn parse(bytes: &[u8]) -> std::io::Result<Arc<Self>> {
+        if bytes.is_empty() || bytes.len() > MAX_REMOTE_AUTH_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PostgreSQL SCRAM verifier file is empty or too large",
+            ));
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PostgreSQL SCRAM verifier file is not UTF-8",
+            )
+        })?;
+        let mut users = HashMap::new();
+        for (line_number, raw_line) in text.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (username, verifier) = line.split_once(':').ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("SCRAM verifier line {} is missing ':'", line_number + 1),
+                )
+            })?;
+            if username.is_empty()
+                || username.len() > MAX_SCRAM_USERNAME_BYTES
+                || username
+                    .bytes()
+                    .any(|byte| byte == 0 || byte == b':' || byte.is_ascii_whitespace())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "SCRAM verifier line {} has an invalid username",
+                        line_number + 1
+                    ),
+                ));
+            }
+            if users.len() >= MAX_REMOTE_AUTH_USERS || users.contains_key(username) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SCRAM verifier file has too many or duplicate users",
+                ));
+            }
+            let parsed = parse_scram_verifier(verifier).map_err(|message| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("SCRAM verifier line {}: {message}", line_number + 1),
+                )
+            })?;
+            users.insert(username.to_owned(), parsed);
+        }
+        if users.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SCRAM verifier file contains no users",
+            ));
+        }
+        Ok(Arc::new(Self { users }))
+    }
+}
+
+fn parse_scram_verifier(value: &str) -> Result<ScramVerifier, &'static str> {
+    let rest = value
+        .strip_prefix("SCRAM-SHA-256$")
+        .ok_or("verifier must use SCRAM-SHA-256")?;
+    let (parameters, keys) = rest.split_once('$').ok_or("missing verifier key section")?;
+    let (iterations, salt) = parameters
+        .split_once(':')
+        .ok_or("missing verifier iteration or salt")?;
+    let iterations = iterations
+        .parse::<u32>()
+        .map_err(|_| "invalid verifier iteration count")?;
+    if !(MIN_SCRAM_ITERATIONS..=MAX_SCRAM_ITERATIONS).contains(&iterations) {
+        return Err("verifier iteration count is outside the configured bounds");
+    }
+    let salt = BASE64
+        .decode(salt)
+        .map_err(|_| "verifier salt is not base64")?;
+    if salt.is_empty() || salt.len() > 64 {
+        return Err("verifier salt has an invalid length");
+    }
+    let (stored_key, server_key) = keys.split_once(':').ok_or("missing stored/server key")?;
+    let stored_key = BASE64
+        .decode(stored_key)
+        .map_err(|_| "stored key is not base64")?;
+    let server_key = BASE64
+        .decode(server_key)
+        .map_err(|_| "server key is not base64")?;
+    let stored_key: [u8; 32] = stored_key
+        .try_into()
+        .map_err(|_| "stored key must be 32 bytes")?;
+    let server_key: [u8; 32] = server_key
+        .try_into()
+        .map_err(|_| "server key must be 32 bytes")?;
+    Ok(ScramVerifier {
+        iterations,
+        salt,
+        stored_key,
+        server_key,
+    })
+}
+
+/// Build a PostgreSQL SCRAM verifier from a password.  This is kept public
+/// only for deployment tooling and tests; the server itself accepts verifier
+/// strings, never plaintext passwords.
+pub fn scram_verifier_for_password(
+    password: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> Result<String, &'static str> {
+    if password.is_empty() || salt.is_empty() || salt.len() > 64 {
+        return Err("password or salt is empty/too large");
+    }
+    if !(MIN_SCRAM_ITERATIONS..=MAX_SCRAM_ITERATIONS).contains(&iterations) {
+        return Err("iteration count is outside the configured bounds");
+    }
+    let mut salted_password = [0u8; 32];
+    pbkdf2_derive(
+        PBKDF2_HMAC_SHA256,
+        std::num::NonZeroU32::new(iterations).ok_or("invalid iteration count")?,
+        salt,
+        password.as_bytes(),
+        &mut salted_password,
+    );
+    let client_key = hmac_sign(&HmacKey::new(HMAC_SHA256, &salted_password), b"Client Key");
+    let stored_key = digest(&SHA256, client_key.as_ref());
+    let server_key = hmac_sign(&HmacKey::new(HMAC_SHA256, &salted_password), b"Server Key");
+    Ok(format!(
+        "SCRAM-SHA-256${iterations}:{}${}:{}",
+        BASE64.encode(salt),
+        BASE64.encode(stored_key.as_ref()),
+        BASE64.encode(server_key.as_ref())
+    ))
+}
+
+struct RemoteTlsRuntime {
+    tls: Arc<ServerConfig>,
+    users: Arc<ScramUsers>,
+}
+
+fn build_remote_tls_runtime(config: &PgRemoteConfig) -> std::io::Result<Arc<RemoteTlsRuntime>> {
+    if config.certificate_pem.is_empty()
+        || config.certificate_pem.len() > MAX_REMOTE_TLS_FILE_BYTES
+        || config.private_key_pem.is_empty()
+        || config.private_key_pem.len() > MAX_REMOTE_TLS_FILE_BYTES
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "remote PostgreSQL TLS material is empty or too large",
+        ));
+    }
+    let users = ScramUsers::parse(&config.auth_file)?;
+    let mut certificate_reader = Cursor::new(&config.certificate_pem);
+    let certificates = pem_certs(&mut certificate_reader)
+        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("remote PostgreSQL certificate is invalid: {error}"),
+            )
+        })?;
+    if certificates.is_empty() || certificates.len() > 16 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "remote PostgreSQL certificate chain is empty or too long",
+        ));
+    }
+    let mut key_reader = Cursor::new(&config.private_key_pem);
+    let private_key: PrivateKeyDer<'static> = pem_private_key(&mut key_reader)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("remote PostgreSQL private key is invalid: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "remote PostgreSQL private key is missing",
+            )
+        })?;
+    let tls = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("remote PostgreSQL TLS configuration is invalid: {error}"),
+            )
+        })?;
+    Ok(Arc::new(RemoteTlsRuntime {
+        tls: Arc::new(tls),
+        users,
+    }))
+}
+
+struct RemoteTlsIo {
+    stream: StreamOwned<ServerConnection, TcpStream>,
+}
+
+impl Read for RemoteTlsIo {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read(buffer)
+    }
+}
+
+impl Write for RemoteTlsIo {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl Io for RemoteTlsIo {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.stream.sock.set_read_timeout(timeout)
+    }
+}
+
+fn accept_remote_tls(stream: TcpStream, config: Arc<ServerConfig>) -> std::io::Result<RemoteTlsIo> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let connection = ServerConnection::new(config).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("could not initialize remote PostgreSQL TLS: {error}"),
+        )
+    })?;
+    let mut stream = StreamOwned::new(connection, stream);
+    while stream.conn.is_handshaking() {
+        stream.conn.complete_io(&mut stream.sock).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("remote PostgreSQL TLS handshake failed: {error}"),
+            )
+        })?;
+    }
+    stream.sock.set_read_timeout(None)?;
+    stream.sock.set_write_timeout(None)?;
+    Ok(RemoteTlsIo { stream })
 }
 
 pub struct PgServer {
@@ -258,6 +567,7 @@ pub struct PgServerHandle {
     active: Arc<AtomicUsize>,
     manager: Mutex<Option<JoinHandle<std::io::Result<()>>>>,
     tcp_addr: Option<SocketAddr>,
+    remote_addr: Option<SocketAddr>,
     unix_socket: Option<std::path::PathBuf>,
 }
 
@@ -277,6 +587,12 @@ impl PgServerHandle {
     /// zero in tests or an embedding application).
     pub fn tcp_addr(&self) -> Option<SocketAddr> {
         self.tcp_addr
+    }
+
+    /// Return the actual bound remote TLS address, when remote PostgreSQL was
+    /// explicitly enabled.
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
     }
 
     pub fn unix_socket(&self) -> Option<&std::path::Path> {
@@ -373,6 +689,12 @@ impl PgServer {
     ) -> std::io::Result<PgServerHandle> {
         let (worker_count, queue_capacity) = self.engine.query_worker_limits();
         let query_workers = QueryWorkerPool::new(worker_count, queue_capacity)?;
+        let remote_runtime = self
+            .config
+            .remote
+            .as_ref()
+            .map(build_remote_tls_runtime)
+            .transpose()?;
         let active = Arc::new(AtomicUsize::new(0));
         let registry = Arc::new(ConnectionRegistry::default());
         let mut tcp_addr = None;
@@ -380,6 +702,22 @@ impl PgServer {
             let listener = bind_trust_tcp_listener(addr)?;
             listener.set_nonblocking(true)?;
             tcp_addr = Some(listener.local_addr()?);
+            Some(listener)
+        } else {
+            None
+        };
+
+        let mut remote_addr = None;
+        let remote_listener = if let Some(remote) = &self.config.remote {
+            let address = remote.listen.parse::<SocketAddr>().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "remote PostgreSQL listen address must be an explicit socket address",
+                )
+            })?;
+            let listener = TcpListener::bind(address)?;
+            listener.set_nonblocking(true)?;
+            remote_addr = Some(listener.local_addr()?);
             Some(listener)
         } else {
             None
@@ -410,6 +748,19 @@ impl PgServer {
                 self.config.max_connections,
                 Arc::clone(&registry),
                 Arc::clone(&query_workers),
+            ));
+        }
+        if let Some(listener) = remote_listener {
+            let runtime = remote_runtime.clone().expect("remote runtime validated");
+            listener_threads.push(spawn_remote_accept_loop(
+                listener,
+                Arc::clone(&shutdown),
+                Arc::clone(&self.engine),
+                Arc::clone(&active),
+                self.config.max_connections,
+                Arc::clone(&registry),
+                Arc::clone(&query_workers),
+                runtime,
             ));
         }
         if let Some(listener) = unix_listener {
@@ -467,6 +818,7 @@ impl PgServer {
             active,
             manager: Mutex::new(Some(manager)),
             tcp_addr,
+            remote_addr,
             unix_socket,
         })
     }
@@ -622,6 +974,56 @@ fn spawn_tcp_accept_loop(
     })
 }
 
+fn spawn_remote_accept_loop(
+    listener: TcpListener,
+    shutdown: Arc<AtomicBool>,
+    engine: Arc<SqlEngine>,
+    active: Arc<AtomicUsize>,
+    max_connections: usize,
+    registry: Arc<ConnectionRegistry>,
+    query_workers: Arc<QueryWorkerPool>,
+    runtime: Arc<RemoteTlsRuntime>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if shutdown.load(Ordering::Acquire) {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        return;
+                    }
+                    let Ok(control) = stream.try_clone() else {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    };
+                    let Ok(permit) =
+                        ConnectionPermit::try_acquire(Arc::clone(&active), max_connections)
+                    else {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    };
+                    spawn_remote_connection_worker(
+                        stream,
+                        Arc::new(control),
+                        engine.clone(),
+                        permit,
+                        Arc::clone(&registry),
+                        Arc::clone(&query_workers),
+                        Arc::clone(&runtime),
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::park_timeout(ACCEPT_POLL_INTERVAL);
+                }
+                Err(_) => return,
+            }
+        }
+    })
+}
+
 fn spawn_unix_accept_loop(
     listener: UnixListener,
     shutdown: Arc<AtomicBool>,
@@ -685,6 +1087,33 @@ fn spawn_connection_worker<S>(
     let worker = thread::spawn(move || {
         let _permit = permit;
         let _ = Connection::new_with_workers(engine, Box::new(stream), query_workers).run();
+        worker_registry.unregister(socket_id);
+    });
+    registry.add_worker(worker);
+}
+
+fn spawn_remote_connection_worker(
+    stream: TcpStream,
+    control: Arc<dyn ShutdownSocket>,
+    engine: Arc<SqlEngine>,
+    permit: ConnectionPermit,
+    registry: Arc<ConnectionRegistry>,
+    query_workers: Arc<QueryWorkerPool>,
+    runtime: Arc<RemoteTlsRuntime>,
+) {
+    let socket_id = registry.register(control);
+    let worker_registry = Arc::clone(&registry);
+    let worker = thread::spawn(move || {
+        let _permit = permit;
+        if let Ok(tls) = accept_remote_tls(stream, Arc::clone(&runtime.tls)) {
+            let _ = Connection::new_with_workers_and_auth(
+                engine,
+                Box::new(tls),
+                query_workers,
+                Arc::clone(&runtime.users),
+            )
+            .run();
+        }
         worker_registry.unregister(socket_id);
     });
     registry.add_worker(worker);
@@ -831,6 +1260,7 @@ struct Connection {
     engine: Arc<SqlEngine>,
     session: SqlSession,
     query_workers: Option<Arc<QueryWorkerPool>>,
+    remote_auth: Option<Arc<ScramUsers>>,
     portals: HashMap<String, Portal>,
     prepared_types: HashMap<String, Vec<u32>>,
     retained_extended_query_bytes: usize,
@@ -916,6 +1346,52 @@ fn startup_cstr(body: &[u8], pos: &mut usize) -> Result<String, SqlError> {
         .map_err(|_| SqlError::new("22021", "invalid UTF-8 in startup packet"))
 }
 
+fn parse_scram_attributes(value: &str) -> Result<Vec<(String, String)>, &'static str> {
+    if value.is_empty() || value.len() > MAX_SCRAM_NONCE_BYTES + 512 {
+        return Err("SCRAM attribute list is empty or too large");
+    }
+    let mut attributes = Vec::new();
+    for item in value.split(',') {
+        let (key, value) = item.split_once('=').ok_or("SCRAM attribute is malformed")?;
+        if key.len() != 1
+            || !key.as_bytes()[0].is_ascii_alphabetic()
+            || value.is_empty()
+            || attributes.iter().any(|(seen, _)| seen == key)
+        {
+            return Err("SCRAM attribute is invalid or duplicated");
+        }
+        attributes.push((key.to_owned(), value.to_owned()));
+    }
+    Ok(attributes)
+}
+
+fn scram_attribute<'a>(attributes: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    attributes
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.as_str())
+}
+
+fn scram_unescape(value: &str) -> Result<String, &'static str> {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character != '=' {
+            output.push(character);
+            continue;
+        }
+        match (chars.next(), chars.next()) {
+            (Some('2'), Some('C')) => output.push(','),
+            (Some('3'), Some('D')) => output.push('='),
+            _ => return Err("invalid SCRAM username escape"),
+        }
+    }
+    if output.is_empty() || output.len() > MAX_SCRAM_USERNAME_BYTES {
+        return Err("SCRAM username has an invalid length");
+    }
+    Ok(output)
+}
+
 type WireResult<T> = std::result::Result<T, SqlError>;
 
 struct Decoder<'a> {
@@ -990,7 +1466,7 @@ impl Drop for Connection {
 
 impl Connection {
     fn new(engine: Arc<SqlEngine>, io: Box<dyn Io>) -> Self {
-        Self::new_inner(engine, io, None)
+        Self::new_inner(engine, io, None, None)
     }
 
     fn new_with_workers(
@@ -998,13 +1474,23 @@ impl Connection {
         io: Box<dyn Io>,
         query_workers: Arc<QueryWorkerPool>,
     ) -> Self {
-        Self::new_inner(engine, io, Some(query_workers))
+        Self::new_inner(engine, io, Some(query_workers), None)
+    }
+
+    fn new_with_workers_and_auth(
+        engine: Arc<SqlEngine>,
+        io: Box<dyn Io>,
+        query_workers: Arc<QueryWorkerPool>,
+        remote_auth: Arc<ScramUsers>,
+    ) -> Self {
+        Self::new_inner(engine, io, Some(query_workers), Some(remote_auth))
     }
 
     fn new_inner(
         engine: Arc<SqlEngine>,
         io: Box<dyn Io>,
         query_workers: Option<Arc<QueryWorkerPool>>,
+        remote_auth: Option<Arc<ScramUsers>>,
     ) -> Self {
         let pid = next_backend_pid();
         let secret = pid
@@ -1025,6 +1511,7 @@ impl Connection {
             engine,
             session,
             query_workers,
+            remote_auth,
             portals: HashMap::new(),
             prepared_types: HashMap::new(),
             retained_extended_query_bytes: 0,
@@ -1253,7 +1740,13 @@ impl Connection {
                 self.startup_error("invalid application_name")?;
                 return Ok(false);
             }
-            self.send_authentication_ok()?;
+            if let Some(users) = self.remote_auth.clone() {
+                if !self.authenticate_scram(&user, &users)? {
+                    return Ok(false);
+                }
+            } else {
+                self.send_authentication_ok()?;
+            }
             self.parameter("server_version", "16.0")?;
             self.parameter("server_version_num", "160000")?;
             self.parameter("client_encoding", "UTF8")?;
@@ -1267,8 +1760,209 @@ impl Connection {
             return Ok(true);
         }
     }
+
+    fn read_auth_frontend_message(&mut self) -> std::io::Result<(u8, Vec<u8>)> {
+        let mut header = [0u8; 5];
+        self.io.read_exact(&mut header)?;
+        let length = u32::from_be_bytes(header[1..].try_into().unwrap());
+        if length < 4 || length as usize - 4 > 64 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SCRAM authentication message is too large or malformed",
+            ));
+        }
+        let mut body = vec![0u8; length as usize - 4];
+        self.io.read_exact(&mut body)?;
+        Ok((header[0], body))
+    }
+
+    fn authenticate_scram(&mut self, username: &str, users: &ScramUsers) -> std::io::Result<bool> {
+        let Some(verifier) = users.users.get(username) else {
+            self.startup_auth_error("password authentication failed")?;
+            return Ok(false);
+        };
+        self.send_authentication_sasl()?;
+        let (message_type, initial_body) = self.read_auth_frontend_message()?;
+        if message_type != b'p' {
+            self.startup_auth_error("expected SASL initial response")?;
+            return Ok(false);
+        }
+        let mut decoder = Decoder::new(&initial_body);
+        let mechanism = match decoder.cstr("SASL mechanism") {
+            Ok(value) => value,
+            Err(_) => {
+                self.startup_auth_error("malformed SASL initial response")?;
+                return Ok(false);
+            }
+        };
+        let response_length = match decoder.i32("SASL initial response length") {
+            Ok(value) => value,
+            Err(_) => {
+                self.startup_auth_error("malformed SASL initial response")?;
+                return Ok(false);
+            }
+        };
+        if mechanism != SCRAM_SHA256_MECHANISM
+            || response_length < 0
+            || response_length as usize > MAX_SCRAM_NONCE_BYTES + 128
+        {
+            self.startup_auth_error("unsupported SASL mechanism or initial response")?;
+            return Ok(false);
+        }
+        let initial = match decoder.bytes(response_length as usize, "SASL initial response") {
+            Ok(value) if decoder.finish("SASL initial response").is_ok() => value,
+            _ => {
+                self.startup_auth_error("malformed SASL initial response")?;
+                return Ok(false);
+            }
+        };
+        let initial = match std::str::from_utf8(initial) {
+            Ok(value) => value,
+            Err(_) => {
+                self.startup_auth_error("SASL initial response is not UTF-8")?;
+                return Ok(false);
+            }
+        };
+        let Some(client_first_bare) = initial.strip_prefix(SCRAM_SASL_NONE) else {
+            self.startup_auth_error("unsupported SCRAM channel binding")?;
+            return Ok(false);
+        };
+        let initial_attributes = match parse_scram_attributes(client_first_bare) {
+            Ok(value) => value,
+            Err(_) => {
+                self.startup_auth_error("malformed SCRAM client-first message")?;
+                return Ok(false);
+            }
+        };
+        let Some(scram_username) = scram_attribute(&initial_attributes, "n") else {
+            self.startup_auth_error("SCRAM client-first message has no username")?;
+            return Ok(false);
+        };
+        let Some(client_nonce) = scram_attribute(&initial_attributes, "r") else {
+            self.startup_auth_error("SCRAM client-first message has no nonce")?;
+            return Ok(false);
+        };
+        let scram_username = match scram_unescape(scram_username) {
+            Ok(value) => value,
+            Err(_) => {
+                self.startup_auth_error("SCRAM username escaping is invalid")?;
+                return Ok(false);
+            }
+        };
+        if scram_username != username
+            || client_nonce.is_empty()
+            || client_nonce.len() > MAX_SCRAM_NONCE_BYTES
+            || !client_nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b',')
+        {
+            self.startup_auth_error("SCRAM client identity or nonce is invalid")?;
+            return Ok(false);
+        }
+        let mut random_nonce = [0u8; 18];
+        SystemRandom::new().fill(&mut random_nonce).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "could not generate SCRAM server nonce",
+            )
+        })?;
+        let server_nonce = format!("{client_nonce}{}", BASE64.encode(random_nonce));
+        let server_first = format!(
+            "r={server_nonce},s={},i={}",
+            BASE64.encode(&verifier.salt),
+            verifier.iterations
+        );
+        self.send_authentication_sasl_continue(&server_first)?;
+
+        let (message_type, final_body) = self.read_auth_frontend_message()?;
+        if message_type != b'p' {
+            self.startup_auth_error("expected SCRAM final response")?;
+            return Ok(false);
+        }
+        let final_message = match std::str::from_utf8(&final_body) {
+            Ok(value) => value,
+            Err(_) => {
+                self.startup_auth_error("SCRAM final response is not UTF-8")?;
+                return Ok(false);
+            }
+        };
+        let final_attributes = match parse_scram_attributes(final_message) {
+            Ok(value) => value,
+            Err(_) => {
+                self.startup_auth_error("malformed SCRAM client-final message")?;
+                return Ok(false);
+            }
+        };
+        let Some(channel_binding) = scram_attribute(&final_attributes, "c") else {
+            self.startup_auth_error("SCRAM final response has no channel binding")?;
+            return Ok(false);
+        };
+        let Some(final_nonce) = scram_attribute(&final_attributes, "r") else {
+            self.startup_auth_error("SCRAM final response has no nonce")?;
+            return Ok(false);
+        };
+        let Some(proof) = scram_attribute(&final_attributes, "p") else {
+            self.startup_auth_error("SCRAM final response has no proof")?;
+            return Ok(false);
+        };
+        if channel_binding != "biws" || final_nonce != server_nonce {
+            self.startup_auth_error("SCRAM channel binding or nonce is invalid")?;
+            return Ok(false);
+        }
+        let proof = match BASE64.decode(proof) {
+            Ok(value) if value.len() == 32 => value,
+            _ => {
+                self.startup_auth_error("SCRAM proof is invalid")?;
+                return Ok(false);
+            }
+        };
+        let Some(proof_position) = final_message.rfind(",p=") else {
+            self.startup_auth_error("SCRAM proof attribute is not in the final position")?;
+            return Ok(false);
+        };
+        if proof_position == 0 || final_message[proof_position + 3..].is_empty() {
+            self.startup_auth_error("SCRAM final response is malformed")?;
+            return Ok(false);
+        }
+        let client_final_without_proof = &final_message[..proof_position];
+        let auth_message =
+            format!("{client_first_bare},{server_first},{client_final_without_proof}");
+        let client_signature = hmac_sign(
+            &HmacKey::new(HMAC_SHA256, &verifier.stored_key),
+            auth_message.as_bytes(),
+        );
+        let mut client_key = [0u8; 32];
+        for (index, byte) in client_key.iter_mut().enumerate() {
+            *byte = proof[index] ^ client_signature.as_ref()[index];
+        }
+        let computed_stored_key = digest(&SHA256, &client_key);
+        if computed_stored_key
+            .as_ref()
+            .ct_eq(&verifier.stored_key)
+            .unwrap_u8()
+            != 1
+        {
+            self.startup_auth_error("password authentication failed")?;
+            return Ok(false);
+        }
+        let server_signature = hmac_sign(
+            &HmacKey::new(HMAC_SHA256, &verifier.server_key),
+            auth_message.as_bytes(),
+        );
+        self.send_authentication_sasl_final(&format!(
+            "v={}",
+            BASE64.encode(server_signature.as_ref())
+        ))?;
+        self.send_authentication_ok()?;
+        Ok(true)
+    }
+
     fn startup_error(&mut self, message: &str) -> std::io::Result<()> {
         self.error(&SqlError::new("08P01", message))
+    }
+
+    fn startup_auth_error(&mut self, message: &str) -> std::io::Result<()> {
+        self.error_with_severity("FATAL", &SqlError::new("28P01", message))
     }
     fn read_startup_header(&mut self) -> std::io::Result<(u32, u32)> {
         let mut b = [0; 8];
@@ -1874,6 +2568,22 @@ impl Connection {
     }
     fn send_authentication_ok(&mut self) -> std::io::Result<()> {
         self.write_message(b'R', &0u32.to_be_bytes())
+    }
+    fn send_authentication_sasl(&mut self) -> std::io::Result<()> {
+        let mut body = 10u32.to_be_bytes().to_vec();
+        cstr_put(&mut body, SCRAM_SHA256_MECHANISM);
+        body.push(0);
+        self.write_message(b'R', &body)
+    }
+    fn send_authentication_sasl_continue(&mut self, message: &str) -> std::io::Result<()> {
+        let mut body = 11u32.to_be_bytes().to_vec();
+        body.extend_from_slice(message.as_bytes());
+        self.write_message(b'R', &body)
+    }
+    fn send_authentication_sasl_final(&mut self, message: &str) -> std::io::Result<()> {
+        let mut body = 12u32.to_be_bytes().to_vec();
+        body.extend_from_slice(message.as_bytes());
+        self.write_message(b'R', &body)
     }
     fn negotiate_protocol_version(
         &mut self,
@@ -2913,6 +3623,7 @@ mod tests {
                 tcp_listen,
                 unix_socket,
                 max_connections: 2,
+                remote: None,
             },
         )
     }
@@ -3416,5 +4127,22 @@ mod tests {
         assert_eq!(error.code, "54000");
         let types = infer_parameter_types("SELECT $65535", &[]).expect("protocol maximum");
         assert_eq!(types.len(), MAX_PROTOCOL_ITEMS);
+    }
+
+    #[test]
+    fn scram_verifier_file_accepts_only_bounded_verifiers() {
+        let verifier = scram_verifier_for_password("secret", b"0123456789abcdef", 4096)
+            .expect("build SCRAM verifier");
+        let users =
+            ScramUsers::parse(format!("app:{verifier}\n").as_bytes()).expect("parse verifier");
+        assert!(users.users.contains_key("app"));
+
+        let plaintext = match ScramUsers::parse(b"app:secret\n") {
+            Ok(_) => panic!("plaintext password unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(plaintext.kind(), std::io::ErrorKind::InvalidInput);
+        let out_of_range = format!("app:SCRAM-SHA-256$1:AA==$AA==:AA==\n");
+        assert!(ScramUsers::parse(out_of_range.as_bytes()).is_err());
     }
 }

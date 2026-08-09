@@ -80,6 +80,7 @@ fn open_test_connection() -> (chorus_pg::PgServerHandle, TcpStream) {
             tcp_listen: Some("127.0.0.1:0".into()),
             unix_socket: None,
             max_connections: 4,
+            remote: None,
         },
     );
     let handle = server

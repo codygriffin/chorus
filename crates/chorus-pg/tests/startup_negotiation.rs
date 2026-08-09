@@ -23,6 +23,7 @@ fn open_server() -> PgServerHandle {
             tcp_listen: Some("127.0.0.1:0".into()),
             unix_socket: None,
             max_connections: 8,
+            remote: None,
         },
     )
     .start_with_drain_timeout(Duration::from_secs(1))

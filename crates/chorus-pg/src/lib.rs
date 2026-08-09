@@ -473,7 +473,7 @@ fn spawn_connection_worker<S>(
     permit: ConnectionPermit,
     registry: Arc<ConnectionRegistry>,
 ) where
-    S: Read + Write + Send + 'static,
+    S: Io + 'static,
 {
     let socket_id = registry.register(control);
     let worker_registry = Arc::clone(&registry);
@@ -599,8 +599,28 @@ impl Drop for ConnectionPermit {
     }
 }
 
-trait Io: Read + Write + Send {}
-impl<T: Read + Write + Send> Io for T {}
+trait Io: Read + Write + Send {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl Io for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+}
+
+impl Io for UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_read_timeout(self, timeout)
+    }
+}
+
+#[cfg(test)]
+impl Io for std::io::Cursor<Vec<u8>> {
+    fn set_read_timeout(&self, _timeout: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 struct Connection {
     io: Box<dyn Io>,
     session: SqlSession,
@@ -613,6 +633,7 @@ struct Connection {
     cancel_token: Arc<AtomicBool>,
     cancel_registration: Arc<CancelRegistration>,
     extended_error: bool,
+    idle_transaction_deadline: Option<Instant>,
 }
 #[derive(Clone)]
 struct Portal {
@@ -776,6 +797,7 @@ impl Connection {
             cancel_token,
             cancel_registration,
             extended_error: false,
+            idle_transaction_deadline: None,
         }
     }
     fn run(mut self) -> std::io::Result<()> {
@@ -783,7 +805,20 @@ impl Connection {
             return Ok(());
         }
         loop {
-            let Some((typ, body)) = self.message()? else {
+            let next = match self.message() {
+                Ok(next) => next,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) && self.idle_transaction_deadline.is_some() =>
+                {
+                    self.fatal_idle_transaction_timeout()?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let Some((typ, body)) = next else {
                 return Ok(());
             };
 
@@ -1481,8 +1516,20 @@ impl Connection {
         self.write_message(b'K', &b)
     }
     fn error(&mut self, e: &SqlError) -> std::io::Result<()> {
+        self.error_with_severity("ERROR", e)
+    }
+    fn fatal_idle_transaction_timeout(&mut self) -> std::io::Result<()> {
+        self.error_with_severity(
+            "FATAL",
+            &SqlError::new(
+                "25P03",
+                "terminating connection due to idle-in-transaction timeout",
+            ),
+        )
+    }
+    fn error_with_severity(&mut self, severity: &str, e: &SqlError) -> std::io::Result<()> {
         let mut b = Vec::new();
-        field(&mut b, b'S', "ERROR");
+        field(&mut b, b'S', severity);
         field(&mut b, b'C', sqlstate(e));
         field(&mut b, b'M', &e.message);
         if let Some(d) = &e.detail {
@@ -1497,13 +1544,90 @@ impl Connection {
         b.push(0);
         self.write_message(b'E', &b)
     }
-    fn message(&mut self) -> std::io::Result<Option<(u8, Vec<u8>)>> {
-        let mut h = [0; 5];
-        match self.io.read_exact(&mut h) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
+
+    fn arm_idle_transaction_timeout(&mut self) -> std::io::Result<()> {
+        let in_transaction = matches!(
+            self.session.transaction_status(),
+            chorus_txn::TransactionStatus::Active | chorus_txn::TransactionStatus::Failed
+        );
+        let timeout_ms = self
+            .session
+            .settings()
+            .idle_in_transaction_session_timeout_ms;
+        if !in_transaction || timeout_ms == 0 {
+            return self.clear_idle_transaction_timeout();
+        }
+
+        let now = Instant::now();
+        let deadline = match self.idle_transaction_deadline {
+            Some(deadline) => deadline,
+            None => now
+                .checked_add(Duration::from_millis(timeout_ms))
+                .unwrap_or(now),
         };
+        self.idle_transaction_deadline = Some(deadline);
+        if deadline <= now {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "idle-in-transaction timeout expired",
+            ));
+        }
+        self.io
+            .set_read_timeout(Some(deadline.saturating_duration_since(now)))
+    }
+
+    fn clear_idle_transaction_timeout(&mut self) -> std::io::Result<()> {
+        let had_deadline = self.idle_transaction_deadline.take().is_some();
+        if had_deadline {
+            self.io.set_read_timeout(None)?;
+        }
+        Ok(())
+    }
+
+    /// Read one complete frontend frame while honoring an absolute idle
+    /// deadline.  `Read::read_exact` may reset a socket timeout for each
+    /// partial read; this loop recomputes the remaining duration so a client
+    /// dribbling a partial frame cannot extend the transaction-idle budget.
+    fn read_exact_at_deadline(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
+        let mut offset = 0;
+        while offset < buffer.len() {
+            if let Some(deadline) = self.idle_transaction_deadline {
+                let now = Instant::now();
+                if deadline <= now {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "idle-in-transaction timeout expired",
+                    ));
+                }
+                self.io
+                    .set_read_timeout(Some(deadline.saturating_duration_since(now)))?;
+            }
+            match self.io.read(&mut buffer[offset..]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "unexpected EOF while reading frontend message",
+                    ));
+                }
+                Ok(read) => offset += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn message(&mut self) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+        self.arm_idle_transaction_timeout()?;
+        let mut h = [0; 5];
+        match self.read_exact_at_deadline(&mut h) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                self.clear_idle_transaction_timeout()?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
         let len = u32::from_be_bytes(h[1..].try_into().unwrap()) as usize;
         if len < 4 || len > MAX_FRONTEND_MESSAGE_BYTES {
             return Err(std::io::Error::new(
@@ -1512,7 +1636,8 @@ impl Connection {
             ));
         }
         let mut b = vec![0; len - 4];
-        self.io.read_exact(&mut b)?;
+        self.read_exact_at_deadline(&mut b)?;
+        self.clear_idle_transaction_timeout()?;
         Ok(Some((h[0], b)))
     }
     fn write_message(&mut self, typ: u8, body: &[u8]) -> std::io::Result<()> {
@@ -2019,7 +2144,85 @@ mod tests {
     use chorus_common::{Limits, OriginId};
     use chorus_storage::{MemoryStateStore, StateStore};
     use chorus_txn::{Committer, LocalCommitter};
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Write};
+    use std::sync::Mutex;
+
+    struct IdleTimeoutIo {
+        input: Vec<u8>,
+        position: usize,
+        read_timeout: Mutex<Option<Duration>>,
+        output: Arc<Mutex<Vec<u8>>>,
+        timed_reads: Arc<AtomicUsize>,
+    }
+
+    impl IdleTimeoutIo {
+        fn new(input: Vec<u8>) -> (Self, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let timed_reads = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    input,
+                    position: 0,
+                    read_timeout: Mutex::new(None),
+                    output: Arc::clone(&output),
+                    timed_reads: Arc::clone(&timed_reads),
+                },
+                output,
+                timed_reads,
+            )
+        }
+    }
+
+    impl Read for IdleTimeoutIo {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.position < self.input.len() {
+                let count = (self.input.len() - self.position).min(buffer.len());
+                buffer[..count].copy_from_slice(&self.input[self.position..self.position + count]);
+                self.position += count;
+                return Ok(count);
+            }
+            let timeout = *self.read_timeout.lock().expect("timeout lock");
+            if let Some(timeout) = timeout {
+                self.timed_reads.fetch_add(1, Ordering::AcqRel);
+                std::thread::sleep(timeout + Duration::from_millis(2));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "simulated idle timeout",
+                ));
+            }
+            Ok(0)
+        }
+    }
+
+    impl Write for IdleTimeoutIo {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.output
+                .lock()
+                .expect("output lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Io for IdleTimeoutIo {
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+            *self.read_timeout.lock().expect("timeout lock") = timeout;
+            Ok(())
+        }
+    }
+
+    fn startup_wire() -> Vec<u8> {
+        let mut wire = Vec::new();
+        let params = [b'u', b's', b'e', b'r', 0, b't', b'e', b's', b't', 0, 0];
+        wire.extend_from_slice(&((params.len() as u32 + 8).to_be_bytes()));
+        wire.extend_from_slice(&PROTOCOL_VERSION_3_0.to_be_bytes());
+        wire.extend_from_slice(&params);
+        wire
+    }
 
     fn test_connection() -> Connection {
         let store = Arc::new(MemoryStateStore::new()) as Arc<dyn StateStore>;
@@ -2028,6 +2231,62 @@ mod tests {
         ) as Arc<dyn Committer>;
         let engine = SqlEngine::new(store, committer, Limits::default());
         Connection::new(engine, Box::new(Cursor::new(Vec::new())))
+    }
+
+    #[test]
+    fn idle_transaction_timeout_is_fatal_even_for_a_partial_frontend_frame() {
+        let store = Arc::new(MemoryStateStore::new()) as Arc<dyn StateStore>;
+        let committer = Arc::new(
+            LocalCommitter::new(Arc::clone(&store), OriginId::new(701)).expect("test committer"),
+        ) as Arc<dyn Committer>;
+        let engine = SqlEngine::new(store, committer, Limits::default());
+        let mut input = startup_wire();
+        input.push(b'Q');
+        let (io, output, timed_reads) = IdleTimeoutIo::new(input);
+        let mut connection = Connection::new(engine, Box::new(io));
+        connection
+            .session
+            .set_param("idle_in_transaction_session_timeout", "20")
+            .unwrap();
+        connection.session.execute("BEGIN", &[]).unwrap();
+
+        connection
+            .run()
+            .expect("idle timeout is a protocol outcome");
+        assert!(timed_reads.load(Ordering::Acquire) >= 1);
+        let output = output.lock().expect("output lock");
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("FATAL"), "missing FATAL response: {text:?}");
+        assert!(text.contains("25P03"), "missing SQLSTATE: {text:?}");
+        assert!(
+            text.contains("idle-in-transaction timeout"),
+            "missing timeout detail: {text:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_idle_session_does_not_arm_transaction_timeout_and_reset_clears_it() {
+        let mut connection = test_connection();
+        connection
+            .session
+            .set_param("idle_in_transaction_session_timeout", "20")
+            .unwrap();
+
+        let (io, _output, timed_reads) = IdleTimeoutIo::new(Vec::new());
+        connection.io = Box::new(io);
+        connection.arm_idle_transaction_timeout().unwrap();
+        assert!(connection.idle_transaction_deadline.is_none());
+        assert_eq!(timed_reads.load(Ordering::Acquire), 0);
+
+        connection.session.execute("BEGIN", &[]).unwrap();
+        connection.arm_idle_transaction_timeout().unwrap();
+        assert!(connection.idle_transaction_deadline.is_some());
+        connection
+            .session
+            .set_param("idle_in_transaction_session_timeout", "0")
+            .unwrap();
+        connection.arm_idle_transaction_timeout().unwrap();
+        assert!(connection.idle_transaction_deadline.is_none());
     }
 
     fn test_server(tcp_listen: Option<String>, unix_socket: Option<String>) -> PgServer {
